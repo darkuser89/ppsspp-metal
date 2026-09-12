@@ -45,6 +45,9 @@
 #include "Common/File/FileUtil.h"
 #include "Common/GPU/GraphicsContext.h"
 #include "Common/GPU/ShaderTranslation.h"
+#if PPSSPP_PLATFORM(MAC) && defined(SDL)
+#include "SDL/SDLCocoaMetalLayer.h"
+#endif
 #ifdef PPSSPP_HAS_METAL
 #include "Common/GPU/Metal/MetalGraphicsContext.h"
 #endif
@@ -372,7 +375,13 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
 		}
 
 		int blockTicks = (int)usToCycles(1000000 / 10);
+#if PPSSPP_PLATFORM(MAC) && defined(SDL)
+		runWithCocoaAutoreleasePool([](void *ticks) {
+			PSP_RunLoopFor(*static_cast<int *>(ticks));
+		}, &blockTicks);
+#else
 		PSP_RunLoopFor(blockTicks);
+#endif
 
 		// If we were rendering, this might be a nice time to do something about it.
 		if (coreState == CORE_NEXTFRAME) {

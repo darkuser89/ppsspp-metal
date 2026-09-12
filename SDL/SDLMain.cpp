@@ -2242,7 +2242,13 @@ int main(int argc, char *argv[]) {
 
 		std::thread emuThread = std::thread([&] {
 			RunMainLoop(graphicsContext, new NativeApplication(), [&](GraphicsContext *graphicsContext) {
+#if PPSSPP_PLATFORM(MAC)
+				runWithCocoaAutoreleasePool([](void *context) {
+					NativeFrame(static_cast<GraphicsContext *>(context));
+				}, graphicsContext);
+#else
 				NativeFrame(graphicsContext);
+#endif
 				bool keepRunning = !(g_QuitRequested || g_RestartRequested);
 				if (!keepRunning) {
 					INFO_LOG(Log::System, "EmuThread was requested to exit normally.");
@@ -2287,7 +2293,13 @@ int main(int argc, char *argv[]) {
 	} else {
 		// OpenGL mode uses this path.
 		std::thread emuThread = EmuThread_Start(graphicsContext, new NativeApplication(), [&](GraphicsContext *graphicsContext){
+#if PPSSPP_PLATFORM(MAC)
+			runWithCocoaAutoreleasePool([](void *context) {
+				NativeFrame(static_cast<GraphicsContext *>(context));
+			}, graphicsContext);
+#else
 			NativeFrame(graphicsContext);
+#endif
 			return true;
 		});
 		while (true) {
