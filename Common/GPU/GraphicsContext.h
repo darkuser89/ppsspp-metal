@@ -12,6 +12,11 @@ struct WindowDesc {
 	void *data2 = nullptr;
 
 	bool Valid() const {
+		if (winsys == WindowSystem::WINDOWSYSTEM_METAL_EXT) {
+			// Metal surfaces pass their CAMetalLayer in data1 and no window in
+			// data2. This is also the surface contract used by MoltenVK.
+			return data1 != nullptr;
+		}
 		return winsys != WindowSystem::WINDOWSYSTEM_UNINITIALIZED && data2;  // Not all platforms use data1, so don't check it.
 	}
 };

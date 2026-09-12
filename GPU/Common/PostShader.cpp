@@ -130,6 +130,10 @@ void LoadPostShaderInfo(Draw::DrawContext *draw, const std::vector<Path> &direct
 
 				std::vector<std::string> vendorBlacklist;
 				section.Get("VendorBlacklist", &vendorBlacklist);
+				if (draw && draw->GetInfoString(Draw::InfoField::APINAME) == "Metal" && section.HasKey("VendorBlacklistMetal")) {
+					vendorBlacklist.clear();
+					section.Get("VendorBlacklistMetal", &vendorBlacklist);
+				}
 				bool skipped = false;
 				for (auto &item : vendorBlacklist) {
 					const Draw::GPUVendor blacklistedVendor = VendorFromString(item);
@@ -219,6 +223,8 @@ void LoadPostShaderInfo(Draw::DrawContext *draw, const std::vector<Path> &direct
 					section.Get("Scale", &info.scaleFactor);
 					bool hidden = false;
 					section.Get("Hidden", &info.hidden);
+					section.Get("Metal", &info.metalSupported);
+					section.Get("MetalNoInline", &info.metalNoInlineFunctions);
 					std::string cbufferFilename;
 					if (section.Get("ConstantBuffer", &cbufferFilename)) {
 						Path cbufferPath = path / cbufferFilename;

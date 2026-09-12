@@ -38,12 +38,6 @@
 #include "GPU/GPUState.h"
 #include "Common/GPU/ShaderTranslation.h"
 
-struct Vertex {
-	float x, y, z;
-	float u, v;
-	uint32_t rgba;
-};
-
 static bool g_overrideScreenBounds;
 static Bounds g_screenBounds;
 
@@ -712,6 +706,13 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 		finalV1 = 1.0f;
 	}
 
+	// MetalFX receives only the visible image, excluding unused framebuffer edges.
+	sourceUV_ = {finalU0, finalV0, finalU1 - finalU0, finalV1 - finalV0};
+	const bool vertical = uvRotation == ROTATION_LOCKED_VERTICAL || uvRotation == ROTATION_LOCKED_VERTICAL180;
+	const float maxSize = (float)draw_->GetDeviceCaps().maxTextureSize;
+	spatialOutputWidth_ = (int)std::clamp(ceilf(vertical ? rc_.h : rc_.w), 0.0f, maxSize);
+	spatialOutputHeight_ = (int)std::clamp(ceilf(vertical ? rc_.w : rc_.h), 0.0f, maxSize);
+
 	// Our vertex buffer is split into three parts, with four vertices each:
 	// 0-3: The final blit vertices (needs to handle cropping the input ONLY if post-processing is not enabled)
 	// 4-7: Post-processing, other passes
@@ -790,6 +791,7 @@ void PresentationCommon::RunPostshaderPasses(const DisplayLayoutConfig &config, 
 		}
 	}
 
+	std::copy_n(verts, 4, outputVerts_);
 	// Grab the previous framebuffer early so we can change previousIndex_ when we want.
 	Draw::Framebuffer *previousFramebuffer = previousFramebuffers_.empty() ? nullptr : previousFramebuffers_[previousIndex_];
 
@@ -930,6 +932,21 @@ void PresentationCommon::CopyToOutput(const DisplayLayoutConfig &config) {
 	BindSource(1, false);
 
 	PostShaderUniforms uniforms;
+	// Output-resolution post shaders still need their original input dimensions.
+	// Spatial upscaling applies to the final color image, before the UI is drawn.
+	if (g_Config.bMetalFXSpatial && !useStereo && !isFinalAtOutputResolution && draw_->SupportsSpatialUpscaling()) {
+		Draw::UVRect uv{sourceUV_.x, sourceUV_.y, sourceUV_.x + sourceUV_.w, sourceUV_.y + sourceUV_.h};
+		if (draw_->UpscaleBoundTexture(0, spatialOutputWidth_, spatialOutputHeight_, &uv)) {
+			Vertex verts[4];
+			std::copy_n(outputVerts_, 4, verts);
+			for (auto &vert : verts) {
+				vert.u = uv.u0 + (vert.u - sourceUV_.x) / sourceUV_.w * (uv.u1 - uv.u0);
+				vert.v = uv.v0 + (vert.v - sourceUV_.y) / sourceUV_.h * (uv.v1 - uv.v0);
+			}
+			draw_->UpdateBuffer(vdata_, (const uint8_t *)verts, 0, sizeof(verts), Draw::UPDATE_DISCARD);
+		}
+	}
+
 	if (isFinalAtOutputResolution && previousFramebuffers_.empty()) {
 		CalculatePostShaderUniforms(lastWidth, lastHeight, (int)rc_.w, (int)rc_.h, &postShaderInfo_.back(), &uniforms);
 		draw_->UpdateDynamicUniformBuffer(&uniforms, sizeof(uniforms));

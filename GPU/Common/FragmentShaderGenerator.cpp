@@ -30,7 +30,7 @@
 #include "GPU/Common/ShaderId.h"
 #include "GPU/Common/ShaderUniforms.h"
 #include "GPU/Common/FragmentShaderGenerator.h"
-#include "GPU/Vulkan/DrawEngineVulkan.h"
+#include "GPU/Common/ShaderCommon.h"
 #include "GPU/ge_constants.h"
 #include "GPU/GPUState.h"
 
@@ -48,10 +48,14 @@ static const SamplerDef samplersStereo[3] = {
 	{ 2, "pal" },
 };
 
-bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLanguageDesc &compat, Draw::Bugs bugs, uint64_t *uniformMask, FragmentShaderFlags *fragmentShaderFlags, std::string *errorString) {
+bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLanguageDesc &compat, Draw::Bugs bugs, uint64_t *uniformMask, FragmentShaderFlags *fragmentShaderFlags, std::string *errorString, bool samplerLodBiasInShader) {
 	*uniformMask = 0;
 	*fragmentShaderFlags = (FragmentShaderFlags)0;
 	errorString->clear();
+	if (samplerLodBiasInShader && compat.shaderLanguage != GLSL_VULKAN) {
+		*errorString = "Shader sampler LOD bias requires the GLSL uniform-buffer path";
+		return false;
+	}
 
 	bool useStereo = id.Bit(FS_BIT_STEREO);
 	bool highpFog = false;
@@ -208,8 +212,7 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 		}
 
 		if (readFramebufferTex) {
-			// The framebuffer texture is always bound as an array.
-			p.F("layout (set = 0, binding = %d) uniform sampler2DArray fbotex;\n", DRAW_BINDING_2ND_TEXTURE);
+			p.F("layout (set = 0, binding = %d) uniform sampler2D%s fbotex;\n", DRAW_BINDING_2ND_TEXTURE, compat.framebufferArrayTextures ? "Array" : "");
 		}
 
 		if (shaderDepalMode != ShaderDepalMode::OFF) {
@@ -522,7 +525,7 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 	if (readFramebufferTex) {
 		if (compat.shaderLanguage == HLSL_D3D11) {
 			WRITE(p, "  vec4 destColor = fbotex.Load(int3((int)gl_FragCoord.x, (int)gl_FragCoord.y, 0));\n");
-		} else if (compat.shaderLanguage == GLSL_VULKAN) {
+		} else if (compat.shaderLanguage == GLSL_VULKAN && compat.framebufferArrayTextures) {
 			WRITE(p, "  lowp vec4 destColor = %s(fbotex, ivec3(gl_FragCoord.x, gl_FragCoord.y, %s), 0);\n", compat.texelFetch, useStereo ? "float(gl_ViewIndex)" : "0");
 		} else if (!compat.texelFetch) {
 			WRITE(p, "  lowp vec4 destColor = %s(fbotex, gl_FragCoord.xy * u_fbotexSize.xy);\n", compat.texture);
@@ -633,10 +636,11 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 							WRITE(p, "  vec4 t = %s(tex, vec3(%s.xy, %s));\n", compat.texture, texcoord, arrayIndex);
 						}
 					} else {
+						const char *bias = samplerLodBiasInShader ? ", u_samplerLodBias" : "";
 						if (doTextureProjection) {
-							WRITE(p, "  vec4 t = %sProj(tex, %s);\n", compat.texture, texcoord);
+							WRITE(p, "  vec4 t = %sProj(tex, %s%s);\n", compat.texture, texcoord, bias);
 						} else {
-							WRITE(p, "  vec4 t = %s(tex, %s.xy);\n", compat.texture, texcoord);
+							WRITE(p, "  vec4 t = %s(tex, %s.xy%s);\n", compat.texture, texcoord, bias);
 						}
 					}
 				}

@@ -62,6 +62,8 @@ struct ShaderLanguageDesc {
 	bool bitwiseOps = false;
 	bool forceMatrix4x4 = false;
 	bool coefsFromBuffers = false;
+	// Expand ARRAY_ON_VULKAN samplers to framebuffer arrays. Metal uses GLSL-VK with 2D framebuffers.
+	bool framebufferArrayTextures = false;
 	char driverInfo[256];  // Really only GL uses this.
 };
 

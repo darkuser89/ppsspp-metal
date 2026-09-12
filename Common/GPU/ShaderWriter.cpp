@@ -387,7 +387,7 @@ void ShaderWriter::DeclareTexture2D(const SamplerDef &def) {
 		break;
 	case GLSL_VULKAN:
 		// texBindingBase_ is used for the thin3d descriptor set layout, where they start at 1.
-		if (def.flags & SamplerFlags::ARRAY_ON_VULKAN) {
+		if ((def.flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.framebufferArrayTextures) {
 			F("layout(set = 0, binding = %d) uniform sampler2DArray %s;\n", def.binding + texBindingBase_, def.name);
 		} else {
 			F("layout(set = 0, binding = %d) uniform sampler2D %s;\n", def.binding + texBindingBase_, def.name);
@@ -418,7 +418,7 @@ ShaderWriter &ShaderWriter::SampleTexture2D(const char *sampName, const char *uv
 		break;
 	default:
 		// Note: we ignore the sampler. make sure you bound samplers to the textures correctly.
-		if (samp && (samp->flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.shaderLanguage == GLSL_VULKAN) {
+		if (samp && (samp->flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.shaderLanguage == GLSL_VULKAN && lang_.framebufferArrayTextures) {
 			const char *index = (flags_ & ShaderWriterFlags::FS_AUTO_STEREO) ? "float(gl_ViewIndex)" : "0.0";
 			F("%s(%s, vec3(%s, %s))", lang_.texture, sampName, uv, index);
 		} else {
@@ -438,7 +438,7 @@ ShaderWriter &ShaderWriter::SampleTexture2DOffset(const char *sampName, const ch
 		break;
 	default:
 		// Note: we ignore the sampler. make sure you bound samplers to the textures correctly.
-		if (samp && (samp->flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.shaderLanguage == GLSL_VULKAN) {
+		if (samp && (samp->flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.shaderLanguage == GLSL_VULKAN && lang_.framebufferArrayTextures) {
 			const char *index = (flags_ & ShaderWriterFlags::FS_AUTO_STEREO) ? "float(gl_ViewIndex)" : "0.0";
 			F("%sOffset(%s, vec3(%s, %s), ivec2(%d, %d))", lang_.texture, sampName, uv, index, offX, offY);
 		} else {
@@ -458,7 +458,7 @@ ShaderWriter &ShaderWriter::LoadTexture2D(const char *sampName, const char *uv, 
 		break;
 	default:
 		// Note: we ignore the sampler. make sure you bound samplers to the textures correctly.
-		if (samp && (samp->flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.shaderLanguage == GLSL_VULKAN) {
+		if (samp && (samp->flags & SamplerFlags::ARRAY_ON_VULKAN) && lang_.shaderLanguage == GLSL_VULKAN && lang_.framebufferArrayTextures) {
 			const char *index = (flags_ & ShaderWriterFlags::FS_AUTO_STEREO) ? "gl_ViewIndex" : "0";
 			F("texelFetch(%s, vec3(%s, %s), %d)", sampName, uv, index, level);
 		} else {

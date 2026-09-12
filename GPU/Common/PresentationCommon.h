@@ -135,6 +135,12 @@ public:
 	void CalculateRenderResolution(const DisplayLayoutConfig &config, int *width, int *height, int *scaleFactor, bool *upscaling, bool *ssaa) const;
 
 protected:
+	struct Vertex {
+		float x, y, z;
+		float u, v;
+		uint32_t rgba;
+	};
+
 	void CreateDeviceObjects();
 	void DestroyDeviceObjects();
 
@@ -199,4 +205,8 @@ protected:
 	Draw::Framebuffer *postShaderOutput_ = nullptr;
 	FRect rc_;
 	OutputFlags outputFlags_ = OutputFlags::DEFAULT;
+	int spatialOutputWidth_ = 0;
+	int spatialOutputHeight_ = 0;
+	FRect sourceUV_{};
+	Vertex outputVerts_[4]{};
 };

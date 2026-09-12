@@ -144,6 +144,22 @@ enum DoLightComputation {
 	LIGHT_FULL,
 };
 
+// Explicit resource bindings shared by the GLSL 450 generators and modern
+// backends. Keep these stable: Vulkan descriptor layouts and Metal resource
+// indices must agree with the generated shaders, including unused bindings.
+enum {
+	DRAW_BINDING_TEXTURE = 0,
+	DRAW_BINDING_2ND_TEXTURE = 1,
+	DRAW_BINDING_DEPAL_TEXTURE = 2,
+	DRAW_BINDING_DYNUBO_BASE = 3,
+	DRAW_BINDING_DYNUBO_LIGHT = 4,
+	DRAW_BINDING_DYNUBO_BONE = 5,
+	DRAW_BINDING_TESS_STORAGE_BUF = 6,
+	DRAW_BINDING_TESS_STORAGE_BUF_WU = 7,
+	DRAW_BINDING_TESS_STORAGE_BUF_WV = 8,
+	DRAW_BINDING_COUNT = 9,
+};
+
 // PSP vertex format.
 enum class PspAttributeLocation {
 	POSITION = 0,

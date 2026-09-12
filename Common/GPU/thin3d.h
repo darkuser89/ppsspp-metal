@@ -720,6 +720,10 @@ struct ClippedDraw {
 	Draw::Aspect aspect;
 };
 
+struct UVRect {
+	float u0, v0, u1, v1;
+};
+
 class DrawContext {
 public:
 	virtual ~DrawContext() = default;
@@ -808,6 +812,12 @@ public:
 
 	// binding must be < MAX_TEXTURE_SLOTS (0, 1 are okay if it's 2).
 	virtual void BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect aspect, int layer) = 0;
+	virtual bool SupportsSpatialUpscaling() const { return false; }
+	// Upscale the selected UV rectangle (or the whole texture if uv is null) to
+	// width/height, then bind the result and return its UV rectangle through uv.
+	// On failure, retain both the original binding and UVs.
+	// Other bindings, render targets and draw state must remain unchanged.
+	virtual bool UpscaleBoundTexture(int binding, int width, int height, UVRect *uv = nullptr) { return false; }
 
 	// Framebuffer fetch / input attachment support, needs to be explicit in Vulkan.
 	virtual void BindCurrentFramebufferForColorInput() {}

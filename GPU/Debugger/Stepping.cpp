@@ -50,7 +50,7 @@ static PauseAction pauseAction = PAUSE_CONTINUE;
 static std::mutex actionLock;
 static std::condition_variable actionWait;
 // In case of accidental wakeup.
-static volatile bool actionComplete;
+static bool actionComplete;
 
 // Many things need to run on the GPU thread.  For example, reading the framebuffer.
 // A message system is used to achieve this (temporarily "unpausing" the thread.)
@@ -95,6 +95,7 @@ static void SetPauseAction(PauseAction act, bool waitComplete = true) {
 	// if (coreState == CORE_STEPPING && act != PAUSE_CONTINUE)
 	// 	Core_UpdateSingleStep();
 	actionComplete = false;
+	bufferResult = false;
 }
 
 static void RunPauseAction() {
@@ -155,15 +156,24 @@ static void RunPauseAction() {
 
 void WaitForPauseAction() {
 	std::unique_lock<std::mutex> guard(actionLock);
-	actionWait.wait(guard);
+	actionWait.wait(guard, [] { return actionComplete; });
 }
 
 bool ProcessStepping() {
 	_dbg_assert_(gpu);
 
 	std::unique_lock<std::mutex> guard(pauseLock);
+	if (coreState == CORE_STEPPING_CPU) {
+		// Buffer requests are also allowed at CPU breakpoints. Keep the CPU
+		// paused; PAUSE_CONTINUE belongs to the GE stepping state machine.
+		if (pauseAction != PAUSE_CONTINUE) {
+			RunPauseAction();
+		}
+		return true;
+	}
 	if (coreState != CORE_STEPPING_GE) {
 		// Not stepping any more, don't try.
+		std::lock_guard<std::mutex> actionGuard(actionLock);
 		actionComplete = true;
 		actionWait.notify_all();
 		return false;
@@ -172,6 +182,7 @@ bool ProcessStepping() {
 	if (pauseAction == PAUSE_CONTINUE) {
 		// This is fine, can just mean to run to the next breakpoint/event.
 		DEBUG_LOG(Log::GeDebugger, "Continuing...");
+		std::lock_guard<std::mutex> actionGuard(actionLock);
 		actionComplete = true;
 		actionWait.notify_all();
 		coreState = CORE_RUNNING_GE;
@@ -192,6 +203,7 @@ bool EnterStepping(CoreState coreState) {
 	}
 	if (coreState != CORE_RUNNING_CPU && coreState != CORE_RUNNING_GE) {
 		// ?? Shutting down, don't try to step.
+		std::lock_guard<std::mutex> actionGuard(actionLock);
 		actionComplete = true;
 		actionWait.notify_all();
 		return false;

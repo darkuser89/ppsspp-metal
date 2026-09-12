@@ -405,3 +405,27 @@ endif()
 # was only linked to the old combined "core" target, which happened to always be linked after
 # Common everywhere it mattered).
 target_link_libraries(Common ${GlslangLibs})
+
+# Native Metal currently has surface adapters in the macOS SDL/headless frontends.
+if(APPLE AND NOT IOS AND NOT LIBRETRO)
+	target_compile_definitions(Common PUBLIC PPSSPP_HAS_METAL=1)
+	target_sources(Common PRIVATE
+		GPU/Metal/MetalShaderCompiler.h
+		GPU/Metal/MetalShaderCompiler.cpp
+		GPU/Metal/MetalRenderContext.h
+		GPU/Metal/MetalRenderContext.mm
+		GPU/Metal/MetalResources.h
+		GPU/Metal/MetalResources.mm
+		GPU/Metal/thin3d_metal.h
+		GPU/Metal/thin3d_metal.mm
+		GPU/Metal/MetalRenderManager.h
+		GPU/Metal/MetalGraphicsContext.h
+		GPU/Metal/MetalGraphicsContext.mm
+	)
+	set_source_files_properties(GPU/Metal/MetalShaderCompiler.cpp PROPERTIES COMPILE_FLAGS -fexceptions)
+	set_source_files_properties(GPU/Metal/MetalRenderContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/Metal/MetalResources.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/Metal/thin3d_metal.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/Metal/MetalGraphicsContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	target_link_libraries(Common spirv-cross-metal "-framework Metal" "-weak_framework MetalFX" "-framework Foundation" "-framework QuartzCore")
+endif()

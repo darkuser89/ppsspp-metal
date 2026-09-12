@@ -26,7 +26,7 @@
 #include "GPU/Common/ShaderId.h"
 #include "GPU/Common/ShaderUniforms.h"
 #include "GPU/Common/VertexShaderGenerator.h"
-#include "GPU/Vulkan/DrawEngineVulkan.h"
+#include "GPU/Common/ShaderCommon.h"
 
 #undef WRITE
 

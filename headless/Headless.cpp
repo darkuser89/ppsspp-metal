@@ -44,6 +44,10 @@
 #include "Common/File/VFS/DirectoryReader.h"
 #include "Common/File/FileUtil.h"
 #include "Common/GPU/GraphicsContext.h"
+#include "Common/GPU/ShaderTranslation.h"
+#ifdef PPSSPP_HAS_METAL
+#include "Common/GPU/Metal/MetalGraphicsContext.h"
+#endif
 #include "Common/Net/Resolve.h"
 #include "Common/TimeUtil.h"
 #include "Common/StringUtils.h"
@@ -245,6 +249,12 @@ static GraphicsContext *CreateGraphicsContext(GPUCore gpuCore, std::string **dev
 #ifdef SDL
 	*deviceSetting = nullptr;
 	switch (gpuCore) {
+	case GPUCORE_METAL:
+#ifdef PPSSPP_HAS_METAL
+		return new MetalGraphicsContext();
+#else
+		return nullptr;
+#endif
 	case GPUCORE_GLES:
 		return new SDLHeadlessGLGraphicsContext();
 	case GPUCORE_VULKAN:
@@ -796,6 +806,9 @@ int main(int argc, const char* argv[]) {
 		case GPUBackend::VULKAN:
 			gpuCore = GPUCORE_VULKAN;
 			break;
+		case GPUBackend::METAL:
+			gpuCore = GPUCORE_METAL;
+			break;
 		}
 	}
 
@@ -814,7 +827,7 @@ int main(int argc, const char* argv[]) {
 		return 1;
 #else
 		// TODO: Will we need a larger window for higher resolutions? Well, not if we use buffered rendering.
-		window = CreateHiddenWindow(480, 272, cmdLineOptions.gpuBackend.value_or(GPUBackend::OPENGL), &windowDesc);
+		window = CreateHiddenWindow(480, 272, (GPUBackend)g_Config.iGPUBackend, &windowDesc);
 		if (!windowDesc.Valid()) {
 			fprintf(stderr, "Failed to create a window for graphics context");
 			return 1;
@@ -976,6 +989,21 @@ int main(int argc, const char* argv[]) {
 	}
 
 	std::string errorMessage;
+	// The normal app initializes shader translation in NativeInit. Headless has
+	// no NativeInit, so own the Metal compiler lifetime across surface creation.
+	struct ShaderTranslationScope {
+		bool active;
+		explicit ShaderTranslationScope(bool enable) : active(enable) {
+			if (active) {
+				ShaderTranslationInit();
+			}
+		}
+		~ShaderTranslationScope() {
+			if (active) {
+				ShaderTranslationShutdown();
+			}
+		}
+	} shaderTranslationScope(gpuCore == GPUCORE_METAL);
 	if (!graphicsContext->InitAPI(windowDesc.data2, deviceSetting, &errorMessage)) {
 		// No fallbacks in headless - if we can't run it, we can't. Let's not get confusing.
 		fprintf(stderr, "Failed to initialize graphics API: %s\n", errorMessage.c_str());

@@ -185,6 +185,8 @@ const char *g_ExceptionActionValues[] = {
 };
 
 #define POFF(member) offsetof(CommandLineOptions, member)
+static const char *g_MSAASampleCounts[] = { "1", "2", "4", "8", "16" };
+
 static const CommandLineParam g_autoParams[] = {
 	{POFF(fullscreen), CmdParamType::Bool, "fullscreen", '\0', "Force full screen mode", CmdLineMode::Application},
 	{POFF(fullscreen), CmdParamType::BoolInverse, "windowed", '\0', "Force windowed mode", CmdLineMode::Application},
@@ -222,6 +224,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(odsLog), CmdParamType::Bool, "odslog", 'o', "Also log through OutputDebugString (Windows)", CmdLineMode::Headless},
 	{POFF(generateInterpreterDispatch), CmdParamType::Bool, "generate-interpreter-dispatch", '\0', "Generate C++ interpreter dispatch code (ExecInstruction) to stdout and exit", CmdLineMode::Headless},
 	{POFF(resolutionScale), CmdParamType::Int, "resolution-scale", '\0', "Set the resolution scale factor"},
+	{POFF(msaaLevel), CmdParamType::Enum, "msaa", '\0', "Set MSAA sample count", CmdLineMode::Both, g_MSAASampleCounts, ARRAY_SIZE(g_MSAASampleCounts)},
 	{POFF(debuggerPort), CmdParamType::Int, "debugger", '\0', "Enable the WebSocket debugger on this port (0 = pick automatically); see docs/WebSocketDebugger.md"},
 	{POFF(debuggerRunPort), CmdParamType::Int, "debugger-run", '\0', "Like --debugger, but starts running instead of waiting at the entry point", CmdLineMode::Headless},
 	{POFF(autoSaveLoadSymbols), CmdParamType::Bool, "auto-save-load-symbols", '\0', "Auto save/load per-module and per-game symbol files (see bAutoSaveLoadSymbols)", CmdLineMode::Both},
@@ -444,6 +447,9 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 			} else if (restOfOption == "software") {
 				gpuBackend = GPUBackend::OPENGL;
 				softwareRendering = true;
+			} else if (restOfOption == "metal") {
+				gpuBackend = GPUBackend::METAL;
+				softwareRendering = false;
 			} else if (sscanf(restOfOption.c_str(), "gles%lg", &glVersionTemp) == 1 || sscanf(restOfOption.c_str(), "opengl%lg", &glVersionTemp) == 1) {
 				gpuBackend = GPUBackend::OPENGL;
 				softwareRendering = false;
@@ -592,6 +598,10 @@ void CommandLineOptions::ApplyToConfig() const {
 	if (resolutionScale.has_value()) {
 		g_Config.iInternalResolution = resolutionScale.value();
 		g_Config.DoNotSaveSetting(&g_Config.iInternalResolution);
+	}
+	if (msaaLevel.has_value()) {
+		g_Config.iMultiSampleLevel = msaaLevel.value();
+		g_Config.DoNotSaveSetting(&g_Config.iMultiSampleLevel);
 	}
 
 	if (memReadAction.has_value()) {

@@ -1528,6 +1528,7 @@ Draw::Texture *FramebufferManagerCommon::MakePixelTexture(const u8 *srcPixels, G
 	Draw::Texture *tex = draw_->CreateTexture(desc);
 	if (!tex) {
 		ERROR_LOG(Log::G3D, "Failed to create DrawPixels texture");
+		return nullptr;
 	}
 	// We don't need to count here, already counted by numUploads by the caller.
 

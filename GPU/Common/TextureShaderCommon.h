@@ -17,6 +17,9 @@
 
 #pragma once
 
+// Shared single-pass texture compute wrapper (RGBA8 output, packed RGBA input).
+extern const char *uploadShader;
+
 #include <unordered_map>
 #include <vector>
 #include <string>

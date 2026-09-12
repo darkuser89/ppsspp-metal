@@ -149,6 +149,7 @@ struct CommandLineOptions {
 
 	// Headless options that may also be mildly useful in application mode
 	std::optional<int> resolutionScale;
+	std::optional<int> msaaLevel;
 
 
 	// Headless options

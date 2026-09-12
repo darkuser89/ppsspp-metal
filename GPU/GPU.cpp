@@ -30,6 +30,9 @@
 #endif
 #include "GPU/Vulkan/GPU_Vulkan.h"
 #include "GPU/Software/SoftGpu.h"
+#ifdef PPSSPP_HAS_METAL
+#include "GPU/Metal/GPU_Metal.h"
+#endif
 
 #if PPSSPP_API(D3D11)
 #include "GPU/D3D11/GPU_D3D11.h"
@@ -53,6 +56,12 @@ static GPUCommon *CreateGPUCore(GPUCore gpuCore, GraphicsContext *ctx, Draw::Dra
 #endif
 	case GPUCORE_SOFTWARE:
 		return new SoftGPU(ctx, draw);
+	case GPUCORE_METAL:
+#ifdef PPSSPP_HAS_METAL
+		return draw ? CreateMetalGPU(ctx, draw) : nullptr;
+#else
+		return nullptr;
+#endif
 	case GPUCORE_DIRECTX11:
 #if PPSSPP_API(D3D11)
 		return new GPU_D3D11(ctx, draw);

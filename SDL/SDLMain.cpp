@@ -54,6 +54,10 @@ SDLJoystick *joystick = NULL;
 #include "Common/GPU/Vulkan/VulkanLoader.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
 #include "Common/GPU/Vulkan/VulkanGraphicsContext.h"
+#ifdef PPSSPP_HAS_METAL
+#include "Common/GPU/Metal/MetalGraphicsContext.h"
+#include <SDL3/SDL_metal.h>
+#endif
 #include "Common/TimeUtil.h"
 #include "Common/Input/InputState.h"
 #include "Common/Input/KeyCodes.h"
@@ -1904,7 +1908,7 @@ int main(int argc, char *argv[]) {
 	mode |= SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #endif
 
-	if (cmdLineOptions.fullscreen) {
+	if (cmdLineOptions.fullscreen.value_or(false)) {
 		g_display.pixel_xres = g_DesktopWidth;
 		g_display.pixel_yres = g_DesktopHeight;
 		g_Config.bFullScreen = true;
@@ -1987,6 +1991,9 @@ int main(int argc, char *argv[]) {
 	// Switch away from Vulkan if not available.
 	int fallbackGPUBackend = -1;
 	switch ((GPUBackend)g_Config.iGPUBackend) {
+	case GPUBackend::METAL:
+		// An explicitly selected Metal backend reports its initialization error.
+		break;
 	case GPUBackend::VULKAN:
 		if (!vulkanMayBeAvailable) {
 			fprintf(stderr, "Vulkan is not available, switching to OpenGL.\n");
@@ -2018,6 +2025,39 @@ int main(int argc, char *argv[]) {
 			windowDesc.data2 = (void *)glContext;
 
 			ctx = new SDLGLGraphicsContext();
+		} else if (backend == GPUBackend::METAL) {
+#ifdef PPSSPP_HAS_METAL
+			window = SDL_CreateWindow("Initializing Metal...", w, h, mode | SDL_WINDOW_METAL | SDL_WINDOW_HIDDEN);
+			if (!window) {
+				*errorMessage = SDL_GetError();
+				return false;
+			}
+			SDL_MetalView view = SDL_Metal_CreateView(window);
+			if (!view) {
+				*errorMessage = SDL_GetError();
+				SDL_DestroyWindow(window);
+				window = nullptr;
+				return false;
+			}
+			windowDesc.winsys = WINDOWSYSTEM_METAL_EXT;
+			windowDesc.data1 = SDL_Metal_GetLayer(view);
+			windowDesc.data2 = view;
+			ctx = new MetalGraphicsContext();
+			if (!ctx->InitAPI(nullptr, nullptr, errorMessage) ||
+				!ctx->InitSurface(windowDesc.winsys, windowDesc.data1, windowDesc.data2, errorMessage)) {
+				delete ctx;
+				SDL_Metal_DestroyView(view);
+				SDL_DestroyWindow(window);
+				window = nullptr;
+				windowDesc = {};
+				return false;
+			}
+			*graphicsContext = ctx;
+			return true;
+#else
+			*errorMessage = "Metal support is not included in this build";
+			return false;
+#endif
 		} else {
 			// Use a local copy of mode: this flag combination is Vulkan-specific, and if we fall back to
 			// OpenGL below, we don't want SDL_WINDOW_VULKAN to stick around and get OR'd in there too.
@@ -2304,6 +2344,11 @@ int main(int argc, char *argv[]) {
 	graphicsContext->ShutdownSurface();
 	graphicsContext->ShutdownAPI();
 	delete graphicsContext;
+#ifdef PPSSPP_HAS_METAL
+	if (windowDesc.winsys == WINDOWSYSTEM_METAL_EXT && windowDesc.data2) {
+		SDL_Metal_DestroyView(windowDesc.data2);
+	}
+#endif
 
 	NativeShutdown();
 

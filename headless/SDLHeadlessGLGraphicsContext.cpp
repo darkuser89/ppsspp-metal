@@ -21,6 +21,9 @@
 
 #include "ppsspp_config.h"
 #include <SDL3/SDL.h>
+#ifdef PPSSPP_HAS_METAL
+#include <SDL3/SDL_metal.h>
+#endif
 
 #include "headless/SDLHeadlessGLGraphicsContext.h"
 #include "Common/GPU/OpenGL/GLCommon.h"
@@ -44,6 +47,8 @@ void *CreateHiddenWindow(int w, int h, GPUBackend backend, WindowDesc *desc) {
 		flags |= SDL_WINDOW_OPENGL;
 	} else if (backend == GPUBackend::VULKAN) {
 		flags |= SDL_WINDOW_VULKAN;
+	} else if (backend == GPUBackend::METAL) {
+		flags |= SDL_WINDOW_METAL;
 	}
 	if (!WINDOW_VISIBLE) {
 		flags |= SDL_WINDOW_HIDDEN;
@@ -56,7 +61,21 @@ void *CreateHiddenWindow(int w, int h, GPUBackend backend, WindowDesc *desc) {
 		return nullptr;
 	}
 
-	if (backend == GPUBackend::VULKAN) {
+	if (backend == GPUBackend::METAL) {
+#ifdef PPSSPP_HAS_METAL
+		SDL_MetalView view = SDL_Metal_CreateView(window);
+		if (!view) {
+			SDL_DestroyWindow(window);
+			return nullptr;
+		}
+		desc->winsys = WINDOWSYSTEM_METAL_EXT;
+		desc->data1 = SDL_Metal_GetLayer(view);
+		desc->data2 = view;
+#else
+		SDL_DestroyWindow(window);
+		return nullptr;
+#endif
+	} else if (backend == GPUBackend::VULKAN) {
 		// Overwrite the surface init params with what we need for Vulkan..
 		std::string errorMessage;
 		if (!DetermineVulkanWindowSystem(window, desc, &errorMessage)) {
@@ -74,6 +93,11 @@ void *CreateHiddenWindow(int w, int h, GPUBackend backend, WindowDesc *desc) {
 
 void DestroyHiddenWindow(void *window, WindowDesc desc) {
 	if (window) {
+#ifdef PPSSPP_HAS_METAL
+		if (desc.winsys == WINDOWSYSTEM_METAL_EXT && desc.data2) {
+			SDL_Metal_DestroyView(desc.data2);
+		}
+#endif
 		SDL_DestroyWindow(static_cast<SDL_Window *>(window));
 		SDL_Quit();
 	}

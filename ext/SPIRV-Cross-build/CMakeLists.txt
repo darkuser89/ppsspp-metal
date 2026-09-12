@@ -61,6 +61,23 @@ target_link_libraries(spirv-cross-cpp spirv-cross-glsl)
 target_link_libraries(spirv-cross-hlsl spirv-cross-glsl)
 target_include_directories(spirv-cross-core PUBLIC ${SRCDIR})
 
+# Keep Metal's recoverable compiler errors separate from the existing backends'
+# assertion-based SPIRV-Cross build. The namespace prevents duplicate symbols and
+# differing inline exception policies from violating the one-definition rule.
+if(APPLE AND NOT IOS AND NOT LIBRETRO)
+	add_library(spirv-cross-metal STATIC
+		${SRCDIR}/spirv_cross.cpp
+		${SRCDIR}/spirv_cross_util.cpp
+		${SRCDIR}/spirv_cfg.cpp
+		${SRCDIR}/spirv_cross_parsed_ir.cpp
+		${SRCDIR}/spirv_parser.cpp
+		${SRCDIR}/spirv_glsl.cpp
+		${SRCDIR}/spirv_msl.cpp
+	)
+	target_compile_definitions(spirv-cross-metal PRIVATE SPIRV_CROSS_NAMESPACE_OVERRIDE=ppsspp_metal_spirv)
+	target_compile_options(spirv-cross-metal PRIVATE -fexceptions)
+endif()
+
 set(spirv-compiler-options "")
 set(spirv-compiler-defines "")
 

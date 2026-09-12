@@ -243,7 +243,8 @@ void TextureShaderScreen::CreateViews() {
 	
 	shaders_ = GetAllTextureShaderInfo();
 	for (int i = 0; i < (int)shaders_.size(); ) {
-		if (shaders_[i].hidden) {
+		if (shaders_[i].hidden || (GetGPUBackend() == GPUBackend::METAL && shaders_[i].section != "Off" &&
+			(!shaders_[i].metalSupported || shaders_[i].computeShaderFiles.size() != 1 || !shaders_[i].constantBuffer.empty()))) {
 			shaders_.erase(shaders_.begin() + i);
 		} else {
 			i++;

@@ -242,7 +242,9 @@ static void GenericStreamBuffer(DebuggerRequest &req, std::function<bool(const G
 	if (!func(buf, &isFramebuffer)) {
 		return req.Fail("Could not download output");
 	}
-	if (!buf) {
+	// A CPU breakpoint can precede the first GE framebuffer setup. A memory
+	// fallback with zero stride is not an image and would make libpng abort.
+	if (!buf || !buf->GetData() || buf->GetStride() == 0 || buf->GetHeight() == 0) {
 		return req.Fail("No output available");
 	}
 

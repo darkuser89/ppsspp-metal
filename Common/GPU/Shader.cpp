@@ -31,6 +31,7 @@ ShaderLanguageDesc::ShaderLanguageDesc(ShaderLanguage lang) {
 
 void ShaderLanguageDesc::Init(ShaderLanguage lang) {
 	shaderLanguage = lang;
+	framebufferArrayTextures = lang == GLSL_VULKAN;
 	strcpy(driverInfo, "");
 	switch (lang) {
 	case GLSL_1xx:
