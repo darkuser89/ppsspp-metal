@@ -35,8 +35,9 @@ struct MetalGEFragmentShader : MetalGEShader {
 };
 
 struct MetalGEUniformBuffers {
-	id<MTLBuffer> base = nil;
-	id<MTLBuffer> lights = nil;
+	Metal::UploadSlice base;
+	Metal::UploadSlice lights;
+	uint64_t commandGeneration = 0;
 };
 
 // Owned by the emulation/render thread, like the shared generators and gstate.
@@ -59,7 +60,8 @@ public:
 	int GetNumFragmentShaders() const { return (int)fragmentCache_.size(); }
 
 	// Uploads immutable snapshots. Failure retains the previous snapshots and all
-	// dirty flags. Encoded draws retain their old buffers across later updates.
+	// dirty flags. Upload slices remain immutable until their submission finishes,
+	// and are refreshed after command buffer changes, even without dirty uniforms.
 	bool UpdateUniforms(bool useBufferedRendering, bool pixelMapped, std::string *error);
 	void SetSamplerLodBias(float bias);
 	bool BindUniforms(id<MTLRenderCommandEncoder> encoder, std::string *error) const;

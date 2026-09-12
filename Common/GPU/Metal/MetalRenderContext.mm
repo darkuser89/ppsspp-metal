@@ -118,6 +118,7 @@ bool RenderContext::BeginCommands(std::string *error) {
 		return false;
 	}
 	commands_.label = @"PPSSPP render commands";
+	++commandGeneration_;
 	return true;
 }
 

@@ -40,11 +40,12 @@ public:
 	// Updates to resources already referenced by a draw must use Commands().
 	id<MTLCommandBuffer> InitializationCommands(std::string *error);
 	// Transient data for the current command buffer. Encode its consumers before
-	// submitting; unlike persistent buffers, these slices must not be cached.
+	// submitting; cached slices are valid only for the same CommandGeneration().
 	UploadSlice Upload(const void *data, size_t size, std::string *error);
 
 	id<MTLDevice> Device() const { return device_; }
 	id<MTLCommandBuffer> Commands() const { return commands_; }
+	uint64_t CommandGeneration() const { return commandGeneration_; }
 	std::string DeviceName() const;
 	id<MTLFunction> CreateShader(const CompiledShader &shader, const char *tag, std::string *error);
 
@@ -65,6 +66,7 @@ private:
 	std::array<std::vector<UploadBlock>, 3> uploadBlocks_;
 	size_t currentUploadBlock_ = 0;
 	size_t nextSubmission_ = 0;
+	uint64_t commandGeneration_ = 0;
 };
 
 }  // namespace Metal

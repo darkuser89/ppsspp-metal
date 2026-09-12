@@ -191,6 +191,12 @@ bool ShaderManagerMetal::UpdateUniforms(bool useBufferedRendering, bool pixelMap
 	if (!CheckEnvironment(error)) {
 		return false;
 	}
+	auto &context = manager_->Context();
+	if (!context.Commands()) {
+		*error = "Metal GE uniforms require an active command buffer";
+		return false;
+	}
+	const bool newCommands = buffers_.commandGeneration != context.CommandGeneration();
 	uint64_t dirty = gstate_c.GetDirtyUniforms();
 	if (!buffers_.base) {
 		dirty |= METAL_BASE_UNIFORMS;
@@ -207,22 +213,23 @@ bool ShaderManagerMetal::UpdateUniforms(bool useBufferedRendering, bool pixelMap
 	if ((dirty & METAL_BASE_UNIFORMS) || samplerLodBiasDirty_) {
 		BaseUpdateUniforms(&base, dirty, useBufferedRendering, pixelMapped);
 		base.samplerLodBias = samplerLodBias_;
-		next.base = [manager_->Context().Device() newBufferWithBytes:&base length:sizeof(base) options:MTLResourceStorageModeShared];
+	}
+	if (newCommands || (dirty & METAL_BASE_UNIFORMS) || samplerLodBiasDirty_) {
+		next.base = context.Upload(&base, sizeof(base), error);
 		if (!next.base) {
-			*error = "Failed to upload Metal GE base uniforms";
 			return false;
 		}
-		next.base.label = @"GE base uniforms";
 	}
 	if (dirty & DIRTY_LIGHT_UNIFORMS) {
 		LightUpdateUniforms(&lights, dirty);
-		next.lights = [manager_->Context().Device() newBufferWithBytes:&lights length:sizeof(lights) options:MTLResourceStorageModeShared];
+	}
+	if (newCommands || (dirty & DIRTY_LIGHT_UNIFORMS)) {
+		next.lights = context.Upload(&lights, sizeof(lights), error);
 		if (!next.lights) {
-			*error = "Failed to upload Metal GE light uniforms";
 			return false;
 		}
-		next.lights.label = @"GE light uniforms";
 	}
+	next.commandGeneration = context.CommandGeneration();
 	base_ = base;
 	lights_ = lights;
 	buffers_ = next;
@@ -236,14 +243,15 @@ bool ShaderManagerMetal::UpdateUniforms(bool useBufferedRendering, bool pixelMap
 
 bool ShaderManagerMetal::BindUniforms(id<MTLRenderCommandEncoder> encoder, std::string *error) const {
 	error->clear();
-	if (!manager_ || !encoder || !buffers_.base || !buffers_.lights) {
+	if (!manager_ || !encoder || !buffers_.base || !buffers_.lights || !manager_->Context().Commands() ||
+		buffers_.commandGeneration != manager_->Context().CommandGeneration()) {
 		*error = "Metal GE uniform buffers or render encoder are unavailable";
 		return false;
 	}
-	[encoder setVertexBuffer:buffers_.base offset:0 atIndex:DRAW_BINDING_DYNUBO_BASE];
-	[encoder setFragmentBuffer:buffers_.base offset:0 atIndex:DRAW_BINDING_DYNUBO_BASE];
-	[encoder setVertexBuffer:buffers_.lights offset:0 atIndex:DRAW_BINDING_DYNUBO_LIGHT];
-	[encoder setFragmentBuffer:buffers_.lights offset:0 atIndex:DRAW_BINDING_DYNUBO_LIGHT];
+	[encoder setVertexBuffer:buffers_.base.buffer offset:buffers_.base.offset atIndex:DRAW_BINDING_DYNUBO_BASE];
+	[encoder setFragmentBuffer:buffers_.base.buffer offset:buffers_.base.offset atIndex:DRAW_BINDING_DYNUBO_BASE];
+	[encoder setVertexBuffer:buffers_.lights.buffer offset:buffers_.lights.offset atIndex:DRAW_BINDING_DYNUBO_LIGHT];
+	[encoder setFragmentBuffer:buffers_.lights.buffer offset:buffers_.lights.offset atIndex:DRAW_BINDING_DYNUBO_LIGHT];
 	return true;
 }
 

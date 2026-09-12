@@ -210,12 +210,15 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		return false;
 	}
 	auto depth = pipelines_.GetDepthStencil(state.depthStencil, error);
-	if (!depth || !shaderManager_->UpdateUniforms(framebufferManager_->UseBufferedRendering(), transformed.pixelMapped, error)) {
+	if (!depth) {
 		return false;
 	}
 	auto encoder = manager_->RenderEncoder();
 	if (!encoder) {
 		*error = "Metal could not open the GE render pass";
+		return false;
+	}
+	if (!shaderManager_->UpdateUniforms(framebufferManager_->UseBufferedRendering(), transformed.pixelMapped, error)) {
 		return false;
 	}
 	auto &context = manager_->Context();
