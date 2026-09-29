@@ -196,6 +196,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(appendConfig), CmdParamType::String, "appendconfig", '\0', "Merge config FILE into the current configuration"},
 	{POFF(root), CmdParamType::String, "root", 'r', "Mount directory as the root of host0:/."},
 	{POFF(memStick), CmdParamType::String, "memstick", '\0', "Memory stick root directory (contains PSP/GAME etc)"},
+	{POFF(nand), CmdParamType::String, "nand", '\0', "Root NAND directory, one level above flash0 (default: the memstick's PSP/NAND)"},
 	{POFF(stateToLoad), CmdParamType::String, "state", '\0', "Load state from specified file"},
 	{POFF(stateToSave), CmdParamType::String, "save-state", '\0', "Save a state to FILE partway through the run", CmdLineMode::Headless},
 	{POFF(compare), CmdParamType::Bool, "compare", 'c', "Enable comparison mode", CmdLineMode::Headless},
@@ -207,12 +208,16 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(screenshotFilenameSave), CmdParamType::String, "screenshot-save", '\0', "Save rendered screenshot to specified path (PNG if the path ends in .png, BMP otherwise)", CmdLineMode::Headless},
 	{POFF(screenshotFilenameDiff), CmdParamType::String, "screenshot-diff", '\0', "Save a visual comparison image to FILE when comparing screenshots", CmdLineMode::Headless},
 	{POFF(screenshotSaveKeepAlpha), CmdParamType::Bool, "screenshot-keep-alpha", '\0', "Preserve the alpha channel when saving PNG screenshots (default: alpha is forced to 255)", CmdLineMode::Headless},
-	{POFF(timeout), CmdParamType::Double, "timeout", '\0', "Set the timeout value", CmdLineMode::Headless},
+	{POFF(timeoutWall), CmdParamType::Double, "timeout-wall", '\0', "Stop the run after this many real seconds", CmdLineMode::Headless},
+	{POFF(timeoutEmulated), CmdParamType::Double, "timeout-emulated", '\0', "Stop the run after this many emulated seconds", CmdLineMode::Headless},
+	// The old name for --timeout-wall, kept working because it's in a lot of scripts.
+	{POFF(timeoutWall), CmdParamType::Double, "timeout", '\0', "Alias for --timeout-wall", CmdLineMode::Headless},
 	{POFF(maxScreenshotError), CmdParamType::Double, "max-mse", '\0', "Maximum allowed MSE error for screenshot comparison", CmdLineMode::Headless},
 	{POFF(mountIso), CmdParamType::String, "mount", 'm', "Mount ISO/CSO on umd1:", CmdLineMode::Headless},
 	{POFF(unpackUpdater), CmdParamType::String, "unpack-updater", '\0', "Unpack the firmware in an updater EBOOT.PBP into DIR and exit", CmdLineMode::Headless},
 	{POFF(unpackUpdaterModel), CmdParamType::String, "unpack-updater-model", '\0', "PSP model to unpack for (01g..12g, default any)", CmdLineMode::Headless},
 	{POFF(unpackUpdaterFilter), CmdParamType::String, "unpack-updater-filter", '\0', "Only unpack entries under this path, e.g. flash0:/font/", CmdLineMode::Headless},
+	{POFF(firmwareFromDisc), CmdParamType::Bool, "firmware-from-disc", '\0', "Install the firmware bundled on the booted disc and use it for this run", CmdLineMode::Headless},
 	{POFF(installPkg), CmdParamType::String, "install-pkg", '\0', "Install the game update in a .pkg into DIR and exit", CmdLineMode::Headless},
 	{POFF(reModule), CmdParamType::String, "re-module", '\0', "Load one PRX standalone and write a reverse-engineering report, then exit", CmdLineMode::Headless},
 	{POFF(reOut), CmdParamType::String, "re-out", '\0', "Directory for --re-module output (default: re-out)", CmdLineMode::Headless},
@@ -221,6 +226,8 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(reRawBase), CmdParamType::String, "re-raw-base", '\0', "Treat --re-module as a raw code image loaded at this address, e.g. 0x08300000", CmdLineMode::Headless},
 	{POFF(reDecrypt), CmdParamType::String, "re-decrypt", '\0', "Decrypt one encrypted PSP file (PRX or ME image) and exit", CmdLineMode::Headless},
 	{POFF(reDecryptOut), CmdParamType::String, "re-decrypt-out", '\0', "Output file for --re-decrypt (default: decrypted.bin)", CmdLineMode::Headless},
+	{POFF(dumpFile), CmdParamType::String, "dump-file", '\0', "Copy one file out of the disc image, e.g. disc0:/PSP_GAME/USRDIR/MOVIE.PMF, or list a directory, and exit", CmdLineMode::Headless},
+	{POFF(dumpFileOut), CmdParamType::String, "dump-file-out", '\0', "Output file for --dump-file (default: the file's own name)", CmdLineMode::Headless},
 	{POFF(odsLog), CmdParamType::Bool, "odslog", 'o', "Also log through OutputDebugString (Windows)", CmdLineMode::Headless},
 	{POFF(generateInterpreterDispatch), CmdParamType::Bool, "generate-interpreter-dispatch", '\0', "Generate C++ interpreter dispatch code (ExecInstruction) to stdout and exit", CmdLineMode::Headless},
 	{POFF(resolutionScale), CmdParamType::Int, "resolution-scale", '\0', "Set the resolution scale factor"},
@@ -230,6 +237,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(autoSaveLoadSymbols), CmdParamType::Bool, "auto-save-load-symbols", '\0', "Auto save/load per-module and per-game symbol files (see bAutoSaveLoadSymbols)", CmdLineMode::Both},
 	{POFF(bootVSH), CmdParamType::Bool, "vsh", '\0', "Boot the VSH (requires files dumped from a PSP in the flash0 directory)"},
 	{POFF(disableHLE), CmdParamType::Int, "disable-hle", '\0', "Bitmask of libraries to run the real firmware module for instead of our HLE", CmdLineMode::Both},
+	{POFF(forceHLE), CmdParamType::Int, "force-hle", '\0', "Bitmask of libraries to run our HLE for, even where the real module is the default", CmdLineMode::Both},
 	{POFF(memReadAction), CmdParamType::Enum, "memread", '\0', "Set the action for memory read exceptions", CmdLineMode::Both, g_ExceptionActionValues, ARRAY_SIZE(g_ExceptionActionValues)},
 	{POFF(memWriteAction), CmdParamType::Enum, "memwrite", '\0', "Set the action for memory write exceptions", CmdLineMode::Both, g_ExceptionActionValues, ARRAY_SIZE(g_ExceptionActionValues)},
 	{POFF(breakAction), CmdParamType::Enum, "break", '\0', "Set the action for break exceptions", CmdLineMode::Both, g_ExceptionActionValues, ARRAY_SIZE(g_ExceptionActionValues)},
@@ -411,7 +419,7 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 				parsedAutoParam = true;
 				break;
 			} else if (result == ParseParamResult::BadValue) {
-				return CommandLineParseResult::Exit;
+				return CommandLineParseResult::Error;
 			} // else nomatch
 		}
 
@@ -564,6 +572,11 @@ void CommandLineOptions::ApplyToConfig() const {
 		// DoNotSaveSetting so a per-game config can't quietly put the HLE back.
 		g_Config.iDisableHLE = disableHLE.value();
 		g_Config.DoNotSaveSetting(&g_Config.iDisableHLE);
+	}
+
+	if (forceHLE.has_value()) {
+		g_Config.iForceEnableHLE = forceHLE.value();
+		g_Config.DoNotSaveSetting(&g_Config.iForceEnableHLE);
 	}
 
 	if (logLevel.has_value()) {

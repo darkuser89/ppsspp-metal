@@ -58,15 +58,28 @@ void __UsbCamInit() {
 }
 
 void __UsbCamDoState(PointerWrap &p) {
+	const bool wasCapturing = config->mode == Camera::Mode::Video;
 	auto s = p.Section("sceUsbCam", 0, 1);
 	if (!s) {
+		if (p.mode == p.MODE_READ) {
+			// Older states didn't save the camera, so leave it off.
+			if (wasCapturing) {
+				Camera::stopCapture();
+			}
+			config->mode = Camera::Mode::Unused;
+			config->type = Camera::ConfigType::CfNone;
+		}
 		return;
 	}
 
 	Do(p, *config);
-	if (config->mode == Camera::Mode::Video) { // stillImage? TBD
-		Camera::stopCapture();
-		Camera::startCapture();
+	if (p.mode == p.MODE_READ) {
+		if (config->mode == Camera::Mode::Video) { // stillImage? TBD
+			Camera::stopCapture();
+			Camera::startCapture();
+		} else if (wasCapturing) {
+			Camera::stopCapture();
+		}
 	}
 }
 

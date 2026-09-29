@@ -232,6 +232,7 @@ public:
 	bool bFastMemory;
 	int iCpuCore;
 	bool bCheckForNewVersion;
+	bool bWow64WarningDismissed;
 	bool bForceLagSync;
 	bool bFuncReplacements;
 	bool bHideSlowWarnings;
@@ -247,6 +248,7 @@ public:
 	bool bAutoSaveSymbolMap;
 	bool bCompressSymbols;
 	bool bCacheFullIsoInRam;
+	bool bAutoUpgradeFirmware;
 	int iRemoteISOPort; // Also used for serving a local remote debugger.
 	std::string sLastRemoteISOServer;
 	int iLastRemoteISOPort;
@@ -264,7 +266,7 @@ public:
 	int iAskForExitConfirmationAfterSeconds;
 	int iUIScaleFactor;  // In 8ths of powers of two.
 	int iDisableHLE;
-	int iForceEnableHLE;  // This is the opposite of DisableHLE but can force on HLE even when we've made it permanently off. Only used in tests, not hooked up to the ini file yet.
+	int iForceEnableHLE;  // The opposite of DisableHLE: puts the HLE back for a module that has graduated to always running for real. Saved as ForceEnableHLEFlags, and the way out if one of those turns out to break a game.
 
 	int iScreenRotation;  // Screen rotation lock. Only supported on Android and possibly other mobile platforms.
 

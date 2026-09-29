@@ -474,6 +474,9 @@ static void __IoAsyncNotify(u64 userdata, int cyclesLate) {
 		if (f->closePending) {
 			__IoFreeFd(fd, error);
 		}
+		// Like any interrupt that wakes a thread, this dispatches right away, so a better
+		// priority waiter doesn't sit ready until something else happens to reschedule.
+		__KernelReSchedule("async io completed");
 	}
 }
 
@@ -522,6 +525,7 @@ static void __IoSyncNotify(u64 userdata, int cyclesLate) {
 
 	HLEKernel::ResumeFromWait(threadID, WAITTYPE_IO, fd, result);
 	f->waitingSyncThreads.erase(std::remove(f->waitingSyncThreads.begin(), f->waitingSyncThreads.end(), threadID), f->waitingSyncThreads.end());
+	__KernelReSchedule("io completed");
 }
 
 static void __IoAsyncBeginCallback(SceUID threadID, SceUID prevCallbackId) {
@@ -665,6 +669,10 @@ void __IoInit() {
 	lastMemStickFatState = MemoryStick_FatState();
 }
 
+void __IoWaitForAsync() {
+	ioManager.SyncThread();
+}
+
 void __IoShutdown() {
 	ioManagerThreadEnabled = false;
 	ioManager.SyncThread();
@@ -722,6 +730,9 @@ void __IoDoState(PointerWrap &p) {
 	if (s >= 3) {
 		Do(p, lastMemStickState);
 		Do(p, lastMemStickFatState);
+	} else if (p.mode == p.MODE_READ) {
+		lastMemStickState = MemoryStick_State();
+		lastMemStickFatState = MemoryStick_FatState();
 	}
 
 	for (int i = 0; i < PSP_COUNT_FDS; ++i) {
@@ -871,9 +882,12 @@ void ConvertTmToPspDateTime(ScePspDateTime& date_out, const tm& date_in, int mic
 	date_out.microsecond = microSeconds;
 }
 
-static void __IoGetStat(SceIoStat *stat, const PSPFileInfo &info) {
-	memset(stat, 0xfe, sizeof(SceIoStat));
-
+// isFAT is whether the file lives on a FAT volume (the memory stick), which changes both the
+// permissions reported and whether st_private means anything.
+static void __IoGetStat(SceIoStat *stat, const PSPFileInfo &info, bool isFAT) {
+	// Deliberately no memset: pspautotests io/stat poisons the struct and shows a real PSP writes
+	// only as far as the timestamps - the six st_private words come back exactly as the caller
+	// left them. Clearing the whole struct would destroy 24 bytes the kernel never touches.
 	int type, attr;
 	if (info.type & FILETYPE_DIRECTORY) {
 		type = SCE_STM_FDIR;
@@ -883,13 +897,26 @@ static void __IoGetStat(SceIoStat *stat, const PSPFileInfo &info) {
 		attr = TYPE_FILE;
 	}
 
-	stat->st_mode = type | info.access;
-	stat->st_attr = attr;
+	if (isFAT) {
+		// FAT has no permissions of its own, so everything reads back as 0777 - including the
+		// execute bits, which is what Beats needed (issue #14812). Clearing the write bits is
+		// the read-only attribute, and that shows up in st_attr too.
+		const bool readOnly = (info.access & 0222) == 0;
+		stat->st_mode = type | (readOnly ? 0555 : 0777);
+		stat->st_attr = attr | (readOnly ? 0x01 : 0x00);
+	} else {
+		stat->st_mode = type | info.access;
+		stat->st_attr = attr;
+	}
 	stat->st_size = info.size;
 	ConvertTmToPspDateTime(stat->st_a_time, info.atime, info.atimeUs);
 	ConvertTmToPspDateTime(stat->st_c_time, info.ctime, info.ctimeUs);
 	ConvertTmToPspDateTime(stat->st_m_time, info.mtime, info.mtimeUs);
-	stat->st_private[0] = info.startSector;
+	// st_private[0] carries the LBN on a UMD, which games read to build disc0:/sce_lbn paths -
+	// see umd/raw_access. On the memory stick a real PSP leaves it alone entirely.
+	if (!isFAT) {
+		stat->st_private[0] = info.startSector;
+	}
 }
 
 static void __IoSchedAsync(FileNode *f, int fd, int usec) {
@@ -911,11 +938,25 @@ static u32 sceIoGetstat(const char *filename, u32 addr) {
 	// TODO: Improve timing (although this seems normally slow..)
 	int usec = 1000;
 
+	// A real PSP refuses to stat the root of a volume - io/stat records sceIoGetstat("ms0:/")
+	// coming back as an invalid argument rather than describing the directory.
+	const char *colon = strchr(filename, ':');
+	if (colon != nullptr) {
+		const char *rest = colon + 1;
+		while (*rest == '/') {
+			++rest;
+		}
+		if (*rest == '\0') {
+			return hleDelayResult(hleLogWarning(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "volume root"), "io getstat", usec);
+		}
+	}
+
+	const bool isFAT = pspFileSystem.FlagsFromFilename(filename) & FileSystemFlags::SIMULATE_FAT32;
 	auto stat = PSPPointer<SceIoStat>::Create(addr);
 	PSPFileInfo info = pspFileSystem.GetFileInfo(filename);
 	if (info.exists) {
 		if (stat.IsValid()) {
-			__IoGetStat(stat, info);
+			__IoGetStat(stat, info, isFAT);
 			stat.NotifyWrite("IoGetstat");
 			return hleDelayResult(hleLogDebug(Log::sceIo, 0, "sector = %08x", info.startSector), "io getstat", usec);
 		} else {
@@ -931,12 +972,26 @@ static u32 sceIoChstat(const char *filename, u32 iostatptr, u32 changebits) {
 	if (!iostat.IsValid())
 		return hleReportError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "bad address");
 
-	ERROR_LOG(Log::sceIo, "UNIMPL sceIoChstat(%s, %08x, %08x)", filename, iostatptr, changebits);
-	if (changebits & SCE_CST_MODE)
-		ERROR_LOG_REPORT(Log::sceIo, "sceIoChstat: change mode to %03o requested", iostat->st_mode);
+	// On a FAT volume the write bits in st_mode and the 0x01 bit in st_attr are two views of the
+	// same read-only flag: io/stat/readonly records that setting either one produces both, and
+	// that it's reversible. Anything else in the struct is still ignored.
+	bool haveWritable = false;
+	bool writable = false;
+	if (changebits & SCE_CST_MODE) {
+		writable = (iostat->st_mode & 0222) != 0;
+		haveWritable = true;
+	}
 	if (changebits & SCE_CST_ATTR) {
-		// These are pretty much all of the reported calls: https://report.ppsspp.org/logs/kind/1115
-		ERROR_LOG_REPORT(Log::sceIo, "sceIoChstat: change attr to %04x requested", iostat->st_attr);
+		// The attribute wins if both were asked for, since it names the flag directly.
+		writable = (iostat->st_attr & 0x01) == 0;
+		haveWritable = true;
+	}
+	if (haveWritable) {
+		if (!pspFileSystem.SetFileWritable(filename, writable)) {
+			// Nothing to be done on a host that can't express it - Android content URIs, or a
+			// read-only filesystem. Hardware would have succeeded, so don't fail the call.
+			WARN_LOG(Log::sceIo, "sceIoChstat: could not make %s %s", filename, writable ? "writable" : "read-only");
+		}
 	}
 	if (changebits & SCE_CST_SIZE)
 		ERROR_LOG(Log::sceIo, "sceIoChstat: change size requested");
@@ -955,7 +1010,7 @@ static u32 npdrmRead(FileNode *f, u8 *data, int size) {
 	PGD_DESC *pgd = f->pgdInfo;
 	if (!pgd) {
 		// When pgdInfo is null, fall back to reading the file in non-encrypted mode
-		WARN_LOG(Log::IO, "npdrmRead: pgdInfo is null for file %s, reading as non-encrypted", f->fullpath.c_str());
+		DEBUG_LOG(Log::IO, "npdrmRead: pgdInfo is null for file %s, reading as non-encrypted", f->fullpath.c_str());
 		return (u32)pspFileSystem.ReadFile(f->handle, data, size);
 	}
 	u32 block, offset, blockPos;
@@ -1143,6 +1198,20 @@ void SanitizeControlChars(std::string &buf) {
 	}
 }
 
+// Output the emulated program wrote to stdout, stderr or a tty. A host that wants it (headless)
+// gets the bytes exactly as written, so its stdout is a faithful copy of the program's. Otherwise
+// it goes in the log, sanitized and with the trailing newline trimmed, since the log adds one.
+static void __IoWriteToHostOutput(DebugOutputChannel channel, const char *str, u32 validSize, int size, const char *name) {
+	if (Core_SendHostOutput(channel, std::string_view(str, validSize))) {
+		return;
+	}
+	const int str_size = size <= 0 || validSize == 0 ? 0 : (str[validSize - 1] == '\n' ? validSize - 1 : validSize);
+	// buffer so we can edit the string.
+	std::string buf(str, str_size);
+	SanitizeControlChars(buf);
+	INFO_LOG(Log::Printf, "%s: %.*s", name, (int)buf.size(), buf.data());
+}
+
 static bool __IoWrite(int &result, int id, u32 data_addr, int size, int &us) {
 	PROFILE_THIS_SCOPE("io_rw");
 	// Low estimate, may be improved later from the WriteFile result.
@@ -1155,12 +1224,8 @@ static bool __IoWrite(int &result, int id, u32 data_addr, int size, int &us) {
 	const u32 validSize = Memory::ClampValidSizeAt(data_addr, size);
 	// Let's handle stdout/stderr specially.
 	if (id == PSP_STDOUT || id == PSP_STDERR) {
-		const char *str = (const char *) data_ptr;
-		const int str_size = size <= 0 ? 0 : (str[validSize - 1] == '\n' ? validSize - 1 : validSize);
-		// buffer so we can edit the string.
-		std::string buf(str, str_size);
-		SanitizeControlChars(buf);
-		INFO_LOG(Log::Printf, "%s: %.*s", id == 1 ? "stdout" : "stderr", (int)buf.size(), buf.data());
+		__IoWriteToHostOutput(id == PSP_STDERR ? DebugOutputChannel::StdErr : DebugOutputChannel::StdOut,
+			(const char *)data_ptr, validSize, size, id == PSP_STDOUT ? "stdout" : "stderr");
 		result = validSize;
 		return true;
 	}
@@ -1184,11 +1249,7 @@ static bool __IoWrite(int &result, int id, u32 data_addr, int size, int &us) {
 		NotifyMemInfo(MemBlockFlags::READ, data_addr, size, tag.c_str(), tag.size());
 
 		if (f->isTTY) {
-			const char *str = (const char *)data_ptr;
-			const int str_size = size <= 0 ? 0 : (str[validSize - 1] == '\n' ? validSize - 1 : validSize);
-			std::string buf(str, str_size);
-			SanitizeControlChars(buf);
-			INFO_LOG(Log::Printf, "%s: %.*s", "tty", (int)buf.size(), buf.data());
+			__IoWriteToHostOutput(DebugOutputChannel::StdOut, (const char *)data_ptr, validSize, size, "tty");
 			result = validSize;
 			return true;
 		}
@@ -1488,6 +1549,15 @@ static FileNode *__IoOpen(int &error, const char *filename, int flags, int mode)
 		access |= FILEACCESS_TRUNCATE;
 	if (flags & PSP_O_EXCL)
 		access |= FILEACCESS_EXCL;
+
+	// Characters FAT can't store make the memory stick driver reject the path outright rather than
+	// report a missing file (utility/savedata/idlist opens a file under "TEST99901A?C").
+	const char *colon = strchr(filename, ':');
+	if (colon && (pspFileSystem.FlagsFromFilename(filename) & FileSystemFlags::SIMULATE_FAT32) &&
+		strpbrk(colon + 1, "?*<>|\"") != nullptr) {
+		error = SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+		return nullptr;
+	}
 
 	PSPFileInfo info;
 	int h = -1;
@@ -2533,17 +2603,15 @@ static u32 sceIoDread(int id, u32 dirent_addr) {
 		}
 
 		PSPFileInfo &info = dir->listing[dir->index];
-		__IoGetStat(&entry->d_stat, info);
+		const bool isFATDir = pspFileSystem.FlagsFromFilename(dir->name) & FileSystemFlags::SIMULATE_FAT32;
+		__IoGetStat(&entry->d_stat, info, isFATDir);
 
 		strncpy(entry->d_name, info.name.c_str(), 256);
 		entry->d_name[255] = '\0';
 
-		bool isFAT = pspFileSystem.FlagsFromFilename(dir->name) & FileSystemFlags::SIMULATE_FAT32;
 		// Only write d_private for memory stick
-		if (isFAT) {
+		if (isFATDir) {
 			const std::string &shortName = dir->ShortName(dir->index);
-			// All files look like they're executable on FAT. This is required for Beats, see issue #14812
-			entry->d_stat.st_mode |= 0111;
 			// write d_private for supporting Custom BGM
 			// ref JPCSP https://code.google.com/p/jpcsp/source/detail?r=3468
 			if (Memory::IsValidAddress(entry->d_private)){

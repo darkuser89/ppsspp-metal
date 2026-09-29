@@ -168,9 +168,6 @@ NAETT_FILES := \
   ${SRC}/ext/naett-lib/src/naett_core.c \
   ${SRC}/ext/naett-lib/src/naett_android.c
 
-MINIMP3_FILES := \
-    ${SRC}/ext/minimp3/minimp3.cpp
-
 AT3_STANDALONE_FILES := \
 	${SRC}/ext/at3_standalone/atrac.cpp \
 	${SRC}/ext/at3_standalone/atrac3.cpp \
@@ -306,7 +303,6 @@ EXEC_AND_LIB_FILES := \
   $(SPIRV_CROSS_FILES) \
   $(RCHEEVOS_FILES) \
   $(NAETT_FILES) \
-  $(MINIMP3_FILES) \
   $(AT3_STANDALONE_FILES) \
   $(EXT_FILES) \
   $(NATIVE_FILES) \
@@ -522,7 +518,6 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/MIPS/MIPSStackWalk.cpp \
   $(SRC)/Core/MIPS/MIPSTables.cpp \
   $(SRC)/Core/MIPS/MIPSVFPUUtils.cpp.arm \
-  $(SRC)/Core/MIPS/MIPSVFPUFallbacks.cpp.arm \
   $(SRC)/Core/MIPS/MIPSCodeUtils.cpp.arm \
   $(SRC)/Core/MIPS/MIPSDebugInterface.cpp \
   $(SRC)/Core/MIPS/MIPSTracer.cpp \
@@ -614,6 +609,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/HW/GpioMMIO.cpp \
   $(SRC)/Core/HW/MemoryStick.cpp \
   $(SRC)/Core/HW/MpegDemux.cpp.arm \
+  $(SRC)/Core/HW/AvcDecoder.cpp.arm \
   $(SRC)/Core/HW/MediaEngine.cpp.arm \
   $(SRC)/Core/HW/SasAudio.cpp.arm \
   $(SRC)/Core/HW/SasReverb.cpp.arm \
@@ -688,6 +684,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/Dialog/PSPMsgDialog.cpp \
   $(SRC)/Core/Dialog/PSPNetconfDialog.cpp \
   $(SRC)/Core/Dialog/PSPNpSigninDialog.cpp \
+  $(SRC)/Core/Dialog/PSPHtmlViewerDialog.cpp \
   $(SRC)/Core/Dialog/PSPOskDialog.cpp \
   $(SRC)/Core/Dialog/PSPOskConstants.cpp \
   $(SRC)/Core/Dialog/PSPScreenshotDialog.cpp \
@@ -741,7 +738,9 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/HLE/sceKernelThread.cpp.arm \
   $(SRC)/Core/HLE/sceKernelTime.cpp \
   $(SRC)/Core/HLE/sceKernelVTimer.cpp \
+  $(SRC)/Core/HLE/sceVideocodec.cpp \
   $(SRC)/Core/HLE/sceMpeg.cpp \
+  $(SRC)/Core/HLE/sceMpegbase.cpp \
   $(SRC)/Core/HLE/sceMd5.cpp \
   $(SRC)/Core/HLE/sceMp4.cpp \
   $(SRC)/Core/HLE/sceAac.cpp \
@@ -1048,6 +1047,7 @@ ifeq ($(UNITTEST),1)
 	$(SRC)/unittest/TestX64Emitter.cpp \
     $(SRC)/unittest/TestRiscVEmitter.cpp \
     $(SRC)/unittest/TestLoongArch64Emitter.cpp \
+    $(SRC)/unittest/TestCrossSIMD.cpp \
     $(SRC)/unittest/TestIRPassSimplify.cpp \
     $(SRC)/unittest/TestShaderGenerators.cpp \
     $(SRC)/unittest/TestSoftwareGPUJit.cpp \
@@ -1057,6 +1057,7 @@ ifeq ($(UNITTEST),1)
     $(SRC)/unittest/TestVFS.cpp \
     $(SRC)/unittest/TestDemangle.cpp \
     $(SRC)/unittest/TestLzrc.cpp \
+    $(SRC)/unittest/TestMpegCsc.cpp \
     $(SRC)/unittest/TestZipSlip.cpp \
     $(SRC)/unittest/UnitTest.cpp
 

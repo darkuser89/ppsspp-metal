@@ -544,13 +544,18 @@ void DoState(PointerWrap &p) {
 		return;
 	}
 
-	// These (should) be filled in later by the modules.
-	for (int i = 0; i < current; ++i) {
-		event_types[i].callback = AntiCrashCallback;
-		event_types[i].name = "INVALID EVENT";
+	// These (should) be filled in later by the modules. Only when loading: a save that fails partway
+	// wouldn't get to all the restores, and would leave the running game with broken events.
+	if (p.mode == PointerWrap::MODE_READ) {
+		for (int i = 0; i < current; ++i) {
+			event_types[i].callback = AntiCrashCallback;
+			event_types[i].name = "INVALID EVENT";
+		}
+		// The state's own events are 0..n-1, so one it doesn't have gets the first id after those.
+		nextEventTypeRestoreId = n;
+		usedEventTypes.clear();
 	}
-	nextEventTypeRestoreId = n - 1;
-	usedEventTypes.clear();
+	// Needed in every pass, or each restore would look like a duplicate and get a new id.
 	restoredEventTypes.clear();
 
 	if (s >= 3) {
@@ -573,6 +578,10 @@ void DoState(PointerWrap &p) {
 	} else {
 		lastGlobalTimeTicks = 0;
 		lastGlobalTimeUs = 0;
+	}
+	if (p.mode == PointerWrap::MODE_READ) {
+		// A debugger's run-until deadline is in emulated us, and the ticks it maps to just changed.
+		RecomputeBreakDeadline();
 	}
 
 	__AudioCPUMHzChange();

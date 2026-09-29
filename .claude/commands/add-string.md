@@ -5,18 +5,22 @@ argument-hint: <Section> "<Key>" ["<English string>"]
 
 Add and/or translate a PPSSPP UI string.
 
-- Section: `$1`
-- Key: `$2`
-- English string: `$3` - if this is empty, the key already exists in `assets/lang/en_US.ini` and
-  you're only filling in the languages where it's still untranslated.
+What was asked for: `$ARGUMENTS`
 
-Those three are split off the invocation positionally, so they're only right if it was called as
-`/add-string <Section> "<Key>" ["<English string>"]`. Called with a sentence instead, they'll be
-three arbitrary words - so **check them before you touch anything**: `$1` has to be a real `[Section]`
-in `assets/lang/en_US.ini`, and `$2` a key that exists under it (or, for a new string, one that
-doesn't exist anywhere yet and that you can find in the C++). If they don't hold up, work out the
-real section and key from what was actually asked for, say which values you settled on, and carry on
-from there - don't translate whatever the positional split happened to produce.
+Work out three things from that, and **say which values you settled on before you touch anything**:
+
+- **Section** - a `[Section]` that exists in `assets/lang/en_US.ini`. Check that it does.
+- **Key** - for a new string this is the English text itself, which is how keys are written here; for
+  an existing one it is the key as `en_US.ini` spells it, character for character.
+- **English string** - only for a new key. If the key is already in `en_US.ini` there is no English
+  string to pass, and the job is filling in the languages where it is still untranslated.
+
+The invocation may be `<Section> "<Key>" ["<English string>"]`, or an ordinary sentence naming the
+section and the string, or just the string. Read it, don't split it on whitespace and hope: three
+words off the front of a sentence are three arbitrary words, and translating those quietly writes
+rubbish into 47 files. When the section or key isn't stated outright, find them - grep the C++ for
+the string to see which `GetI18NCategory` it belongs to, and `en_US.ini` for whether the key is
+already there. Ask only if that leaves it genuinely ambiguous.
 
 Follow the workflow in docs/translations.md. Run langtool from
 `Tools/langtool`:
@@ -51,23 +55,31 @@ Follow the workflow in docs/translations.md. Run langtool from
    No trailing `# comments` on those lines, they'd end up inside the translation. Placeholders like `%1` and `%d` have to appear verbatim in the
    translation, in whatever position the target language needs them.
 
-   **If you don't know a language well enough to be confident, leave it out.** A key that's missing
-   from a language file falls back to the English string at runtime, which is normal and fine - much
-   better than a confident guess that nobody in the project can read well enough to catch.
+   **If you don't know a language well enough to be confident, leave it out.** Step 4 gives those
+   languages the English string as a placeholder, which is much better than a confident guess that
+   nobody in the project can read well enough to catch.
 
    If a language deliberately keeps the English string (a term like "Vsync" that language doesn't
    translate), that's different from not knowing - include it with the English text. It gets written
    with a `# same as English` comment, which is what stops langtool from trying to translate it
    again on every later run.
 
-3. `cargo run -- import-single <scratch-file> "$1" "$2"`
+3. `cargo run -- import-single <scratch-file> "<Section>" "<Key>"`
 
    Note this overwrites any existing value for that key, so if the key already had human
    translations, check what you're about to replace first. The section has to exist already.
 
-4. `cargo run -- validate` - always, at the end. It must print `Found 0 problems.`
+4. `cargo run -- add-new-key "<Section>" "<Key>"` - **always, every language file ends up with the
+   key.** This writes `Key = Key` (plain English, no `# same as English` marker, so it still reads
+   as outstanding work) into every language you skipped, and leaves the ones you translated alone.
+   A missing key would fall back to the English string at runtime anyway, but then it looks exactly
+   like a translated one in the files, and translators can't see what's left to do.
+
+   Don't reach for `copy-missing-lines` to do this - it fills in placeholders repo-wide, and drags
+   several hundred lines of unrelated housekeeping (other missing keys, obsolete keys commented out)
+   into your diff.
+
+5. `cargo run -- validate` - always, at the end. It must print `Found 0 problems.`
 
 Finally, report which languages you translated and which you skipped and why, and leave the changes
-uncommitted for review unless asked otherwise. If you want the languages you skipped to carry the
-English string as a visible placeholder rather than just falling back to it, that's
-`cargo run -- copy-missing-lines`.
+uncommitted for review unless asked otherwise.

@@ -1299,10 +1299,16 @@ void PPGeDrawImage(ImageID atlasImage, float x, float y, float w, float h, const
 void PPGeDrawImage(float x, float y, float w, float h, float u1, float v1, float u2, float v2, int tw, int th, const PPGeImageStyle &style) {
 	if (!dlPtr)
 		return;
+	if (!style.alphaBlend) {
+		WriteCmd(GE_CMD_ALPHABLENDENABLE, 0);
+	}
 	BeginVertexData();
 	Vertex(x, y, u1, v1, tw, th, style.color);
 	Vertex(x + w, y + h, u2, v2, tw, th, style.color);
 	EndVertexDataAndDraw(GE_PRIM_RECTANGLES);
+	if (!style.alphaBlend) {
+		WriteCmd(GE_CMD_ALPHABLENDENABLE, 1);
+	}
 }
 
 void PPGeSetDefaultTexture()
@@ -1443,6 +1449,12 @@ void PPGeImage::Free() {
 		loadedTextures_.erase(std::remove(loadedTextures_.begin(), loadedTextures_.end(), this), loadedTextures_.end());
 		loadFailed_ = false;
 	}
+}
+
+void PPGeImage::Forget() {
+	texture_ = 0;
+	loadFailed_ = false;
+	loadedTextures_.erase(std::remove(loadedTextures_.begin(), loadedTextures_.end(), this), loadedTextures_.end());
 }
 
 void PPGeImage::DoState(PointerWrap &p) {

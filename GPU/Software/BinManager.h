@@ -57,6 +57,8 @@ struct BinItem {
 
 template <typename T, size_t N>
 struct BinQueue {
+	BinQueue(const BinQueue &) = delete;
+	BinQueue &operator=(const BinQueue &) = delete;
 	BinQueue() {
 		Reset();
 	}
@@ -185,6 +187,8 @@ struct BinDirtyRange {
 class StringWriter;
 class BinManager {
 public:
+	BinManager(const BinManager &) = delete;
+	BinManager &operator=(const BinManager &) = delete;
 	BinManager();
 	~BinManager();
 
@@ -265,6 +269,8 @@ private:
 
 	bool pendingOverlap_ = false;
 	bool creatingState_ = false;
+	// JIT clear generations when the current state was computed.
+	int jitGen_ = -1;
 	uint16_t pendingStateIndex_ = 0;
 
 	std::unordered_map<const char *, double> flushReasonTimes_;

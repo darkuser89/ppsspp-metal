@@ -471,6 +471,9 @@ struct SceKernelSMOption {
 static int actionAfterModule;
 
 static std::set<SceUID> loadedModules;
+// Set once we've seen a PSP_MODULE_VSH_MODE module load (i.e. we're booting the VSH rather
+// than a game), and reset on the next __KernelLoadExec. See ShouldHLEModuleForLoad below.
+static bool g_runningVSH = false;
 // STATE END
 //////////////////////////////////////////////////////////////////////////
 
@@ -479,7 +482,7 @@ static void __KernelModuleInit() {
 }
 
 void __KernelModuleDoState(PointerWrap &p) {
-	auto s = p.Section("sceKernelModule", 1, 2);
+	auto s = p.Section("sceKernelModule", 1, 3);
 	if (!s)
 		return;
 
@@ -490,6 +493,19 @@ void __KernelModuleDoState(PointerWrap &p) {
 
 	if (s >= 2) {
 		Do(p, loadedModules);
+	}
+	if (s >= 3) {
+		Do(p, g_runningVSH);
+	} else if (p.mode == p.MODE_READ) {
+		// Derive it the way the loader sets it.
+		g_runningVSH = false;
+		for (SceUID moduleId : loadedModules) {
+			u32 error;
+			PSPModule *module = kernelObjects.Get<PSPModule>(moduleId, error);
+			if (module && ((module->nm.attribute & PSP_MODULE_VSH_MODE) != 0 || equals(module->nm.name, "vsh_module"))) {
+				g_runningVSH = true;
+			}
+		}
 	}
 
 	if (p.mode == p.MODE_READ) {
@@ -503,6 +519,9 @@ void __KernelModuleDoState(PointerWrap &p) {
 				}
 			}
 		}
+		// The functions were found in memory from before the load, where other code may have been
+		// (an overlay module, say.) Hash them from what's there now, so a hook only goes where it matches.
+		MIPSAnalyst::RehashFunctions();
 		if (g_Config.bFuncReplacements) {
 			MIPSAnalyst::ReplaceFunctions();
 		}
@@ -1117,10 +1136,6 @@ enum : u32 {
 	ELF_MAGIC = 0x464c457f,
 };
 
-// Set once we've seen a PSP_MODULE_VSH_MODE module load (i.e. we're booting the VSH rather
-// than a game), and reset on the next __KernelLoadExec. See ShouldHLEModuleForLoad below.
-static bool g_runningVSH = false;
-
 // A few flash0 modules (VSH's own bridge/UI/utility libraries) should only ever be genuinely
 // loaded - rather than faked via any HLE implementation we may have for them - once we know
 // we're actually running the VSH. A regular game never legitimately loads these, so this only
@@ -1180,22 +1195,36 @@ static void LoadAndStartVshKernelModule(const char *path, SceKernelSMOption *smo
 // Some of the kernel's drivers have a per-model build (memlmd, loadexec, wlanfirm, ...), and a
 // firmware installed for one model ships only that model's - so asking for "_01g" unconditionally
 // fails on, say, an 02g install, which is what PPSSPP's own updater unpack produces by default.
-// Swap in the model we're emulating when the path names a model and that file is actually there.
+// The naming also changed over time: firmwares older than about 3.50 predate the PSP-2000 and have
+// no split at all (plain memlmd.prx, loadexec.prx), and their wlan firmware is named after the
+// chip revision instead (wlanfirm_magpie.prx is the one that became wlanfirm_01g.prx). Try the
+// emulated model, then the model in the path, then those older spellings, and take whichever is
+// actually there.
 static std::string ResolveVshModelModule(const char *path) {
 	std::string_view name(path);
 	const size_t model = name.find("_01g.prx");
 	if (model == std::string_view::npos) {
 		return std::string(path);
 	}
+	const std::string_view stem = name.substr(0, model);
+
+	std::vector<std::string> candidates;
 	const int generation = (int)EmulatedModelGeneration();
-	if (generation == 1) {
-		return std::string(path);
+	if (generation != 1) {
+		candidates.push_back(StringFromFormat("%.*s_%02dg.prx", (int)stem.size(), stem.data(), generation));
 	}
-	std::string candidate = StringFromFormat("%.*s_%02dg.prx", (int)model, path, generation);
-	if (pspFileSystem.GetFileInfo(candidate).exists) {
-		return candidate;
+	candidates.push_back(std::string(path));
+	if (endsWith(stem, "wlanfirm")) {
+		candidates.push_back(std::string(stem) + "_magpie.prx");
 	}
-	// A dump unpacked for every model has the 01g one too, so this isn't necessarily a failure.
+	candidates.push_back(std::string(stem) + ".prx");
+
+	for (const std::string &candidate : candidates) {
+		if (pspFileSystem.GetFileInfo(candidate).exists) {
+			return candidate;
+		}
+	}
+	// Nothing matched - hand back the original so the loader reports it by the name we asked for.
 	return std::string(path);
 }
 
@@ -1225,7 +1254,14 @@ static void LoadAndStartVshKernelModules() {
 	smallStackOption.stacksize = 0x40000;
 	*/
 	for (const char *path : vshSmallKernelModulePaths) {
-		LoadAndStartVshKernelModule(ResolveVshModelModule(path).c_str(), nullptr);
+		const std::string resolved = ResolveVshModelModule(path);
+		if (!pspFileSystem.GetFileInfo(resolved).exists) {
+			// Older firmwares don't have all of these - lowio.prx only appears around 3.52 - and a
+			// driver that isn't in the dump isn't a failure to report.
+			INFO_LOG(Log::sceModule, "LoadAndStartVshKernelModules: %s isn't in this firmware, skipping", resolved.c_str());
+			continue;
+		}
+		LoadAndStartVshKernelModule(resolved.c_str(), nullptr);
 	}
 
 	// Firmwares up to about 4.05 keep scePaf's heap allocator in a module of its own, which paf
@@ -2005,6 +2041,32 @@ static PSPModule *__KernelLoadELFFromPtr(const u8 *ptr, size_t elfSize, u32 load
 	return module;
 }
 
+bool KernelUnloadModuleByID(SceUID moduleId) {
+	u32 error;
+	PSPModule *module = kernelObjects.Get<PSPModule>(moduleId, error);
+	if (!module) {
+		return false;
+	}
+	module->Cleanup();
+	kernelObjects.Destroy<PSPModule>(moduleId);
+	return true;
+}
+
+bool KernelModuleIsLoaded(std::string_view name) {
+	u32 error;
+	for (SceUID moduleId : loadedModules) {
+		PSPModule *module = kernelObjects.Get<PSPModule>(moduleId, error);
+		// A fake module is our own HLE stand-in, which isn't the real library being asked about.
+		if (!module || module->isFake) {
+			continue;
+		}
+		if (equals(name, module->nm.name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 SceUID KernelLoadModule(const std::string &filename, std::string *error_string, bool fromTop) {
 	std::vector<uint8_t> buffer;
 	if (pspFileSystem.ReadEntireFile(filename, buffer) < 0)
@@ -2135,6 +2197,9 @@ void __KernelLoadReset() {
 		HLEShutdown();
 		Replacement_Init();
 		HLEInit();
+		// LoadExec keeps the PSP filesystems mounted, so refresh the filesystem-dependent HLE
+		// availability state after rebuilding the basic HLE state.
+		HLECheckModuleAvailability();
 	}
 
 	__KernelModuleInit();
@@ -3190,12 +3255,16 @@ const HLEFunction ModuleMgrForKernel[] = {
 	{0xD675EBB8, &WrapU_UUU<sceKernelSelfStopUnloadModule>,             "sceKernelSelfStopUnloadModule",           'x', "xxx",   HLE_KERNEL_SYSCALL },
 	{0xD5DDAB1F, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
 	{0xD86DD11B, &WrapU_C<sceKernelSearchModuleByName>,                 "sceKernelSearchModuleByName",             'x', "s",     HLE_KERNEL_SYSCALL },
-	// The 1.x NID for sceKernelLoadModuleVSH - same function, matched by its callee set in
-	// modulemgr.prx (sceKernelIsIntrContext, sceIoOpen/Ioctl/Close, sceKernelGetUserLevel).
-	// This is how the VSH loads its own plugins, so leaving it unresolved meant vshmain got
-	// module id 0 back and the sceKernelStartModule after it failed with UNKNOWN_MODULE.
-	// NOTE: new entries go at the end - the syscall opcode in a savestate is an index into this array.
+	// The 1.x NID for sceKernelLoadModuleVSH - same function.
+	// This is how the VSH loads its own plugins.
 	{0xA4370E7C, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
+	// And the 5.x NID for it.
+	{0xCCDE84A8, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
+	// And the four remaining NIDs it has had.
+	{0xFE586962, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
+	{0x329C89DB, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
+	{0x8909A807, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
+	{0xBDFEEC4F, &WrapU_CUU<sceKernelLoadModuleVSH>,                    "sceKernelLoadModuleVSH",                  'x', "sxx",   HLE_KERNEL_SYSCALL },
 };
 
 void Register_ModuleMgrForUser() {

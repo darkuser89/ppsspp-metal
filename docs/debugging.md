@@ -47,19 +47,34 @@ platforms. Where arch is x64 or ARM64.
 A working invocation, and the traps around it:
 
 ```bash
-./Windows/x64/Debug/PPSSPPHeadless.exe -i --debugger=34567 --timeout=100000 --graphics=software --log \
+./Windows/x64/Debug/PPSSPPHeadless.exe -i --debugger=34567 --timeout-wall=100000 --graphics=software --log \
     --root pspautotests/tests/../ pspautotests/tests/cpu/cpu_alu/cpu_alu.prx > hl.log 2>&1 &
 # wait for "Listening on port" in hl.log, then:
 ./Tools/wsdbg/target/release/wsdbg.exe 34567 --sync --sync-timeout 15 < script.txt
 ```
 
-- **`--timeout` is wall-clock seconds for the whole session**, not per test - the default is infinity, but as soon as
-  you pass one it applies to your whole interactive debugging session too. Pass something huge (`--timeout=100000`);
-  otherwise the process prints `TIMEOUT` and exits out from under you mid-session. (There's an escape hatch: the
-  deadline check is skipped while `IsDebuggerPresent()`, i.e. under a native debugger.)
+- **The timeouts apply to the whole session**, not per test. `--timeout-wall=N` is real seconds and
+  `--timeout-emulated=N` is emulated ones; both default to infinity, both can be set at once, and whichever
+  is reached first ends the run (`TIMEOUT` or `TIMEOUT (emulated)`). `--timeout` is the old name for
+  `--timeout-wall`. As soon as you pass one it applies to your whole interactive debugging session too, so
+  pass something huge (`--timeout-wall=100000`) or the process exits out from under you mid-session. The
+  wall-clock check is skipped while `IsDebuggerPresent()`; the emulated one doesn't need that escape hatch,
+  since sitting at a native breakpoint burns no emulated time.
+- **Which one you want depends on the question.** Wall-clock is what stops a hang from hanging the machine.
+  Emulated is what you want for "has the game had long enough to get somewhere" - a heavy scene runs many
+  times slower than real time and a near-idle one much faster, so the same wall-clock budget means very
+  different amounts of game time. Booting a firmware VSH to its XMB is a good example: 10 emulated seconds
+  is about 25 real ones on 6.61 and about 7 on 2.00.
 - **Prefer `--debugger=0` and scrape `Listening on port N` from that run's own log** over hardcoding a port. Also
   `taskkill //F //IM PPSSPPHeadless.exe` between runs for hygiene (Git Bash here has no `pkill`) - leftover
   instances are easy to accumulate when a script leaves the CPU stopped at a breakpoint.
+- **On Linux, kill leftovers with `pkill -x PPSSPPHeadless`, never `pkill -f PPSSPPHeadless`.** `-f` matches full
+  command lines, and the shell running your `pkill` has "PPSSPPHeadless" in its own command line, so it kills
+  itself (exit 144) and the emulator instances you meant to clear survive into the next run.
+- **Attaching gdb to a running instance fails under WSL/Ubuntu** (`ptrace_scope`: "Could not attach to process"),
+  so a hang has to be caught by starting the run under gdb. Interrupting a batch-mode gdb from another shell with
+  `pkill -INT` never got as far as the backtrace in the 2026-09-22 attempts. Before reaching for gdb, first rule out
+  the cheap explanations below (backend, flags) by diffing a good and a bad command line.
 
   Some history, because it silently produced a round of bogus results before it was fixed: `Common/Net/HTTPServer.cpp`
   used to set `SO_REUSEADDR`, which on Winsock means "allow binding a port someone else is already listening on"
@@ -112,7 +127,7 @@ A working invocation, and the traps around it:
 - **Exception and crash messages do not reach the log in headless.** It registers its own debug-output listener
   (`SendDebugOutput` in `headless/Headless.cpp`) that `fwrite`s to stdout, which is block-buffered when you
   redirect it to a file - so the output sits in the CRT buffer while the process runs, and `taskkill //F` throws
-  it away rather than flushing. To actually read a crash trace, give that run a short `--timeout` and `wait` for
+  it away rather than flushing. To actually read a crash trace, give that run a short `--timeout-wall` and `wait` for
   the process to exit on its own.
 - **`0xFFFFFFFF` is not an invalid instruction** - it decodes to `vflush`, a real Allegrex VFPU op, so writing it
   over code to test illegal-instruction handling just runs it. Check what an encoding actually is with
@@ -121,6 +136,80 @@ A working invocation, and the traps around it:
 - **To line input injection up with a wall-clock repro, use `cpu.status`'s `us` field** (emulated microseconds), not
   `ticks`. The PSP's clock frequency is changeable and games do change it - CrossCraft Classic runs at 333MHz, so
   `ticks / 222000000` is off by a factor of 1.5. `clockHz` is reported alongside.
+- **`--graphics=software` cannot see "the screen stops updating" bugs.** When HLE writes pixels straight into a
+  display buffer - video decoding, `sceJpeg`, `sceMpegAvcCsc` - the hardware backends only find out because the HLE
+  calls `gpu->PerformWriteFormattedFromMemory()`. The software renderer reads that memory directly and so renders
+  the frame whether or not anything was notified. A missing notification therefore looks perfect under
+  `--graphics=software` and shows up as a frozen screen on every real backend, while the decode logs keep scrolling
+  past as if all were well. Reproduce display bugs on a hardware backend (see "Choosing a GPU backend" below;
+  `directx9` is not a valid value) and compare `--screenshot-save=` output, not the log.
+- **`wsdbg --launch` only works with the headless build.** The app build is a GUI-subsystem exe with no stdout, so
+  the `Listening on port N` line never reaches the launcher and it gives up. Start it yourself with an explicit
+  `--debugger=PORT` and point wsdbg at that port. Note also that `--debugger-run` is `CmdLineMode::Headless`; the
+  app takes plain `--debugger=PORT`.
+- **`--launch` needs `--log` to find the port.** Without it, headless prints only emulated printfs, so the
+  `Listening on port N` NOTICE never appears and `--launch` fails with "PPSSPP never reported a debugger port".
+  `--log --loglevel=3` keeps the port line while cutting the debug flood - full `--log` at the default level costs
+  a lot of emulation speed (a 25-second run of a game playing video wrote 450k lines and ran several times slower
+  than real time, which on its own looks like the stall you're hunting).
+
+## Measuring a commercial game with headless
+
+Headless will happily run a game and print nothing, or run *a different configuration than the one you asked
+for*, and both look like a clean pass if you are counting log lines. Four traps, each of which silently
+produced a round of bogus results here:
+
+- **`--log` is required for any log output at all**, and the log goes to **stderr**. Without it you get only
+  headless's own lines (`Loaded State`, `TIMEOUT`); `-d`/`-v` set the level but don't turn the printf logger
+  on. So folding stderr in isn't optional if you're grepping, which is what makes the third trap bite.
+- **Headless's memory stick is not the app's.** It defaults to `<exe dir>/memstick` (`headless/Headless.cpp`),
+  so `Windows/<platform>/<config>/memstick`, while the app derives its own from `installed.txt` or Documents
+  (`InitMemstickDirectory` in `Windows/main.cpp`, which carries a TODO about sharing the derivation). Headless
+  *creates* that directory, empty `PSP/NAND/flash0` and all, so firmware installed through the app is invisible
+  and every LLE module quietly falls back to HLE - at which point you are measuring the HLE you were trying to
+  compare against. Pass `--memstick=` explicitly; it resolves relative to the CWD, not the exe.
+- **Check the exit code.** An unrecognised parameter prints `Error: ...` to stderr and exits 1, which is
+  correct and easy to throw away: fold stderr into stdout (which the first trap forces), count grep hits, and a
+  run that never started reports the same all-zero line as a clean one.
+- **Zero is not a pass.** Measuring by log-grepping needs a positive precondition asserted separately ("did
+  this run reach the code at all"), or "0 errors" also means "0 anything" - which is equally what a failed
+  boot, a savestate that never reaches the cutscene, and a silent HLE fallback produce.
+
+The last three compound: the fix is to treat the run's exit code and a positive "we got here" counter as
+preconditions, and only then believe the error counts.
+
+Rather than silently falling back to HLE, headless refuses the run: an explicit
+`--disable-hle=` whose firmware module isn't there names the module, prints the `flash0:/kd` and memory stick
+it looked in (usually enough to spot that it's the one beside the exe), and exits 1. Only an *explicit*
+`--disable-hle` binds - sceMpeg and sceMp4 are LLE by default and still fall back quietly, or every run on a
+machine with no firmware would fail. So when a measurement depends on the real module, pass the flag
+explicitly even though it's on by default, and the run will tell you if it didn't get it.
+
+`--force-hle=` is the other direction, and the one to reach for when deciding whether something is
+our fault: it puts our HLE back for libraries that now run the real module by default, so the same
+repro can be run both ways and the logs diffed. That is how the leftover warnings in Tekken 6 were
+sorted - three appeared identically with `--force-hle=16`, which made them the game's own, and the
+fourth only under the real module, which made it ours. Neither `--nand=` pointing somewhere empty
+nor `--appendconfig` does this job: the firmware gets found anyway and the setting is per-game.
+
+### Choosing a GPU backend
+
+- **`--graphics=software`** (the default) needs no GPU at all, and matches the GPU pspautotests' reference
+  screenshots (taken on a PSP) best. It's slow for games, though: it runs display lists synchronously inside
+  `sceGeListEnQueue`, which then dominates any profile of the emulator thread.
+- **`--graphics=vulkan`** renders offscreen, into images of its own with no window or swapchain, so it needs no
+  display. On macOS it goes through MoltenVK.
+- **`--graphics=opengl`** renders offscreen on macOS (a CGL context with a framebuffer object of its own), and
+  through a hidden SDL window elsewhere.
+- **`--graphics=d3d11`** (Windows) renders through a hidden window.
+
+For game runs, prefer a hardware backend: 30 emulated seconds of God of War take 3-4 seconds instead of a minute.
+The pspautotests pass on Vulkan and OpenGL except for 17 GPU tests, whose references are hardware screenshots
+that the hardware backends don't match exactly.
+
+Pass `--graphics` explicitly even when you want the default, so a copied command line doesn't depend on it. If a
+run goes silent with no CPU use, a host thread is blocked, and neither `--timeout-wall` nor `--timeout-emulated`
+will end it, as both are only checked when the emulation loop comes around.
 
 ## Debugging and breakpoint considerations
 
@@ -136,6 +225,32 @@ Concretely, as measured against the headless build (2026-08-16), per CPU backend
 | `cpu.stepInto/Over/Out`, `runUntil`, `nextHLE` | works | works |
 | `memory.breakpoint.*` (memchecks) | works | **only for constant addresses** |
 | `cpu.regBreakpoint.*` | works | never trips (as documented) |
+
+## Native debuggers and the memory fault handler
+
+With fast memory on, a bad guest access from JIT code is a real host SIGSEGV/SIGBUS (an access violation on
+Windows), which `Memory::HandleFault` (`Core/MemFault.cpp`) catches and turns into a clean emulator-side
+exception. A native debugger sees the fault first and stops there, so a run that would have reported
+`Read Word: SIGSEGV at ...` looks like a crash instead. Continuing hands the fault to the handler, like a
+first-chance exception in Visual Studio. To keep the debugger out of the way when the faults are expected:
+
+- **lldb (macOS/iOS)** needs both of these, verified 2026-09-28 against `pspautotests/tests/cpu/crash`. The
+  first skips the stop on the Mach-level EXC_BAD_ACCESS, the second the stop on the signal it turns into:
+
+  ```
+  settings set platform.plugin.darwin.ignored-exceptions EXC_BAD_ACCESS
+  process launch --stop-at-entry
+  process handle SIGSEGV SIGBUS -s false -n false -p true
+  continue
+  ```
+
+  (`process handle` needs a live process, hence the `--stop-at-entry`.) The catch is that a genuine host crash
+  then kills the process without stopping in the debugger.
+- **gdb (Linux/Android)**: `handle SIGSEGV nostop noprint pass`.
+
+The `pspautotests/tests/cpu/crash/crash_*.prx` binaries each make one bad access (read, write, float, bad jump),
+which makes them the quickest check that the handler works on a platform: run one with `-j` in headless. They
+should print the guest exception and exit 0, not die with signal 11.
 
 ## Debugging a game that works on hardware but not in PPSSPP
 

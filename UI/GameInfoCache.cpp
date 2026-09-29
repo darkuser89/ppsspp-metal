@@ -170,9 +170,11 @@ bool GameInfo::Delete() {
 			const Path &ppstPath = filePath_;
 			INFO_LOG(Log::System, "Deleting file %s", ppstPath.c_str());
 			MoveFileToTrashOrDelete(ppstPath);
-			const Path screenshotPath = filePath_.WithReplacedExtension(".ppst", ".jpg");
-			if (File::Exists(screenshotPath)) {
-				MoveFileToTrashOrDelete(screenshotPath);
+			// The screenshot and the slot's custom name are no use without the state itself.
+			for (const Path &companion : SaveState::GetCompanionFilePaths(ppstPath)) {
+				if (File::Exists(companion)) {
+					MoveFileToTrashOrDelete(companion);
+				}
 			}
 			return true;
 		}
@@ -766,8 +768,9 @@ handleELF:
 
 			// Let's use the screenshot as an icon, too.
 			if (flags_ & GameInfoFlags::ICON) {
-				Path screenshotPath = gamePath_.WithReplacedExtension(".ppst", ".jpg");
-				if (ReadLocalFileToString(screenshotPath, &info_->icon.data, &info_->lock)) {
+				Path screenshotPath;
+				if (gamePath_.WithReplacedExtension(".ppst", ".jpg", &screenshotPath) &&
+					ReadLocalFileToString(screenshotPath, &info_->icon.data, &info_->lock)) {
 					info_->icon.dataLoaded = true;
 				}
 			}
@@ -778,9 +781,10 @@ handleELF:
 		{
 			info_->SetTitle(info_->GetFilePath().GetFilename());
 			if (flags_ & GameInfoFlags::ICON) {
-				Path screenshotPath = gamePath_.WithReplacedExtension(".ppdmp", ".png");
 				// Let's use the comparison screenshot as an icon, if it exists.
-				if (screenshotPath.IsLocalType() && ReadLocalFileToString(screenshotPath, &info_->icon.data, &info_->lock)) {
+				Path screenshotPath;
+				if (gamePath_.WithReplacedExtension(".ppdmp", ".png", &screenshotPath) &&
+					screenshotPath.IsLocalType() && ReadLocalFileToString(screenshotPath, &info_->icon.data, &info_->lock)) {
 					info_->icon.dataLoaded = true;
 				}
 			}

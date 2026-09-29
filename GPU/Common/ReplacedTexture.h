@@ -140,6 +140,8 @@ struct ReplacedTextureLevel {
 
 class ReplacedTexture {
 public:
+	ReplacedTexture(const ReplacedTexture &) = delete;
+	ReplacedTexture &operator=(const ReplacedTexture &) = delete;
 	ReplacedTexture(VFSBackend *vfs, const ReplacementDesc &desc);
 	~ReplacedTexture();
 
@@ -215,6 +217,10 @@ private:
 	};
 
 	void Prepare(VFSBackend *vfs);
+	// Waits for any load task, then drops all data and file references, and detaches from the VFS.
+	// The texture reloads from scratch once it gets a VFS again. Must run before the VFS is deleted.
+	void Unload();
+	void ReleaseLevels();
 	LoadLevelResult LoadLevelData(VFSFileReference *fileRef, const std::string &filename, int level, Draw::DataFormat *pixelFormat);
 	void PurgeIfNotUsedSinceTime(double t);
 

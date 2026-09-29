@@ -306,6 +306,7 @@ enum PSPErrorCode : u32 {
 	SCE_ERROR_AV_MODULE_NOT_LOADED                    = 0x80110F03,
 
 	SCE_ERROR_UTILITY_INVALID_STATUS                  = 0x80110001,
+	SCE_ERROR_UTILITY_INVALID_ADDRESS                 = 0x80110002,
 	SCE_ERROR_UTILITY_INVALID_PARAM_SIZE              = 0x80110004,
 	SCE_ERROR_UTILITY_WRONG_TYPE                      = 0x80110005,
 	SCE_ERROR_UTILITY_STRING_TOO_LONG                 = 0x80110102,
@@ -499,6 +500,8 @@ enum PSPErrorCode : u32 {
 	SCE_SAS_ERROR_NOT_INIT = 0x80420100,
 
 	SCE_AVCODEC_ERROR_INVALID_DATA = 0x807f00fd,
+	// Name inferred: sceAudiocodec returns this for an unsupported codec or AAC sample rate.
+	SCE_AVCODEC_ERROR_UNSUPPORTED = 0x807f00ff,
 
 	// These are inferred from behavior.
 	SCE_REG_ERROR_MALLOC_FAILURE = 0x80082712,

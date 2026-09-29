@@ -15,6 +15,7 @@
 #include "Common/Net/Resolve.h"
 
 #ifndef HTTPS_NOT_AVAILABLE
+#include "Common/Net/HTTPNaettRequest.h"
 #include "ext/naett-lib/naett.h"
 // Note: PPSSPP_PLATFORM(LINUX) is also set on Android, which needs no loader.
 #if PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID)
@@ -31,7 +32,6 @@ extern JavaVM *gJvm;
 
 namespace net {
 
-static bool g_naettInitialized;
 static bool g_wsaInitialized;
 
 void Init() {
@@ -44,19 +44,18 @@ void Init() {
 		g_wsaInitialized = true;
 	}
 #endif
-	if (!g_naettInitialized) {
+	// naett ignores repeat calls the same way WSAStartup does, so there's nothing to track here
+	// either. HTTPSAvailable is cheap to ask twice - on Linux it's a cached dlopen result.
 #ifndef HTTPS_NOT_AVAILABLE
 #if PPSSPP_PLATFORM(ANDROID)
-		_assert_(gJvm != nullptr);
-		naettInit(gJvm);
+	_assert_(gJvm != nullptr);
+	naettInit(gJvm);
 #else
-		if (HTTPSAvailable()) {
-			naettInit(NULL);
-		}
-#endif
-#endif
-		g_naettInitialized = true;
+	if (HTTPSAvailable()) {
+		naettInit(NULL);
 	}
+#endif
+#endif
 }
 
 bool HTTPSAvailable() {
@@ -70,6 +69,9 @@ bool HTTPSAvailable() {
 }
 
 void Shutdown() {
+#ifndef HTTPS_NOT_AVAILABLE
+	http::HTTPSShutdown();
+#endif
 #ifdef _WIN32
 	if (g_wsaInitialized) {
 		WSACleanup();

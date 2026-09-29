@@ -129,6 +129,7 @@
     <ClInclude Include="..\..\Core\Dialog\PSPMsgDialog.h" />
     <ClInclude Include="..\..\Core\Dialog\PSPNetconfDialog.h" />
     <ClInclude Include="..\..\Core\Dialog\PSPNpSigninDialog.h" />
+    <ClInclude Include="..\..\Core\Dialog\PSPHtmlViewerDialog.h" />
     <ClInclude Include="..\..\Core\Dialog\PSPOskConstants.h" />
     <ClInclude Include="..\..\Core\Dialog\PSPOskDialog.h" />
     <ClInclude Include="..\..\Core\Dialog\PSPPlaceholderDialog.h" />
@@ -219,7 +220,9 @@
     <ClInclude Include="..\..\Core\HLE\sceMp3.h" />
     <ClInclude Include="..\..\Core\HLE\sceMp4.h" />
     <ClInclude Include="..\..\Core\HLE\sceAac.h" />
+    <ClInclude Include="..\..\Core\HLE\sceVideocodec.h" />
     <ClInclude Include="..\..\Core\HLE\sceMpeg.h" />
+    <ClInclude Include="..\..\Core\HLE\sceMpegbase.h" />
     <ClInclude Include="..\..\Core\HLE\sceMt19937.h" />
     <ClInclude Include="..\..\Core\HLE\sceNet.h" />
     <ClInclude Include="..\..\Core\HLE\sceNet_lib.h" />
@@ -257,6 +260,7 @@
     <ClInclude Include="..\..\Core\HW\Camera.h" />
     <ClInclude Include="..\..\Core\HW\Display.h" />
     <ClInclude Include="..\..\Core\HW\GpioMMIO.h" />
+    <ClInclude Include="..\..\Core\HW\AvcDecoder.h" />
     <ClInclude Include="..\..\Core\HW\MediaEngine.h" />
     <ClInclude Include="..\..\Core\HW\MemoryStick.h" />
     <ClInclude Include="..\..\Core\HW\MpegDemux.h" />
@@ -303,7 +307,6 @@
     <ClInclude Include="..\..\Core\MIPS\InterpreterVFPU.h" />
     <ClInclude Include="..\..\Core\MIPS\MIPSStackWalk.h" />
     <ClInclude Include="..\..\Core\MIPS\MIPSTables.h" />
-    <ClInclude Include="..\..\Core\MIPS\MIPSVFPUFallbacks.h" />
     <ClInclude Include="..\..\Core\MIPS\MIPSVFPUUtils.h" />
     <ClInclude Include="..\..\Core\MIPS\MIPSTracer.h" />
     <ClInclude Include="..\..\Core\MIPS\x86\Jit.h" />
@@ -414,6 +417,7 @@
     <ClCompile Include="..\..\Core\Dialog\PSPMsgDialog.cpp" />
     <ClCompile Include="..\..\Core\Dialog\PSPNetconfDialog.cpp" />
     <ClCompile Include="..\..\Core\Dialog\PSPNpSigninDialog.cpp" />
+    <ClCompile Include="..\..\Core\Dialog\PSPHtmlViewerDialog.cpp" />
     <ClCompile Include="..\..\Core\Dialog\PSPOskConstants.cpp" />
     <ClCompile Include="..\..\Core\Dialog\PSPOskDialog.cpp" />
     <ClCompile Include="..\..\Core\Dialog\PSPPlaceholderDialog.cpp" />
@@ -502,7 +506,9 @@
     <ClCompile Include="..\..\Core\HLE\sceMp3.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceMp4.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceAac.cpp" />
+    <ClCompile Include="..\..\Core\HLE\sceVideocodec.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceMpeg.cpp" />
+    <ClCompile Include="..\..\Core\HLE\sceMpegbase.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceMt19937.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceNet.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceNet_lib.cpp" />
@@ -539,6 +545,7 @@
     <ClCompile Include="..\..\Core\HW\Camera.cpp" />
     <ClCompile Include="..\..\Core\HW\Display.cpp" />
     <ClCompile Include="..\..\Core\HW\GpioMMIO.cpp" />
+    <ClCompile Include="..\..\Core\HW\AvcDecoder.cpp" />
     <ClCompile Include="..\..\Core\HW\MediaEngine.cpp" />
     <ClCompile Include="..\..\Core\HW\MemoryStick.cpp" />
     <ClCompile Include="..\..\Core\HW\MpegDemux.cpp" />
@@ -611,7 +618,6 @@
     <ClCompile Include="..\..\Core\MIPS\InterpreterVFPU.cpp" />
     <ClCompile Include="..\..\Core\MIPS\MIPSStackWalk.cpp" />
     <ClCompile Include="..\..\Core\MIPS\MIPSTables.cpp" />
-    <ClCompile Include="..\..\Core\MIPS\MIPSVFPUFallbacks.cpp" />
     <ClCompile Include="..\..\Core\MIPS\MIPSVFPUUtils.cpp" />
     <ClCompile Include="..\..\Core\MIPS\MIPSTracer.cpp" />
     <ClCompile Include="..\..\Core\MIPS\x86\Asm.cpp" />

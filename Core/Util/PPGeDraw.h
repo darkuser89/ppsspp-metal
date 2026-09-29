@@ -85,6 +85,7 @@ struct PPGeStyle {
 
 struct PPGeImageStyle {
 	uint32_t color = 0xFFFFFFFF;
+	bool alphaBlend = true;
 };
 
 // Get the metrics of the bounding box of the text without changing the buffer or state.
@@ -121,6 +122,8 @@ public:
 	// Does not normally need to be called (except to force preloading.)
 	bool Load();
 	void Free();
+	// Drops the texture without freeing its memory, which a savestate load has already replaced.
+	void Forget();
 	bool IsValid();
 
 	void DoState(PointerWrap &p);

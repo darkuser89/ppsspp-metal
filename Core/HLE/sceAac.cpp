@@ -43,8 +43,12 @@ void __AACShutdown() {
 
 void __AACDoState(PointerWrap &p) {
 	auto s = p.Section("sceAAC", 0, 1);
-	if (!s)
+	if (!s) {
+		if (p.mode == PointerWrap::MODE_READ) {
+			__AACShutdown();
+		}
 		return;
+	}
 
 	Do(p, g_aacMap);
 }
@@ -216,6 +220,8 @@ const HLEFunction sceAac[] = {
 	{0X6DC7758A, &WrapU_U<sceAacGetMaxOutputSample>,             "sceAacGetMaxOutputSample",          'x', "x"      },
 	{0X506BF66C, &WrapU_U<sceAacGetSumDecodedSample>,            "sceAacGetSumDecodedSample",         'x', "x"      },
 	{0XD2DA2BBA, &WrapU_U<sceAacResetPlayPosition>,              "sceAacResetPlayPosition",           'x', "x"      },
+	{0XE955E83A, nullptr,                                        "sceAacLowLevelInit",                '?', ""       },
+	{0XFA01FCB6, nullptr,                                        "sceAacLowLevelDecode",              '?', ""       }
 };
 
 void Register_sceAac() {

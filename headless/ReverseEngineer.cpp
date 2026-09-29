@@ -44,6 +44,8 @@
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/ELF/PrxDecrypter.h"
 #include "Core/FileSystems/DirectoryFileSystem.h"
+#include "Core/FileSystems/ISOFileSystem.h"
+#include "Core/Loaders.h"
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/sceKernel.h"
@@ -391,8 +393,65 @@ int RunDecryptFile(const std::string &inPath, const std::string &outPath) {
 	return 0;
 }
 
+int RunDumpDiscFile(const std::string &discPath, const std::string &inPath, const std::string &outPath) {
+	std::string insideDisc = inPath;
+	const size_t colon = insideDisc.find(':');
+	if (colon != std::string::npos) {
+		insideDisc = insideDisc.substr(colon + 1);
+	}
+	if (insideDisc.empty() || insideDisc[0] != '/') {
+		insideDisc = "/" + insideDisc;
+	}
+
+	std::unique_ptr<FileLoader> loader(ConstructFileLoader(Path(discPath)));
+	std::string blockError;
+	std::shared_ptr<BlockDevice> device(loader ? ConstructBlockDevice(loader.get(), &blockError) : nullptr);
+	if (!device) {
+		fprintf(stderr, "dump-file: %s isn't a disc image we can read: %s\n", discPath.c_str(), blockError.c_str());
+		return 1;
+	}
+	// The ISO filesystem takes ownership of the block device, which owns the loader.
+	loader.release();
+	ISOFileSystem isoFs(&pspFileSystem, device);
+
+	// A directory gets listed instead.
+	const PSPFileInfo dirInfo = isoFs.GetFileInfo(insideDisc);
+	if (dirInfo.exists && dirInfo.type == FILETYPE_DIRECTORY) {
+		for (const PSPFileInfo &entry : isoFs.GetDirListing(insideDisc)) {
+			printf("%s %10lld %s\n", entry.type == FILETYPE_DIRECTORY ? "d" : "-", (long long)entry.size, entry.name.c_str());
+		}
+		return 0;
+	}
+
+	const int handle = isoFs.OpenFile(insideDisc, FILEACCESS_READ);
+	if (handle < 0) {
+		fprintf(stderr, "dump-file: no such file on the disc: %s\n", insideDisc.c_str());
+		return 1;
+	}
+	const PSPFileInfo info = isoFs.GetFileInfoByHandle(handle);
+	std::vector<u8> data((size_t)info.size);
+	const size_t readBytes = data.empty() ? 0 : isoFs.ReadFile(handle, data.data(), (s64)data.size());
+	isoFs.CloseFile(handle);
+	if (readBytes != data.size()) {
+		fprintf(stderr, "dump-file: short read, %d of %d bytes\n", (int)readBytes, (int)data.size());
+		return 1;
+	}
+	if (!File::WriteDataToFile(false, data.data(), data.size(), Path(outPath))) {
+		fprintf(stderr, "dump-file: couldn't write %s\n", outPath.c_str());
+		return 1;
+	}
+	printf("dump-file: wrote %d bytes of %s to %s\n", (int)data.size(), insideDisc.c_str(), outPath.c_str());
+	return 0;
+}
+
 int RunReverseEngineer(const ReverseEngineerOptions &opts) {
-	const Path modulePath = ResolveModulePath(opts.modulePath);
+	// A module inside a disc image rather than on the host - see ReverseEngineerOptions.
+	const bool fromDisc = startsWithNoCase(opts.modulePath, "disc0:") || startsWithNoCase(opts.modulePath, "umd0:");
+	if (fromDisc && opts.discPath.empty()) {
+		fprintf(stderr, "re: a disc0: module path needs the disc image as the positional argument\n");
+		return 1;
+	}
+	const Path modulePath = fromDisc ? Path(opts.discPath) : ResolveModulePath(opts.modulePath);
 	if (!File::Exists(modulePath)) {
 		fprintf(stderr, "re: no such file: %s\n", modulePath.c_str());
 		return 1;
@@ -415,8 +474,16 @@ int RunReverseEngineer(const ReverseEngineerOptions &opts) {
 		return 1;
 	}
 
+	// For a disc, the path inside it; otherwise the containing directory and the leaf name.
+	std::string insideDisc;
+	if (fromDisc) {
+		insideDisc = opts.modulePath.substr(opts.modulePath.find(':') + 1);
+		if (insideDisc.empty() || insideDisc[0] != '/') {
+			insideDisc = "/" + insideDisc;
+		}
+	}
 	const std::string dir = modulePath.GetDirectory();
-	const std::string filename = modulePath.GetFilename();
+	const std::string filename = fromDisc ? Path(insideDisc).GetFilename() : modulePath.GetFilename();
 
 	PSPModule *module = nullptr;
 	std::string moduleName;
@@ -445,12 +512,31 @@ int RunReverseEngineer(const ReverseEngineerOptions &opts) {
 		printf("re: raw image %s at %08x, %d bytes\n", filename.c_str(), base, blockSize);
 		MIPSAnalyst::ScanForFunctions(base, base + blockSize - 4, true);
 	} else {
-		// Mount the containing directory so the normal file-backed loader path can be used.
-		auto hostFs = std::make_shared<DirectoryFileSystem>(&pspFileSystem, Path(dir), FileSystemFlags::FLASH);
-		pspFileSystem.Mount("host0:", hostFs);
+		// Mount whatever holds the module so the normal file-backed loader path can be used: the
+		// disc itself, or the containing directory.
+		std::string loadPath;
+		if (fromDisc) {
+			std::unique_ptr<FileLoader> loader(ConstructFileLoader(modulePath));
+			std::string blockError;
+			std::shared_ptr<BlockDevice> device(loader ? ConstructBlockDevice(loader.get(), &blockError) : nullptr);
+			if (!device) {
+				fprintf(stderr, "re: %s isn't a disc image we can read: %s\n", modulePath.c_str(), blockError.c_str());
+				ShutdownMinimalPSP();
+				return 1;
+			}
+			// The ISO filesystem takes ownership of the block device, which owns the loader.
+			loader.release();
+			auto isoFs = std::make_shared<ISOFileSystem>(&pspFileSystem, device);
+			pspFileSystem.Mount("host0:", isoFs);
+			loadPath = "host0:" + insideDisc;
+		} else {
+			auto hostFs = std::make_shared<DirectoryFileSystem>(&pspFileSystem, Path(dir), FileSystemFlags::FLASH);
+			pspFileSystem.Mount("host0:", hostFs);
+			loadPath = "host0:/" + filename;
+		}
 
 		std::string error;
-		const SceUID uid = KernelLoadModule("host0:/" + filename, &error);
+		const SceUID uid = KernelLoadModule(loadPath, &error);
 		if (uid < 0) {
 			fprintf(stderr, "re: failed to load %s: %s\n", modulePath.c_str(), error.c_str());
 			ShutdownMinimalPSP();

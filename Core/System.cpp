@@ -63,6 +63,7 @@
 #include "Core/Config.h"
 #include "Core/Core.h"
 #include "Core/Util/PathUtil.h"
+#include "Core/Util/PSARUnpack.h"
 #include "Core/CoreTiming.h"
 #include "Core/CoreParameter.h"
 #include "Core/FileLoaders/RamCachingFileLoader.h"
@@ -494,8 +495,6 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 		}
 	}
 
-	InitVFPU();
-
 	LoadSymbolsIfSupported();
 	LoadGameSymbolsIfEnabled();
 
@@ -505,7 +504,8 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 
 	DisplayHWInit();
 
-	// Init all the HLE modules
+	// Initialize the HLE state before mounting filesystems. This includes the module tables and
+	// CoreTiming event needed by savestates, but does not inspect any filesystem paths.
 	HLEInit();
 
 	// TODO: Put this somewhere better?
@@ -513,7 +513,16 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 		g_CoreParameter.mountIsoLoader = ConstructFileLoader(g_CoreParameter.mountIso);
 	}
 
+	// Most game discs carry a firmware updater, so this is where a NAND with nothing (or only the
+	// fonts) in it gets filled in. Has to happen before the mount below: the install erases and
+	// rewrites the very directory flash0:/flash1: point at.
+	AutoInstallFirmwareFromDisc();
+
 	MountFileSystems();
+
+	// The module availability checks need the mounted PSP filesystem and the firmware installed
+	// above. Keep them after the mount, before any kernel or game module can be loaded.
+	HLECheckModuleAvailability();
 
 	// Game-specific settings are load from for example Load_PSP_ISO (which calls g_Config.LoadGameConfig).
 	// We can't do things that depend on these before the below switch. So for example, the adjustment of the GPU core

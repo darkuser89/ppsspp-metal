@@ -566,7 +566,11 @@ static void __KernelMsgPipeEndCallback(SceUID threadID, SceUID prevCallbackId) {
 	MsgPipe *ko = uid == 0 ? NULL : kernelObjects.Get<MsgPipe>(uid, error);
 
 	if (ko == NULL) {
-		ERROR_LOG_REPORT(Log::sceKernel, "__KernelMsgPipeEndCallback: Invalid object");
+		// Deleted during the callback.
+		u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
+		if (timeoutPtr != 0 && waitTimer != -1)
+			Memory::WriteOrException_U32(0, timeoutPtr);
+		__KernelResumeThreadFromWait(threadID, SCE_KERNEL_ERROR_WAIT_DELETE);
 		return;
 	}
 
@@ -622,7 +626,10 @@ void __KernelMsgPipeDoState(PointerWrap &p)
 int sceKernelCreateMsgPipe(const char *name, int partition, u32 attr, u32 size, u32 optionsPtr) {
 	if (!name)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_NO_MEMORY, "invalid name");
-	if (partition < 1 || partition > 9 || partition == 7)
+	// Only partitions 1-6 exist. sysmem/partitions and its kernel-mode twin record 7 and up
+	// coming back ILLEGAL_ARGUMENT from both privilege levels; what privilege changes is the
+	// permission check below, not the range.
+	if (partition < 1 || partition > 6)
 		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, "invalid partition %d", partition);
 
 	BlockAllocator *allocator = BlockAllocatorFromID(partition);

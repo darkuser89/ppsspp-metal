@@ -209,8 +209,6 @@ if(NOT LIBRETRO)
 		Debugger/WebSocket/SteppingSubscriber.h
 		Debugger/WebSocket/WebSocketUtils.cpp
 		Debugger/WebSocket/WebSocketUtils.h
-		Dialog/PSPPlaceholderDialog.cpp
-		Dialog/PSPPlaceholderDialog.h
 		HW/GranularMixer.cpp
 		HW/GranularMixer.h
 		HW/StereoResampler.cpp
@@ -356,11 +354,15 @@ add_library(Core STATIC
 	Dialog/PSPNetconfDialog.cpp
 	Dialog/PSPNetconfDialog.h
 	Dialog/PSPNpSigninDialog.cpp
+	Dialog/PSPHtmlViewerDialog.cpp
 	Dialog/PSPNpSigninDialog.h
+	Dialog/PSPHtmlViewerDialog.h
 	Dialog/PSPOskDialog.cpp
 	Dialog/PSPOskDialog.h
 	Dialog/PSPOskConstants.cpp
 	Dialog/PSPOskConstants.h
+	Dialog/PSPPlaceholderDialog.cpp
+	Dialog/PSPPlaceholderDialog.h
 	Dialog/PSPSaveDialog.cpp
 	Dialog/PSPSaveDialog.h
 	Dialog/PSPScreenshotDialog.cpp
@@ -494,8 +496,12 @@ add_library(Core STATIC
 	HLE/sceKernelTime.h
 	HLE/sceKernelVTimer.cpp
 	HLE/sceKernelVTimer.h
+	HLE/sceVideocodec.cpp
+	HLE/sceVideocodec.h
 	HLE/sceMpeg.cpp
 	HLE/sceMpeg.h
+	HLE/sceMpegbase.cpp
+	HLE/sceMpegbase.h
 	HLE/sceNet.cpp
 	HLE/sceNet.h
 	HLE/sceNet_lib.cpp
@@ -595,6 +601,8 @@ add_library(Core STATIC
 	HW/Display.h
 	HW/GpioMMIO.cpp
 	HW/GpioMMIO.h
+	HW/AvcDecoder.cpp
+	HW/AvcDecoder.h
 	HW/MediaEngine.cpp
 	HW/MediaEngine.h
 	HW/MpegDemux.cpp
@@ -645,8 +653,6 @@ add_library(Core STATIC
 	MIPS/MIPSTables.h
 	MIPS/MIPSVFPUUtils.cpp
 	MIPS/MIPSVFPUUtils.h
-	MIPS/MIPSVFPUFallbacks.cpp
-	MIPS/MIPSVFPUFallbacks.h
 	MIPS/MIPSTracer.cpp
 	MIPS/MIPSTracer.h
 	MIPS/JitCommon/JitCommon.cpp
@@ -729,7 +735,7 @@ endif()
 
 list(APPEND CoreExtraLibs armips)
 
-target_link_libraries(Core GPU Common chdr kirk cityhash sfmt19937 xbrz xxhash rcheevos minimp3 at3_standalone lua
+target_link_libraries(Core GPU Common chdr kirk cityhash sfmt19937 xbrz xxhash rcheevos at3_standalone lua
 	aemu_postoffice_client ${CoreExtraLibs} ${CMAKE_DL_LIBS})
 
 # Winsock
@@ -817,3 +823,11 @@ set_source_files_properties(${CMAKE_BINARY_DIR}/git-version.cpp
 	PROPERTIES GENERATED TRUE
 	SKIP_AUTOMOC ON)
 add_dependencies(Core GitVersion)
+
+# No fused multiply-adds in CPU emulation unless written explicitly, so its float results are the
+# same on every CPU. Elsewhere (the vertex decoder, say) they're fine. MSVC doesn't fuse by default.
+if(NOT MSVC)
+	get_target_property(CoreCPUSources Core SOURCES)
+	list(FILTER CoreCPUSources INCLUDE REGEX "^MIPS/")
+	set_source_files_properties(${CoreCPUSources} PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()

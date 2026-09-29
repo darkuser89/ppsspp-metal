@@ -30,6 +30,8 @@ constexpr int MAX_GL_TEXTURE_SLOTS = 8;
 
 class GLRTexture {
 public:
+	GLRTexture(const GLRTexture &) = delete;
+	GLRTexture &operator=(const GLRTexture &) = delete;
 	GLRTexture(const Draw::DeviceCaps &caps, int width, int height, int depth, int numMips);
 	~GLRTexture();
 
@@ -53,6 +55,8 @@ public:
 
 class GLRFramebuffer {
 public:
+	GLRFramebuffer(const GLRFramebuffer &) = delete;
+	GLRFramebuffer &operator=(const GLRFramebuffer &) = delete;
 	GLRFramebuffer(const Draw::DeviceCaps &caps, int _width, int _height, bool z_stencil, const char *tag)
 		: color_texture(caps, _width, _height, 1, 1), z_stencil_texture(caps, _width, _height, 1, 1),
 		width(_width), height(_height), z_stencil_(z_stencil) {
@@ -83,6 +87,8 @@ private:
 
 class GLRShader {
 public:
+	GLRShader(const GLRShader &) = delete;
+	GLRShader &operator=(const GLRShader &) = delete;
 	explicit GLRShader(std::string_view _desc) : desc(_desc) {}
 	~GLRShader() {
 		if (shader) {
@@ -116,6 +122,9 @@ public:
 
 class GLRProgram {
 public:
+	GLRProgram() = default;
+	GLRProgram(const GLRProgram &) = delete;
+	GLRProgram &operator=(const GLRProgram &) = delete;
 	~GLRProgram() {
 		if (deleteCallback_) {
 			deleteCallback_(deleteParam_);
@@ -442,6 +451,23 @@ public:
 		step.texture_image.depth = depth;
 		step.texture_image.allocType = allocType;
 		step.texture_image.linearFilter = linearFilter;
+	}
+
+	// Takes ownership over the data pointer and delete[]-s it. Runs as an init step, so unlike
+	// TextureSubImage below, it doesn't have to happen inside a render pass.
+	void TextureSubImageInit(GLRTexture *texture, int level, int x, int y, int width, int height, Draw::DataFormat format, uint8_t *data, GLRAllocType allocType = GLRAllocType::NEW) {
+		std::lock_guard<std::mutex> lock(initStepsMutex_);
+		GLRInitStep &step = initSteps_.push_uninitialized();
+		step.stepType = GLRInitStepType::TEXTURE_SUBIMAGE;
+		step.texture_subimage.texture = texture;
+		step.texture_subimage.data = data;
+		step.texture_subimage.format = format;
+		step.texture_subimage.level = level;
+		step.texture_subimage.x = x;
+		step.texture_subimage.y = y;
+		step.texture_subimage.width = width;
+		step.texture_subimage.height = height;
+		step.texture_subimage.allocType = allocType;
 	}
 
 	void TextureSubImage(int slot, GLRTexture *texture, int level, int x, int y, int width, int height, Draw::DataFormat format, uint8_t *data, GLRAllocType allocType = GLRAllocType::NEW) {
@@ -777,7 +803,9 @@ public:
 	}
 
 	// Would really love to have a basevertex parameter, but impossible in unextended GLES, without glDrawElementsBaseVertex, unfortunately.
-	void DrawIndexed(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLRBuffer *indexBuffer, uint32_t indexOffset, GLenum mode, int count, GLenum indexType, int instances = 1) {
+	// If maxIndex is known (>= 0), it's passed on to the driver through glDrawRangeElements, which saves drivers that need the index
+	// range (like Panfrost) from scanning the index data on the CPU for every draw.
+	void DrawIndexed(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLRBuffer *indexBuffer, uint32_t indexOffset, GLenum mode, int count, GLenum indexType, int instances = 1, int maxIndex = -1) {
 		_dbg_assert_(vertexBuffer && indexBuffer && curRenderStep_ && curRenderStep_->stepType == GLRStepType::RENDER);
 		GLRRenderData &data = curRenderStep_->commands.push_uninitialized();
 		data.cmd = GLRRenderCommand::DRAW;
@@ -790,6 +818,7 @@ public:
 		data.draw.count = count;
 		data.draw.indexType = indexType;
 		data.draw.instances = instances;
+		data.draw.maxIndex = maxIndex;
 	}
 
 	enum { MAX_INFLIGHT_FRAMES = 3 };

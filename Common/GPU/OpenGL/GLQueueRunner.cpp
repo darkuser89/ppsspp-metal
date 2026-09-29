@@ -130,6 +130,15 @@ void GLQueueRunner::RunInitSteps(const FastVec<GLRInitStep> &steps, bool skipGLC
 				}
 				break;
 			}
+			case GLRInitStepType::TEXTURE_SUBIMAGE:
+			{
+				if (step.texture_subimage.allocType == GLRAllocType::ALIGNED) {
+					FreeAlignedMemory(step.texture_subimage.data);
+				} else if (step.texture_subimage.allocType == GLRAllocType::NEW) {
+					delete[] step.texture_subimage.data;
+				}
+				break;
+			}
 			case GLRInitStepType::CREATE_PROGRAM:
 			{
 				WARN_LOG(Log::G3D, "CREATE_PROGRAM found with skipGLCalls, not good");
@@ -138,6 +147,7 @@ void GLQueueRunner::RunInitSteps(const FastVec<GLRInitStep> &steps, bool skipGLC
 			case GLRInitStepType::CREATE_SHADER:
 			{
 				WARN_LOG(Log::G3D, "CREATE_SHADER found with skipGLCalls, not good");
+				delete[] step.create_shader.code;
 				break;
 			}
 			default:
@@ -400,6 +410,31 @@ void GLQueueRunner::RunInitSteps(const FastVec<GLRInitStep> &steps, bool skipGLC
 			CHECK_GL_ERROR_IF_DEBUG();
 			break;
 		}
+		case GLRInitStepType::TEXTURE_SUBIMAGE:
+		{
+			GLRTexture *tex = step.texture_subimage.texture;
+			CHECK_GL_ERROR_IF_DEBUG();
+			if (boundTexture != tex->texture) {
+				glBindTexture(tex->target, tex->texture);
+				boundTexture = tex->texture;
+			}
+			_assert_(tex->target == GL_TEXTURE_2D);
+			_assert_(step.texture_subimage.data != nullptr);
+			GLenum internalFormat, format, type;
+			int alignment;
+			Thin3DFormatToGLFormatAndType(step.texture_subimage.format, internalFormat, format, type, alignment);
+			glTexSubImage2D(tex->target, step.texture_subimage.level,
+				step.texture_subimage.x, step.texture_subimage.y,
+				step.texture_subimage.width, step.texture_subimage.height,
+				format, type, step.texture_subimage.data);
+			if (step.texture_subimage.allocType == GLRAllocType::ALIGNED) {
+				FreeAlignedMemory(step.texture_subimage.data);
+			} else if (step.texture_subimage.allocType == GLRAllocType::NEW) {
+				delete[] step.texture_subimage.data;
+			}
+			CHECK_GL_ERROR_IF_DEBUG();
+			break;
+		}
 		case GLRInitStepType::TEXTURE_FINALIZE:
 		{
 			CHECK_GL_ERROR_IF_DEBUG();
@@ -643,6 +678,9 @@ void GLQueueRunner::RunSteps(const std::vector<GLRStep *> &steps, GLFrameData &f
 								delete[] c.texture_subimage.data;
 							}
 						}
+						break;
+					case GLRRenderCommand::UNIFORMSTEREOMATRIX:
+						delete[] c.uniformStereoMatrix4.mData;
 						break;
 					default:
 						break;
@@ -1232,7 +1270,9 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step, bool first, bool last
 					glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buf);
 					curElemArrayBuffer = buf;
 				}
-				if (c.draw.instances == 1) {
+				if (c.draw.instances == 1 && c.draw.maxIndex >= 0 && (!gl_extensions.IsGLES || gl_extensions.GLES3)) {
+					glDrawRangeElements(c.draw.mode, 0, c.draw.maxIndex, c.draw.count, c.draw.indexType, (void *)(intptr_t)c.draw.indexOffset);
+				} else if (c.draw.instances == 1) {
 					glDrawElements(c.draw.mode, c.draw.count, c.draw.indexType, (void *)(intptr_t)c.draw.indexOffset);
 				} else {
 					glDrawElementsInstanced(c.draw.mode, c.draw.count, c.draw.indexType, (void *)(intptr_t)c.draw.indexOffset, c.draw.instances);

@@ -49,6 +49,8 @@
 #include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceUtility.h"
+#include "Core/HLE/sceSas.h"
+#include "Core/HLE/sceIo.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/JitCommon/JitBlockCache.h"
 #include "Core/RetroAchievements.h"
@@ -66,6 +68,9 @@ constexpr int SCREENSHOT_FAILURE_RETRIES = 6;
 static const char * const STATE_EXTENSION = "ppst";
 static const char * const UNDO_STATE_EXTENSION = "undo.ppst";
 static const char * const UNDO_SCREENSHOT_EXTENSION = "undo.jpg";
+// Namespaced the way UNDO_STATE_EXTENSION is, so a stray "<prefix>_<slot>.txt" someone happened to
+// leave in the savestate folder isn't mistaken for a slot's name.
+static const char * const NAME_EXTENSION = "name.txt";
 
 static const char * const LOAD_UNDO_NAME = "load_undo.ppst";
 
@@ -134,13 +139,20 @@ int g_screenshotFailures;
 	// when in-game it's just not an issue.
 
 	void SaveStart::DoState(PointerWrap &p) {
+		// Nothing may still be writing PSP memory while it's saved, or be left to write into what's loaded.
+		__UtilityWaitForIO();
+		__SasWaitForMix();
+		__IoWaitForAsync();
+
 		auto s = p.Section("SaveStart", 1, 3);
 		if (!s)
 			return;
 
 		if (s >= 2) {
-			// This only increments on save, of course.
-			++saveStateGeneration;
+			// This only increments on save, of course (once, not also in the measuring pass.)
+			if (p.mode == p.MODE_WRITE) {
+				++saveStateGeneration;
+			}
 			Do(p, saveStateGeneration);
 			// This saves the first git version to create this save state (or generation of save states.)
 			if (saveStateInitialGitVersion.empty())
@@ -164,7 +176,7 @@ int g_screenshotFailures;
 		// Memory is a bit tricky when jit is enabled, since there's emuhacks in it.
 		// These must be saved before copying out memory and restored after.
 		auto savedReplacements = SaveAndClearReplacements();
-		if (MIPSComp::jit && p.mode == p.MODE_WRITE) {
+		if (MIPSComp::jit && (p.mode == p.MODE_WRITE || p.mode == p.MODE_VERIFY)) {
 			if (MIPSComp::jit) {
 				std::vector<u32> savedBlocks;
 				savedBlocks = MIPSComp::jit->SaveAndClearEmuHackOps();
@@ -469,12 +481,10 @@ int g_screenshotFailures;
 		if (NetworkWarnUserIfOnlineAndCantSavestate()) {
 			return;
 		}
-
 		Path fn = GenerateSaveSlotPath(gamePrefix, slot, STATE_EXTENSION);
 		Path fnUndo = GenerateSaveSlotPath(gamePrefix, slot, UNDO_STATE_EXTENSION);
 		if (!fn.empty()) {
 			Path shot = GenerateSaveSlotPath(gamePrefix, slot, SCREENSHOT_EXTENSION);
-
 			std::string prefix(gamePrefix);
 			auto renameCallback = [fn, fnUndo, prefix, slot, callback](Status status, std::string_view message, std::string_view metadata) {
 				if (status != Status::FAILURE) {
@@ -535,10 +545,12 @@ int g_screenshotFailures;
 	void DeleteSlot(std::string_view gamePrefix, int slot) {
 		Path fn = GenerateSaveSlotPath(gamePrefix, slot, STATE_EXTENSION);
 		Path shot = GenerateSaveSlotPath(gamePrefix, slot, SCREENSHOT_EXTENSION);
+		Path fnName = GenerateSaveSlotPath(gamePrefix, slot, NAME_EXTENSION);
 
 		if (File::Exists(fn)) {
 			DeleteIfExists(fn);
 			DeleteIfExists(shot);
+			DeleteIfExists(fnName);
 		}
 		Rescan(gamePrefix);
 	}
@@ -706,6 +718,47 @@ int g_screenshotFailures;
 		return GetSaveFileDateAsString(fn);
 	}
 
+	std::string GetSlotCustomName(std::string_view gamePrefix, int slot) {
+		// Most slots don't have a name file, and this gets called for every slot each time the
+		// pause screen builds its views - so consult the listing before touching the disk.
+		if (!SaveStateFileExists(gamePrefix, slot, NAME_EXTENSION)) {
+			return std::string();
+		}
+		Path path = GenerateSaveSlotPath(gamePrefix, slot, NAME_EXTENSION);
+		std::string result;
+		File::ReadBinaryFileToString(path, &result);
+		return result;
+	}
+
+	void SetSlotCustomName(std::string_view gamePrefix, int slot, std::string_view new_name){
+		const Path path = GenerateSaveSlotPath(gamePrefix, slot, NAME_EXTENSION);
+		if (new_name.empty()) {
+			// Clearing the name. Leaving an empty file behind would work, but it'd stay in the
+			// savestate folder for good - a slot with no name shouldn't have a name file.
+			DeleteIfExists(path);
+		} else {
+			File::WriteStringToFile(true, new_name, path);
+		}
+		// What we just wrote (or removed) isn't reflected in the listing GetSlotCustomName reads,
+		// so without this the change wouldn't show up until something else happened to rescan.
+		Rescan(gamePrefix);
+	}
+
+	std::vector<Path> GetCompanionFilePaths(const Path &statePath) {
+		const std::string stateExtension = std::string(".") + STATE_EXTENSION;
+		// A path that isn't a savestate yields nothing, which WithReplacedExtension now tells us
+		// rather than handing back the path itself. An undo state does work, and correctly:
+		// "x.undo.ppst" maps onto "x.undo.jpg".
+		std::vector<Path> paths;
+		for (const char *extension : { SCREENSHOT_EXTENSION, NAME_EXTENSION }) {
+			Path companion;
+			if (statePath.WithReplacedExtension(stateExtension, std::string(".") + extension, &companion)) {
+				paths.push_back(companion);
+			}
+		}
+		return paths;
+	}
+
 	std::vector<Operation> Flush() {
 		std::lock_guard<std::mutex> guard(mutex);
 		std::vector<Operation> copy = g_pendingOperations;
@@ -799,6 +852,11 @@ int g_screenshotFailures;
 
 		if (!needsProcess)
 			return;
+		if (coreState == CORE_STEPPING_GE || coreState == CORE_RUNNING_GE) {
+			// A display list stopped in the GE debugger still belongs to the sceGe call that started
+			// it, which finishes when the list does. Wait for that.
+			return;
+		}
 		needsProcess = false;
 
 		if (!__KernelIsRunning()) {
@@ -910,7 +968,10 @@ int g_screenshotFailures;
 
 			case OperationType::Verify:
 			{
+				// Its write pass counts as a save, which it isn't.
+				const int generation = saveStateGeneration;
 				int tempResult = CChunkFileReader::Verify(state) == CChunkFileReader::ERROR_NONE;
+				saveStateGeneration = generation;
 				callbackResult = tempResult ? Status::SUCCESS : Status::FAILURE;
 				if (tempResult) {
 					INFO_LOG(Log::SaveState, "Verified save state system");

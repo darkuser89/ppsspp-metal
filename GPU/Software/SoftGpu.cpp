@@ -826,8 +826,8 @@ void SoftGPU::Execute_BlockTransferStart(u32 op, u32 diff) {
 
 	// Need to flush both source and target, so we overwrite properly.
 	if (Memory::IsValidRange(src, srcSize) && Memory::IsValidRange(dst, dstSize)) {
-		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", false, src, srcStride, width * bpp, height);
-		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", true, dst, dstStride, width * bpp, height);
+		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", false, src, srcStride * bpp, width * bpp, height);
+		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", true, dst, dstStride * bpp, width * bpp, height);
 	} else {
 		drawEngine_->transformUnit.Flush(this, "blockxfer_wrap");
 	}
@@ -864,6 +864,9 @@ void SoftGPU::Execute_Prim(u32 op, u32 diff) {
 	}
 
 	cyclesExecuted += EstimatePerVertexCost() * count;
+	if (gstate.isModeThrough()) {
+		cyclesExecuted += EstimateFillCycles(prim, verts, indices, count, drawEngine_->FindVertexDecoder(vertType), vertType);
+	}
 	int bytesRead;
 	drawEngine_->transformUnit.SetDirty(dirtyFlags_);
 	drawEngine_->transformUnit.SubmitPrimitive(verts, indices, prim, count, vertType, &bytesRead, drawEngine_);
@@ -1281,7 +1284,8 @@ void SoftGPU::InvalidateCache(u32 addr, int size, GPUInvalidationType type)
 
 void SoftGPU::PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format)
 {
-	// Ignore.
+	// Nothing to update, but remember it for EstimateFillCycles.
+	NoteVideoRange(addr, (u32)size);
 }
 
 bool SoftGPU::PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags) {

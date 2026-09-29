@@ -29,6 +29,7 @@
 
 #include "Common/Log.h"
 #include "Common/Serialize/SerializeFuncs.h"
+#include "Common/StringUtils.h"
 #include "Common/TimeUtil.h"
 #include "Core/Config.h"
 #include "Core/Core.h"
@@ -43,6 +44,8 @@
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/sceKernelModule.h"
+#include "Core/HLE/sceFont.h"
+#include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/HLE/HLE.h"
 
 enum {
@@ -141,8 +144,6 @@ static const HLEModuleMeta g_moduleMeta[] = {
 	{"sceNetAdhocctl_Library"},
 	{"sceNetIfhandle_Service"},
 	{"sceSsl_Module"},
-	{"sceDEFLATE_Library"},
-	{"sceMD5_Library"},
 	{"sceMemab"},  // Underlying AdHoc crypto library
 	{"sceAvcodec_driver"},
 	{"sceAudiocodec_Driver"},
@@ -160,7 +161,16 @@ static const HLEModuleMeta g_moduleMeta[] = {
 	{"sceMp4_library", "sceMp4", DisableHLEFlags::sceMp4},
 	{"mp4msv_module", "mp4msv", DisableHLEFlags::sceMp4},
 	{"SceParseHTTPheader_Library", "sceParseHttp", DisableHLEFlags::sceParseHttp},
-	{"SceParseURI_Library"},
+	{"SceParseURI_Library", "sceParseUri", DisableHLEFlags::sceParseUri},
+	// Dependency-free libraries games carry on the disc (never loaded from firmware).
+	{"sceDEFLATE_Library", "sceDeflt", DisableHLEFlags::sceDeflt},
+	{"sceADLER32_Library", "sceAdler", DisableHLEFlags::sceAdler},
+	{"sceMD5_Library", "sceMd5", DisableHLEFlags::sceMd5},
+	{"sceSHA256_Library", "sceSha256", DisableHLEFlags::sceSha256},
+	{"sceMT19937_Library", "sceMt19937", DisableHLEFlags::sceMt19937},
+	{"sceSfmt19937_Library", "sceSfmt19937", DisableHLEFlags::sceSfmt19937},
+	// sceHeap imports only Kernel_Library and ThreadManForUser.
+	{"sceHeap_Library", "sceHeap", DisableHLEFlags::sceHeap},
 	// Guessing these names
 	{"sceJpeg", "sceJpeg"},
 	{"sceJpeg_library", "sceJpeg"},
@@ -200,7 +210,30 @@ DisableHLEFlags AlwaysDisableHLEFlags() {
 	//
 	// PSMF testing issue: #20200
 	// sceCcc is simply a character conversion library, zero deps. If available we just load it.
-	return DisableHLEFlags::scePsmf | DisableHLEFlags::scePsmfPlayer | DisableHLEFlags::sceCcc;
+	// sceDeflt is zip format decompression.
+	// sceSmft19937 and sceMt19937 are random number generation.
+	// sceAdler, sceSha256, sceMd5 are hashes.
+	// sceHeap is a memory allocator wrapper.
+	//
+	// All these are found in game discs, and are basically dependency-less libraries that we
+	// can just run as-is, no need for HLE. Games always ship these if they use them.
+	//
+	// sceFont is the odd one out: the module is on the disc like the others, but it reads its fonts
+	// from flash0:/font, so it is only usable with a firmware dump installed - see
+	// HLECheckModuleAvailability, which puts the HLE back when those fonts aren't there.
+	//
+	// sceParseUri and sceParseHttp are not here - those two are also in the firmware, and
+	// sceUtility can load them (modules 0x103 and 0x104), so unlike the rest a game may import them
+	// without carrying a copy.
+	//
+	// sceMpeg and sceMp4 are video, and unlike the rest above they need a module we may not have -
+	// sceMp4's two are firmware-only. HLECheckModuleAvailability takes the flag back off when the
+	// module isn't there, as it does for sceFont's fonts.
+	return DisableHLEFlags::scePsmf | DisableHLEFlags::scePsmfPlayer | DisableHLEFlags::sceCcc |
+		DisableHLEFlags::sceDeflt | DisableHLEFlags::sceAdler | DisableHLEFlags::sceMd5 |
+		DisableHLEFlags::sceSha256 | DisableHLEFlags::sceMt19937 | DisableHLEFlags::sceSfmt19937 |
+		DisableHLEFlags::sceHeap | DisableHLEFlags::sceFont |
+		DisableHLEFlags::sceMpeg | DisableHLEFlags::sceMp4;
 }
 
 // Which modules we're HLE-ing is part of the machine's state, not a live setting: it's decided
@@ -219,18 +252,25 @@ static bool g_disableHLELatched;
 static DisableHLEFlags g_unavailableDisableFlags = (DisableHLEFlags)0;
 
 // Process compat flags.
-static DisableHLEFlags ComputeDisableHLEFlags() {
-	DisableHLEFlags flags = (DisableHLEFlags)g_Config.iDisableHLE | AlwaysDisableHLEFlags();
+static DisableHLEFlags ComputeDisableHLEFlags(DisableHLEFlags alwaysDisabled = AlwaysDisableHLEFlags()) {
+	DisableHLEFlags flags = (DisableHLEFlags)g_Config.iDisableHLE | alwaysDisabled;
 	if (PSP_CoreParameter().compat.flags().DisableHLESceFont) {
 		flags |= DisableHLEFlags::sceFont;
 	}
-	if (PSP_CoreParameter().compat.flags().ForceHLEPsmf) {
-		flags &= ~(DisableHLEFlags::scePsmf | DisableHLEFlags::scePsmfPlayer);
-	}
-
 	flags &= ~(DisableHLEFlags)g_Config.iForceEnableHLE;
 	// Anything whose firmware module isn't actually present stays HLE'd.
 	flags &= ~g_unavailableDisableFlags;
+
+	// Our psmf and psmfPlayer HLE plays video by calling our sceMpeg HLE, so it has nothing to talk
+	// to when the real mpeg.prx is running: the player sits in "not yet playing" forever and no
+	// frame ever comes out. The two have to be on the same side, and since sceMpeg is the one we
+	// now run for real by default, this compat flag gives way to it.
+	//
+	// Last, so it sees what sceMpeg actually ended up as rather than what was asked for - without a
+	// module to run, sceMpeg is back on HLE and the flag means what it always did.
+	if (PSP_CoreParameter().compat.flags().ForceHLEPsmf && !(flags & DisableHLEFlags::sceMpeg)) {
+		flags &= ~(DisableHLEFlags::scePsmf | DisableHLEFlags::scePsmfPlayer);
+	}
 	return flags;
 }
 
@@ -310,25 +350,107 @@ static void hleDelayResultFinish(u64 userdata, int cycleslate) {
 		WARN_LOG(Log::HLE, "Someone else woke up HLE-blocked thread %d?", threadID);
 }
 
-// Which firmware files a flag needs before it can be honoured.
-static void CheckDisableHLEAvailability() {
+// Which files need to be present for a disable-hle-flag to be honoured.
+//
+// Two shapes end up here. sceMp4 because libmp4.prx and mp4msv.prx are firmware libraries no game
+// ships, so without firmware there is nothing to run at all. sceFont because the module is on the
+// disc like any other but reads its fonts from flash0:/font with nothing to fall back on. Either
+// way the HLE is the only thing that can serve, so the flag comes off.
+//
+// sceMpeg can come from either place: some discs carry their own mpeg.prx (Death Jr. loads
+// PSP_GAME/USRDIR/MODULES/MPEG.PRX) and don't need the firmware at all. The choice has to be made
+// here, before the game's imports are resolved, and getting it wrong leaves the game importing from
+// a module that never loads - so when the firmware hasn't got one, look on the disc for one too.
+//
+// sceMp3 and sceAtrac aren't here because they're not on by default - the user asked for those
+// specifically, and they warn at the point they would have loaded a module.
+
+// Whether the disc carries its own copy of a module, for when the firmware doesn't have it. Only a
+// filename match: reading each PRX to see what it exports would be the sure way, but the name is
+// remarkably consistent, and guessing wrong here only costs us the real module.
+//
+// About a quarter of discs ship one, and in every case seen it is called mpeg.prx - but where it
+// sits varies a great deal. PSP_GAME/USRDIR/MODULE and .../MODULES are the common ones, with
+// KMODULE, PRX, AMODULE, DATA/MODULE, LAUNCHER/MODULE, PSP152 and plain USRDIR also turning up -
+// and EACN/PRX/MODULE, which is five deep. Hence the generous depth.
+static bool DiscHasModule(std::string_view filename) {
+	struct Walker {
+		std::string_view wanted;
+		// Bounded so a disc laid out in some way nobody expected can't turn this into a long walk
+		// during boot. Listing a directory is cheap - it reads the ISO's own records, not files -
+		// so this is a lot of headroom over the handful of module directories a game really has.
+		int budget = 10000;
+
+		bool Search(const std::string &dir, int depth) {
+			if (depth > 8 || budget <= 0) {
+				return false;
+			}
+			std::vector<PSPFileInfo> entries = pspFileSystem.GetDirListing(dir);
+			budget -= (int)entries.size();
+			for (const PSPFileInfo &entry : entries) {
+				if (entry.name == "." || entry.name == "..") {
+					continue;
+				}
+				if (entry.type == FILETYPE_DIRECTORY) {
+					if (Search(dir + entry.name + "/", depth + 1)) {
+						return true;
+					}
+				} else if (equalsNoCase(entry.name, wanted)) {
+					return true;
+				}
+			}
+			return false;
+		}
+	};
+	Walker walker{ filename };
+	return walker.Search("disc0:/", 0);
+}
+void HLECheckModuleAvailability() {
 	g_unavailableDisableFlags = (DisableHLEFlags)0;
 
-	if ((DisableHLEFlags)g_Config.iDisableHLE & DisableHLEFlags::sceMp4) {
+	// libfont.prx/sceFont is shipped on game discs but reads its fonts from flash0:/font and has
+	// nothing to fall back on, so the fonts are required.
+	if (AlwaysDisableHLEFlags() & DisableHLEFlags::sceFont) {
+		if (!NandFontsComplete()) {
+			g_unavailableDisableFlags |= DisableHLEFlags::sceFont;
+			INFO_LOG(Log::HLE, "flash0:/font doesn't have this firmware's fonts - using the HLE sceFont rather than the disc's.");
+		}
+	}
+
+	// Ask AlwaysDisableHLEFlags rather than the setting: these two are on by default now, so the
+	// setting's bit is clear for almost everyone.
+	//
+	// No game ships the MP4 libraries and they only appear in firmware 6.00 and later, so an older
+	// dump legitimately hasn't got them. Dropping the flag here doesn't rescue anything - our
+	// sceMp4 HLE is very nearly all stubs - so without those files MP4 playback is simply not
+	// available. Nothing is said about it here because almost nothing uses sceMp4, and a warning
+	// every boot would be noise; NotifyLoadStatusMp4 says it instead, when something actually asks.
+	if (AlwaysDisableHLEFlags() & DisableHLEFlags::sceMp4) {
 		const Path kd = g_Config.nandRootDirectory / "flash0" / "kd";
-		if (!File::Exists(kd / "libmp4.prx") || !File::Exists(kd / "mp4msv.prx")) {
+		if (!pspFileSystem.GetFileInfo("flash0:/kd/libmp4.prx").exists ||
+			!pspFileSystem.GetFileInfo("flash0:/kd/mp4msv.prx").exists) {
 			g_unavailableDisableFlags |= DisableHLEFlags::sceMp4;
-			ERROR_LOG(Log::HLE, "Asked to run the real sceMp4, but %s doesn't have libmp4.prx and "
-				"mp4msv.prx - keeping the HLE.", kd.c_str());
-			auto sy = GetI18NCategory(I18NCat::SYSTEM);
-			g_OSD.Show(OSDType::MESSAGE_WARNING,
-				sy->T("Real sceMp4 needs a firmware dump in the NAND folder - using HLE instead"), 6.0f);
+			INFO_LOG(Log::HLE, "%s doesn't have libmp4.prx and mp4msv.prx - using the HLE sceMp4.",
+				kd.c_str());
+		}
+	}
+
+	// Nothing on screen for this one: the sceMpeg HLE is good enough that landing on it is not
+	// something to interrupt the player over. Worth a line in the log, since it explains why a
+	// video looks different from how it looks with the real module.
+	if (AlwaysDisableHLEFlags() & DisableHLEFlags::sceMpeg) {
+		if (!pspFileSystem.GetFileInfo("flash0:/kd/mpeg.prx").exists && !DiscHasModule("mpeg.prx")) {
+			g_unavailableDisableFlags |= DisableHLEFlags::sceMpeg;
+			INFO_LOG(Log::HLE, "Neither flash0:/kd nor the disc has mpeg.prx - using the HLE sceMpeg.");
 		}
 	}
 }
 
+DisableHLEFlags HLEGetUnavailableDisableFlags() {
+	return g_unavailableDisableFlags;
+}
+
 void HLEInit() {
-	CheckDisableHLEAvailability();
 	RegisterAllModules();
 	// Latched lazily rather than here: the compat flags this depends on aren't loaded yet.
 	g_disableHLELatched = false;
@@ -350,6 +472,12 @@ void HLEDoState(PointerWrap &p) {
 			g_effectiveDisableHLE = (DisableHLEFlags)disableHLE;
 			g_disableHLELatched = true;
 		}
+	} else if (p.mode == p.MODE_READ) {
+		// Older states didn't save the flags. They were all made before any module graduated past
+		// these, so resolving their imports against today's defaults would leave the ones since
+		// (sceMpeg, sceFont, the leaf libraries...) as unresolved stubs.
+		g_effectiveDisableHLE = ComputeDisableHLEFlags(DisableHLEFlags::scePsmf | DisableHLEFlags::scePsmfPlayer | DisableHLEFlags::sceCcc);
+		g_disableHLELatched = true;
 	}
 
 	// Can't be inside a syscall when saving state, reset this so errors aren't misleading.
@@ -364,16 +492,30 @@ void HLEDoState(PointerWrap &p) {
 	if (s >= 2) {
 		int actions = (int)mipsCallActions.size();
 		Do(p, actions);
-		if (actions != (int)mipsCallActions.size()) {
-			mipsCallActions.resize(actions);
+		if (p.mode == p.MODE_READ) {
+			for (PSPAction *action : mipsCallActions) {
+				delete action;
+			}
+			mipsCallActions.clear();
+			if (actions < 0) {
+				p.SetError(p.ERROR_FAILURE);
+				return;
+			}
+			mipsCallActions.resize(actions, nullptr);
 		}
 
 		for (auto &action : mipsCallActions) {
 			int actionTypeID = action != nullptr ? action->actionTypeID : -1;
 			Do(p, actionTypeID);
 			if (actionTypeID != -1) {
-				if (p.mode == p.MODE_READ)
+				if (p.mode == p.MODE_READ) {
 					action = __KernelCreateAction(actionTypeID);
+					if (!action) {
+						ERROR_LOG(Log::SaveState, "Unable to load state: unknown action type %d", actionTypeID);
+						p.SetError(p.ERROR_FAILURE);
+						return;
+					}
+				}
 				action->DoState(p);
 			}
 		}
@@ -403,7 +545,6 @@ const HLEModule *GetHLEModuleByIndex(int index) {
 	return &moduleDB[index];
 }
 
-// TODO: Do something faster.
 const HLEModule *GetHLEModuleByName(std::string_view name) {
 	for (auto &module : moduleDB) {
 		if (name == module.name) {
@@ -413,7 +554,6 @@ const HLEModule *GetHLEModuleByName(std::string_view name) {
 	return nullptr;
 }
 
-// TODO: Do something faster.
 const HLEFunction *GetHLEFuncByName(const HLEModule *module, std::string_view name) {
 	for (int i = 0; i < module->numFunctions; i++) {
 		auto &func = module->funcTable[i];
@@ -1100,6 +1240,133 @@ void hlePushFuncDesc(std::string_view module, std::string_view funcName) {
 		g_stack[stackSize] = func;
 		g_stackSize = stackSize + 1;
 	}
+}
+
+// Fetches one word of a variadic argument list. Note that this is not the o32 layout - psp-gcc
+// builds for the MIPS EABI, where the first eight arguments go in a0-a3 and t0-t3, and the rest
+// on the stack starting at sp+0 (o32 would pass four in registers and start the stack at sp+16).
+static bool ReadVarArgWord(int index, u32 *value) {
+	if (index < 4) {
+		*value = currentMIPS->r[MIPS_REG_A0 + index];
+		return true;
+	}
+	if (index < 8) {
+		*value = currentMIPS->r[MIPS_REG_T0 + index - 4];
+		return true;
+	}
+	const u32 addr = currentMIPS->r[MIPS_REG_SP] + (index - 8) * 4;
+	if (!Memory::IsValid4AlignedAddress(addr)) {
+		ERROR_LOG(Log::HLE, "printf: bad stack pointer %08x", addr);
+		return false;
+	}
+	*value = Memory::ReadUnchecked_U32(addr);
+	return true;
+}
+
+bool HLEFormatPrintf(u32 fmtAddr, int firstVarArg, std::string *result) {
+	if (!Memory::IsValidNullTerminatedString(fmtAddr)) {
+		ERROR_LOG(Log::HLE, "printf: bad format string at %08x", fmtAddr);
+		return false;
+	}
+
+	VERBOSE_LOG(Log::HLE, "printf fmt: %s", Memory::GetCharPointerUnchecked(fmtAddr));
+	VERBOSE_LOG(Log::HLE, "printf a0-a3, t0-t3: %08x %08x %08x %08x %08x %08x %08x %08x",
+		currentMIPS->r[MIPS_REG_A0], currentMIPS->r[MIPS_REG_A1],
+		currentMIPS->r[MIPS_REG_A2], currentMIPS->r[MIPS_REG_A3],
+		currentMIPS->r[MIPS_REG_T0], currentMIPS->r[MIPS_REG_T1],
+		currentMIPS->r[MIPS_REG_T2], currentMIPS->r[MIPS_REG_T3]);
+
+	bool processingSpecifier = false;
+	std::string specifier;
+	int bytesToRead = 0;
+	int argIndex = firstVarArg;
+	result->clear();
+	for (const char *c = Memory::GetCharPointerUnchecked(fmtAddr); *c != '\0'; c++) {
+		if (!processingSpecifier) {
+			if (*c == '%') {
+				specifier = "%";
+				processingSpecifier = true;
+				bytesToRead = 0;
+			} else {
+				result->append(1, *c);
+			}
+			continue;
+		}
+
+		specifier.append(1, *c);
+
+		// Going by https://cplusplus.com/reference/cstdio/printf/#compatibility - no idea what the
+		// kernel module really supports.
+		switch (*c) {
+		case '%':
+			result->append(specifier);
+			processingSpecifier = false;
+			break;
+
+		case 's':
+		{
+			u32 val = 0;
+			if (!ReadVarArgWord(argIndex++, &val)) {
+				return false;
+			}
+			if (!Memory::IsValidNullTerminatedString(val)) {
+				ERROR_LOG(Log::HLE, "printf: bad string reference at %08x", val);
+				return false;
+			}
+			result->append(Memory::GetCharPointerUnchecked(val));
+			processingSpecifier = false;
+			break;
+		}
+
+		case 'd':
+		case 'i':
+		case 'u':
+		case 'o':
+		case 'x':
+		case 'X':
+		case 'f':
+		case 'e':
+		case 'E':
+		case 'g':
+		case 'G':
+		case 'c':
+		case 'p':
+		case 'n':
+		{
+			u64 val = 0;
+			if (bytesToRead == 0) {
+				bytesToRead = 4;
+			}
+			int readCount = 0;
+			while (bytesToRead != 0) {
+				u32 word = 0;
+				if (!ReadVarArgWord(argIndex++, &word)) {
+					return false;
+				}
+				val = val | ((u64)word << (readCount * 32));
+				bytesToRead -= 4;
+				readCount++;
+			}
+			char buf[128]{};
+			snprintf(buf, sizeof(buf), specifier.c_str(), val);
+			buf[sizeof(buf) - 1] = '\0';
+			result->append(buf);
+			processingSpecifier = false;
+			break;
+		}
+
+		case 'h':
+			// The allegrex calling convention is 4 byte aligned.
+			bytesToRead = 4;
+			break;
+
+		case 'l':
+			bytesToRead = bytesToRead + 4;
+			break;
+		}
+	}
+
+	return true;
 }
 
 // TODO: Also add support for argument names.

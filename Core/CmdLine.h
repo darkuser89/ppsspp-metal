@@ -88,10 +88,17 @@ struct CommandLineOptions {
 	// (the default) to take whatever file list names each file first.
 	std::optional<std::string> unpackUpdaterModel;
 	std::optional<std::string> unpackUpdaterFilter;
+	// Headless: install the firmware bundled on the disc being booted into a scratch NAND, and
+	// boot against that.
+	std::optional<bool> firmwareFromDisc;
 
 	// Bitmask of DisableHLEFlags: run the real firmware module instead of our HLE for those
 	// libraries. Needs a firmware dump under the NAND directory.
 	std::optional<int> disableHLE;
+
+	// The opposite: put our HLE back for libraries that now run the real module by default. The
+	// way to compare the two without editing a config, and the way out if the real one breaks a game.
+	std::optional<int> forceHLE;
 
 	// Headless: install the game update in a .pkg (given as the boot filename) into this
 	// directory, then exit without booting anything. The directory is the game folder itself -
@@ -119,6 +126,10 @@ struct CommandLineOptions {
 	std::optional<std::string> reDecrypt;
 	// Where the plaintext goes. Defaults to "decrypted.bin".
 	std::optional<std::string> reDecryptOut;
+	// Headless: copy one file out of the disc image given as the positional argument, to
+	// --dump-file-out, and exit.
+	std::optional<std::string> dumpFile;
+	std::optional<std::string> dumpFileOut;
 
 	std::optional<int> memReadAction;
 	std::optional<int> memWriteAction;
@@ -156,7 +167,12 @@ struct CommandLineOptions {
 	std::optional<bool> compare;
 	std::optional<bool> bench;
 	std::optional<bool> verbose;
-	std::optional<double> timeout;
+	// Two independent limits on a headless run, either or both may be set - whichever is reached
+	// first stops it. Wall-clock is what CI wants (a test that hangs must not hang the machine);
+	// emulated is what you want when the question is "has the game had long enough", since a
+	// heavy scene can run tens of times slower than real time and a near-idle one much faster.
+	std::optional<double> timeoutWall;
+	std::optional<double> timeoutEmulated;
 	std::optional<bool> printEqualLines;
 
 	std::optional<std::string> screenshotFilename;

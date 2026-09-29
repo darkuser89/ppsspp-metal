@@ -38,6 +38,8 @@ struct OpenCategory {
 };
 
 static int g_openRegistryMode;
+// How many sceRegOpenRegistry calls are outstanding. It really is refcounted.
+static int g_openRegistryCount;
 static int g_handleGen;  // TODO: The real PSP seems to use memory addresses. Probably it's doing allocations, which we don't really want to do unless we can match them exactly.
 static std::map<int, OpenCategory> g_openCategories;
 
@@ -939,7 +941,10 @@ static const KeyValue tree_CONFIG[] = {
 
 // Dump of /REGISTRY
 static const KeyValue tree_REGISTRY[] = {
-	{ "category_version", ValueType::INT, "", (int)0x66 },  // decimal: 102
+	// A real 6.6x PSP has 0x66 here, which is what this tree was dumped from - but the VSH treats a
+	// category_version higher than the schema it knows as a corrupt registry and offers to reset your
+	// settings instead of booting. So we go very low.
+	{ "category_version", ValueType::INT, "", 1 },
 };
 
 // There might be more categories.
@@ -959,12 +964,14 @@ enum RegOpenMode {
 
 void __RegInit() {
 	g_openRegistryMode = 0;
+	g_openRegistryCount = 0;
 	g_handleGen = 1337;
 	g_openCategories.clear();
 }
 
 void __RegShutdown() {
 	g_openCategories.clear();
+	g_openRegistryCount = 0;
 }
 
 static const KeyValue *LookupCategory(std::string_view path, int *count) {
@@ -1003,11 +1010,30 @@ static const KeyValue *LookupCategory(std::string_view path, int *count) {
 }
 
 void __RegDoState(PointerWrap &p) {
-	auto s = p.Section("sceReg", 0, 1);
-	if (!s)
+	auto s = p.Section("sceReg", 0, 3);
+	if (!s) {
+		if (p.mode == PointerWrap::MODE_READ) {
+			__RegInit();
+		}
 		return;
+	}
 	Do(p, g_openRegistryMode);
 	Do(p, g_openCategories);
+	if (s >= 2) {
+		Do(p, g_openRegistryCount);
+	} else {
+		// Old states didn't track this. Anything with a category open had the registry open too.
+		g_openRegistryCount = g_openCategories.empty() ? 0 : 1;
+	}
+	if (s >= 3) {
+		Do(p, g_handleGen);
+	} else if (p.mode == PointerWrap::MODE_READ) {
+		// Don't hand out a handle that's still open in the state.
+		g_handleGen = 1337;
+		if (!g_openCategories.empty()) {
+			g_handleGen = std::max(g_handleGen, g_openCategories.rbegin()->first + 1);
+		}
+	}
 }
 
 // Registry level (it seems only /system can exist, so kinda pointless)
@@ -1017,20 +1043,26 @@ int sceRegOpenRegistry(u32 regParamAddr, int mode, u32 regHandleAddr) {
 		Memory::WriteUnchecked_U32(0, regHandleAddr);
 	}
 	g_openRegistryMode = mode;
+	g_openRegistryCount++;
 
 	if (g_openRegistryMode != REG_OPEN_READONLY) {
 		WARN_LOG(Log::HLE, "sceRegOpenRegistry: Opening registry in non-readonly mode. This is not yet supported (we'll simply emulate it as read-only anyway).");
 	}
 
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegCloseRegistry(int regHandle) {
 	if (regHandle != 0) {
 		return hleLogError(Log::sceReg, SCE_REG_ERROR_REGISTRY_NOT_FOUND);
 	}
-	g_openCategories.clear();
-	return hleLogInfo(Log::sceReg, 0);
+	if (g_openRegistryCount > 0) {
+		g_openRegistryCount--;
+	}
+	if (g_openRegistryCount == 0) {
+		g_openCategories.clear();
+	}
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegFlushRegistry(int regHandle) {
@@ -1038,7 +1070,7 @@ int sceRegFlushRegistry(int regHandle) {
 		return hleLogError(Log::sceReg, SCE_REG_ERROR_REGISTRY_NOT_FOUND);
 	}
 	// For us this is a no-op.
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 // Seems dangerous! Have not dared to test this on hardware.
@@ -1079,7 +1111,7 @@ int sceRegOpenCategory(int regHandle, const char *name, int mode, u32 regHandleA
 	OpenCategory cat{ name, mode };
 	g_openCategories[handle] = cat;
 	Memory::WriteUnchecked_U32(handle, regHandleAddr);
-	return hleLogInfo(Log::sceReg, 0, "open handle: %d", handle);
+	return hleLogDebug(Log::sceReg, 0, "open handle: %d", handle);
 }
 
 int sceRegCloseCategory(int regHandle) {
@@ -1090,7 +1122,7 @@ int sceRegCloseCategory(int regHandle) {
 	}
 
 	g_openCategories.erase(iter);
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegRemoveCategory(int regHandle, const char *name) {
@@ -1121,7 +1153,7 @@ int sceRegGetKeysNum(int catHandle, u32 numAddr) {
 	}
 
 	Memory::WriteUnchecked_U32(count, numAddr);
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegGetKeys(int catHandle, u32 bufAddr, int num) {
@@ -1149,7 +1181,7 @@ int sceRegGetKeys(int catHandle, u32 bufAddr, int num) {
 		strncpy(dest, keyvals[i].name.c_str(), keyLen);
 	}
 
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegGetKeyInfo(int catHandle, const char *name, u32 outKeyHandleAddr, u32 outTypeAddr, u32 outSizeAddr) {
@@ -1191,7 +1223,7 @@ int sceRegGetKeyInfo(int catHandle, const char *name, u32 outKeyHandleAddr, u32 
 				// Let's just make the index the key handle.
 				Memory::WriteUnchecked_U32(size, outSizeAddr);
 			}
-			return hleLogInfo(Log::sceReg, 0, "handle: %d type: %d size: %d", i, (int)keyvals[i].type, size);
+			return hleLogDebug(Log::sceReg, 0, "handle: %d type: %d size: %d", i, (int)keyvals[i].type, size);
 		}
 	}
 
@@ -1230,7 +1262,7 @@ int sceRegGetKeyInfoByName(int catHandle, const char *name, u32 typeAddr, u32 si
 				}
 				Memory::WriteUnchecked_U32(size, sizeAddr);
 			}
-			return hleLogInfo(Log::sceReg, 0, "type: %d size: %d", (int)keyvals[i].type, size);
+			return hleLogDebug(Log::sceReg, 0, "type: %d size: %d", (int)keyvals[i].type, size);
 		}
 	}
 
@@ -1261,13 +1293,13 @@ int sceRegGetKeyValue(int catHandle, int keyHandle, u32 bufAddr, u32 size) {
 	switch (keyval.type) {
 	case ValueType::BIN:
 		Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-		return hleLogInfo(Log::sceReg, 0);
+		return hleLogDebug(Log::sceReg, 0);
 	case ValueType::STR:
 		Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-		return hleLogInfo(Log::sceReg, 0, "value: '%s'", keyval.strValue);
+		return hleLogDebug(Log::sceReg, 0, "value: '%s'", keyval.strValue);
 	case ValueType::INT:
 		Memory::WriteUnchecked_U32(keyval.intValue, bufAddr);
-		return hleLogInfo(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
+		return hleLogDebug(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
 	case ValueType::DIR:
 	case ValueType::FAIL:
 	default:
@@ -1303,14 +1335,14 @@ int sceRegGetKeyValueByName(int catHandle, const char *name, u32 bufAddr, u32 si
 		switch (keyval.type) {
 		case ValueType::BIN:
 			Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-			return hleLogInfo(Log::sceReg, 0);
+			return hleLogDebug(Log::sceReg, 0);
 		case ValueType::STR:
 			Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-			return hleLogInfo(Log::sceReg, 0, "value: '%s'", keyval.strValue);
+			return hleLogDebug(Log::sceReg, 0, "value: '%s'", keyval.strValue);
 		case ValueType::INT:
 			if (size >= sizeof(u32))
 				Memory::WriteUnchecked_U32(keyval.intValue, bufAddr);
-			return hleLogInfo(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
+			return hleLogDebug(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
 		case ValueType::DIR:
 		case ValueType::FAIL:
 		default:
@@ -1346,7 +1378,7 @@ int sceRegGetCategoryNumAtRoot(int regHandle, u32 numCategoriesPtr) {
 	}
 
 	Memory::WriteUnchecked_U32(numCategories, numCategoriesPtr);
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegGetCategoryListAtRoot(int regHandle, u32 bufPtr, int numCategories) {
@@ -1372,7 +1404,7 @@ int sceRegGetCategoryListAtRoot(int regHandle, u32 bufPtr, int numCategories) {
 		}
 	}
 
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 const HLEFunction sceReg[] = {

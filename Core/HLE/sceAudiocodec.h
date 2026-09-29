@@ -50,7 +50,7 @@ struct SceAudiocodecCodec {
 	u32 inBuf;              // 0x18  the raw frame to decode
 	s32 srcBytesRead;       // 0x1c  written by the decoder
 	u32 outBuf;             // 0x20  where decoded PCM goes
-	s32 dstSamplesWritten;  // 0x24  written by the decoder
+	s32 dstBytesWritten;    // 0x24  written by the decoder, in bytes like srcBytesRead
 
 	// Codec-specific, 0x28..0x67.
 	union {
@@ -100,12 +100,13 @@ struct SceAudiocodecCodec {
 			s32 unk64;           // 0x64
 		} mp3;
 
-		// AAC. The hardware sizes its input from the byte at 0x2c and its output from the byte
-		// at 0x2d; the sample rate at 0x28 is our own observation from games.
+		// AAC. The input frame size is 0x609 when unk2c is nonzero and 0x600 when it is zero, and
+		// the output size comes from unk2d (avcodec.prx decodeUtility); the sample rate at 0x28 is
+		// our own observation from games.
 		struct {
 			u32 sampleRate;  // 0x28
-			u8 unk2c;        // 0x2c
-			u8 unk2d;        // 0x2d
+			u8 unk2c;        // 0x2c  selects the input frame size (see above)
+			u8 unk2d;        // 0x2d  selects the output size
 			u8 unk2e;        // 0x2e
 			u8 unk2f;        // 0x2f
 			s32 unk30[14];   // 0x30..0x67

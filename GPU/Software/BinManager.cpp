@@ -173,13 +173,27 @@ BinManager::~BinManager() {
 
 void BinManager::UpdateState() {
 	PROFILE_THIS_SCOPE("bin_state");
+	auto jitGen = []() {
+		return Rasterizer::JitClearGeneration() + Sampler::JitClearGeneration();
+	};
+	// A JIT clear frees the code the current state's function pointers point into.
+	if (jitGen_ != jitGen()) {
+		dirty_ |= SoftDirty::PIXEL_ALL | SoftDirty::SAMPLER_ALL | SoftDirty::RAST_ALL;
+	}
 	if (HasDirty(SoftDirty::PIXEL_ALL | SoftDirty::SAMPLER_ALL | SoftDirty::RAST_ALL)) {
 		if (states_.Full())
 			Flush("states");
 		creatingState_ = true;
 		stateIndex_ = (uint16_t)states_.Push(RasterizerState());
-		// When new funcs are compiled, we need to flush if WX exclusive.
-		ComputeRasterizerState(&states_[stateIndex_], this);
+		// When new funcs are compiled, we need to flush if WX exclusive. Compiling can also clear the caches,
+		// losing the funcs picked before it, so then compute it again.
+		for (int tries = 0; tries < 3; ++tries) {
+			jitGen_ = jitGen();
+			ComputeRasterizerState(&states_[stateIndex_], this);
+			if (jitGen_ == jitGen()) {
+				break;
+			}
+		}
 		states_[stateIndex_].samplerID.cached.clut = cluts_[clutIndex_].readable;
 		creatingState_ = false;
 
@@ -232,21 +246,32 @@ void BinManager::UpdateState() {
 		if (newMaxTasks > MAX_POSSIBLE_TASKS)
 			newMaxTasks = MAX_POSSIBLE_TASKS;
 		// We don't want to overlap wrong, so flush any pending.
+		bool flushed = false;
 		if (maxTasks_ != newMaxTasks) {
 			maxTasks_ = newMaxTasks;
 			Flush("selfrender");
+			flushed = true;
 		}
-		pendingOverlap_ = pendingOverlap_ || selfRender;
 
 		// Lastly, we have to check if we're newly writing depth we were texturing before.
 		// This happens in Call of Duty (depth clear after depth texture), for example.
-		if (!hadDepth && state.pixelID.depthWrite) {
+		if (!flushed && !hadDepth && state.pixelID.depthWrite) {
 			for (size_t i = 0; i < states_.Size(); ++i) {
 				if (HasTextureWrite(states_.Peek(i))) {
 					Flush("selfdepth");
+					flushed = true;
+					break;
 				}
 			}
 		}
+
+		if (flushed) {
+			// The flush forgot what this draw writes and reads, so record it again.
+			MarkPendingWrites(state);
+			MarkPendingReads(state);
+			ClearDirty(SoftDirty::BINNER_RANGE);
+		}
+		pendingOverlap_ = pendingOverlap_ || selfRender;
 		ClearDirty(SoftDirty::BINNER_OVERLAP);
 	}
 }

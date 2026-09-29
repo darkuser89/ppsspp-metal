@@ -229,6 +229,7 @@ void DrawEngineGLES::Flush() {
 		numDrawVerts_ = 0;
 		numDrawInds_ = 0;
 		vertexCountInDrawCalls_ = 0;
+		numVertsToDecode_ = 0;
 		decodeVertsCounter_ = 0;
 		decodeIndsCounter_ = 0;
 		return;
@@ -332,7 +333,7 @@ void DrawEngineGLES::Flush() {
 			render_->DrawIndexed(inputLayout,
 				vertexBuffer, vertexBufferOffset,
 				indexBuffer, indexBufferOffset,
-				glprim[prim], vertexCount, GL_UNSIGNED_SHORT);
+				glprim[prim], vertexCount, GL_UNSIGNED_SHORT, 1, maxIndex - 1);
 		} else {
 			render_->Draw(
 				inputLayout, vertexBuffer, vertexBufferOffset,
@@ -419,7 +420,7 @@ void DrawEngineGLES::Flush() {
 			indexBufferOffset = (uint32_t)frameData.pushIndex->Push(inds, sizeof(uint16_t) * result.drawIndexCount, 2, &indexBuffer);
 			render_->DrawIndexed(
 				softwareInputLayout_, vertexBuffer, vertexBufferOffset, indexBuffer, indexBufferOffset,
-				glprim[prim], result.drawIndexCount, GL_UNSIGNED_SHORT);
+				glprim[prim], result.drawIndexCount, GL_UNSIGNED_SHORT, 1, result.drawVertexCount - 1);
 			gpuStats.perFrame.numVertsDrawn += result.drawIndexCount;
 		} else if (action == SW_CLEAR) {
 			u32 clearColor = result.color;

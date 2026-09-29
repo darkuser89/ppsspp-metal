@@ -120,6 +120,11 @@ static double curFrameTime;
 static double lastFrameTime;
 static double nextFrameTime;
 static int numVBlanksSinceFlip;
+// Host timestamp of the last flip we let through, for the fast-forward flip limiter in
+// __DisplayFlip. Up here with the rest of them so a boot resets it - as a static inside the
+// function it kept a timestamp from whatever ran before, and the first flip of a new game was
+// compared against it.
+static double lastFlipHostTime;
 
 const int PSP_DISPLAY_MODE_LCD = 0;
 
@@ -130,8 +135,10 @@ std::map<SceUID, int> vblankPausedWaits;
 
 // STATE END
 
-// The vblank period is 731.5 us (0.7315 ms)
-const double vblankMs = 0.7315;
+// tests/display/vblanklen measures 730-770us from sceDisplayWaitVblankStart returning until
+// vblank ends, and an hcount of up to 14 inside it. The wait's own latency is in that, so this is
+// the upper end.
+const double vblankMs = 0.770;
 // These are guesses based on tests.
 const double vsyncStartMs = 0.5925;
 const double vsyncEndMs = 0.7265;
@@ -212,6 +219,7 @@ void __DisplayInit() {
 	curFrameTime = 0.0;
 	nextFrameTime = 0.0;
 	lastFrameTime = 0.0;
+	lastFlipHostTime = 0.0;
 
 	__KernelRegisterWaitTypeFuncs(WAITTYPE_VBLANK, __DisplayVblankBeginCallback, __DisplayVblankEndCallback);
 }
@@ -255,9 +263,11 @@ void __DisplayDoState(PointerWrap &p) {
 		Do(p, lagSyncEvent);
 		Do(p, lagSyncScheduled);
 		CoreTiming::RestoreRegisterEvent(lagSyncEvent, "LagSync", &hleLagSync);
-		lastLagSync = time_now_d();
-		if (lagSyncScheduled != UseLagSync()) {
-			ScheduleLagSync();
+		if (p.mode == p.MODE_READ) {
+			lastLagSync = time_now_d();
+			if (lagSyncScheduled != UseLagSync()) {
+				ScheduleLagSync();
+			}
 		}
 	} else {
 		lagSyncEvent = -1;
@@ -291,6 +301,10 @@ void __DisplayDoState(PointerWrap &p) {
 		Do(p, lastFlipCycles);
 		Do(p, nextFlipCycles);
 	}
+	if (p.mode == p.MODE_READ) {
+		// Not saved. Start counting again rather than carry over the session before the load.
+		lastFlipsTooFrequent = 0;
+	}
 
 	gpu->DoState(p);
 
@@ -307,8 +321,8 @@ void __DisplayShutdown() {
 void __DisplayVblankBeginCallback(SceUID threadID, SceUID prevCallbackId) {
 	SceUID pauseKey = prevCallbackId == 0 ? threadID : prevCallbackId;
 
-	// This means two callbacks in a row.  PSP crashes if the same callback waits inside itself (may need more testing.)
-	// TODO: Handle this better?
+	// Shouldn't happen: each nesting level pauses under its own key, and on hardware a callback can
+	// nest only one level (a CB wait that would go deeper never returns.)
 	if (vblankPausedWaits.find(pauseKey) != vblankPausedWaits.end()) {
 		return;
 	}
@@ -651,12 +665,11 @@ void __DisplayFlip(int cyclesLate) {
 	// Alternative to frameskip fast-forward, where we draw everything.
 	// Useful if skipping a frame breaks graphics or for checking drawing speed.
 	if (g_frameTiming.FastForwardNeedsSkipFlip() && (!FrameTimingThrottled() || refreshRateNeedsSkip)) {
-		static double lastFlip = 0;
 		double now = time_now_d();
-		if ((now - lastFlip) < 1.0f / refreshRate) {
+		if ((now - lastFlipHostTime) < 1.0f / refreshRate) {
 			forceNoFlip = true;
 		} else {
-			lastFlip = now;
+			lastFlipHostTime = now;
 		}
 	}
 

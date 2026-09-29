@@ -23,8 +23,10 @@
 #include "Common/Serialize/SerializeMap.h"
 #include "Common/Swap.h"
 #include "Core/HLE/sceMpeg.h"
+#include "Core/HLE/sceMpegbase.h"
 #include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceKernelThread.h"
+#include "Core/Config.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/FunctionWrappers.h"
 #include "Core/HLE/ErrorCodes.h"
@@ -121,13 +123,10 @@ static AVPixelFormat pmp_want_pix_fmt;
 
 #endif
 
-struct SceMpegLLI
-{
-	u32 pSrc;
-	u32 pDst;
-	u32 Next;
-	int iSize;
-};
+void MpegSetPmpVideoSource(u32 addr, int blocks) {
+	pmp_videoSource = addr;
+	pmp_nBlocks = blocks;
+}
 
 void SceMpegAu::read(u32 addr) {
 	Memory::Memcpy(this, addr, sizeof(*this), "SceMpegAu");
@@ -231,7 +230,9 @@ void MpegContext::DoState(PointerWrap &p) {
 		}
 	}
 	DoClass(p, mediaengine);
-	ringbufferNeedsReverse = s < 2;
+	if (p.mode == p.MODE_READ) {
+		ringbufferNeedsReverse = s < 2;
+	}
 }
 
 static MpegContext *getMpegCtx(u32 mpegAddr) {
@@ -349,10 +350,24 @@ private:
 	s32 remainingPackets_ = 0;
 };
 
+static void ClearMpegContexts() {
+	for (const auto &[_, ctx] : g_mpegCtxs) {
+		delete ctx;
+	}
+	g_mpegCtxs.clear();
+}
+
 void __MpegInit() {
+	// getMpegCtx keys on a handle read out of game memory, so don't leave contexts from a previous
+	// game around for the next one to find.
+	ClearMpegContexts();
 	isMpegInit = false;
 	mpegLibVersion = 0x010A;
 	streamIdGen = 1;
+	useRingbufferPutCallbackMulti = true;
+	sceMpegAvcResourceAddr = 0;
+	sceMpegAvcResourceDataAddr = 0;
+	sceMpegAvcResourceFlags = 0;
 	actionPostPut = __KernelRegisterActionType(PostPutAction::Create);
 
 #ifdef USE_FFMPEG
@@ -366,7 +381,7 @@ void __MpegInit() {
 }
 
 void __MpegDoState(PointerWrap &p) {
-	auto s = p.Section("sceMpeg", 1, 4);
+	auto s = p.Section("sceMpeg", 1, 5);
 	if (!s)
 		return;
 
@@ -383,6 +398,7 @@ void __MpegDoState(PointerWrap &p) {
 			useRingbufferPutCallbackMulti = false;
 			ringbufferPutPacketsAdded = 0;
 		} else {
+			useRingbufferPutCallbackMulti = true;
 			Do(p, ringbufferPutPacketsAdded);
 		}
 		if (s < 4) {
@@ -400,14 +416,22 @@ void __MpegDoState(PointerWrap &p) {
 	__KernelRestoreActionType(actionPostPut, PostPutAction::Create);
 
 	Do(p, g_mpegCtxs);
+
+	if (s >= 5) {
+		Do(p, sceMpegAvcResourceFlags);
+	} else {
+		sceMpegAvcResourceFlags = 0;
+	}
+	if (p.mode == p.MODE_READ) {
+		// Constant for now, see sceMpegAvcResourceInit.
+		const bool inited = (sceMpegAvcResourceFlags & MPEG_AVC_RESOURCE_FLAG) != 0;
+		sceMpegAvcResourceAddr = inited ? 0x10000000 : 0;
+		sceMpegAvcResourceDataAddr = inited ? sceMpegAvcResourceAddr + 8 : 0;
+	}
 }
 
 void __MpegShutdown() {
-	std::map<u32, MpegContext *>::iterator it, end;
-	for (it = g_mpegCtxs.begin(), end = g_mpegCtxs.end(); it != end; ++it) {
-		delete it->second;
-	}
-	g_mpegCtxs.clear();
+	ClearMpegContexts();
 }
 
 void __MpegLoadModule(int version,u32 crc) {
@@ -1044,10 +1068,7 @@ void __VideoPmpInit() {
 
 void __VideoPmpShutdown() {
 #ifdef USE_FFMPEG
-	// We need to empty pmp_queue to not leak memory.
-	for (auto it = pmp_queue.begin(); it != pmp_queue.end(); ++it){
-		av_free(*it);
-	}
+	// The queued frames are the media engine's own m_pFrameRGB, which it frees.
 	pmp_queue.clear();
 	pmp_ContextList.clear();
 	delete pmpframes;
@@ -2320,39 +2341,3 @@ void Register_sceMpeg()
 {
 	RegisterHLEModule("sceMpeg", ARRAY_SIZE(sceMpeg), sceMpeg);
 }
-
-// This function is currently only been used for PMP videos
-// p pointing to a SceMpegLLI structure consists of video frame blocks.
-static u32 sceMpegBasePESpacketCopy(u32 p)
-{
-	pmp_videoSource = p;
-	pmp_nBlocks = 0;
-
-	auto lli = PSPPointer<SceMpegLLI>::Create(p);
-	while (lli.IsValid()) {
-		pmp_nBlocks++;
-		// lli.Next ==0 for last block
-		if (lli->Next == 0){
-			break;
-		}
-		++lli;
-	}
-
-	DEBUG_LOG(Log::Mpeg, "sceMpegBasePESpacketCopy(%08x), received %d block(s)", pmp_videoSource, pmp_nBlocks);
-	return 0;
-}
-
-const HLEFunction sceMpegbase[] =
-{
-	{0XBEA18F91, &WrapU_U<sceMpegBasePESpacketCopy>,           "sceMpegBasePESpacketCopy",           'x', "x"      },
-	{0X492B5E4B, nullptr,                                      "sceMpegBaseCscInit",                 '?', ""       },
-	{0X0530BE4E, nullptr,                                      "sceMpegbase_0530BE4E",               '?', ""       },
-	{0X91929A21, nullptr,                                      "sceMpegBaseCscAvc",                  '?', ""       },
-	{0X304882E1, nullptr,                                      "sceMpegBaseCscAvcRange",             '?', ""       },
-	{0X7AC0321A, nullptr,                                      "sceMpegBaseYCrCbCopy",               '?', ""       }
-};
-
-void Register_sceMpegbase()
-{
-	RegisterHLEModule("sceMpegbase", ARRAY_SIZE(sceMpegbase), sceMpegbase);
-};

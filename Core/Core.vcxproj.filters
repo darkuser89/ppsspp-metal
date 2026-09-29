@@ -255,7 +255,13 @@
     <ClCompile Include="HLE\sceJpeg.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
+    <ClCompile Include="HLE\sceVideocodec.cpp">
+      <Filter>HLE\Libraries</Filter>
+    </ClCompile>
     <ClCompile Include="HLE\sceMpeg.cpp">
+      <Filter>HLE\Libraries</Filter>
+    </ClCompile>
+    <ClCompile Include="HLE\sceMpegbase.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
     <ClCompile Include="HLE\sceMd5.cpp">
@@ -353,6 +359,9 @@
     </ClCompile>
     <ClCompile Include="HLE\sceImpose.cpp">
       <Filter>HLE\Libraries</Filter>
+    </ClCompile>
+    <ClCompile Include="HW\AvcDecoder.cpp">
+      <Filter>HW</Filter>
     </ClCompile>
     <ClCompile Include="HW\MediaEngine.cpp">
       <Filter>HW</Filter>
@@ -545,6 +554,9 @@
       <Filter>Dialog</Filter>
     </ClCompile>
     <ClCompile Include="Dialog\PSPNpSigninDialog.cpp">
+      <Filter>Dialog</Filter>
+    </ClCompile>
+    <ClCompile Include="Dialog\PSPHtmlViewerDialog.cpp">
       <Filter>Dialog</Filter>
     </ClCompile>
     <ClCompile Include="Debugger\DisassemblyManager.cpp">
@@ -1231,9 +1243,6 @@
     <ClCompile Include="TiltEventProcessor.cpp">
       <Filter>Core</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\MIPSVFPUFallbacks.cpp">
-      <Filter>MIPS</Filter>
-    </ClCompile>
     <ClCompile Include="ConfigSettings.cpp">
       <Filter>Core</Filter>
     </ClCompile>
@@ -1581,6 +1590,12 @@
     <ClInclude Include="HLE\sceMpeg.h">
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
+    <ClInclude Include="HLE\sceVideocodec.h">
+      <Filter>HLE\Libraries</Filter>
+    </ClInclude>
+    <ClInclude Include="HLE\sceMpegbase.h">
+      <Filter>HLE\Libraries</Filter>
+    </ClInclude>
     <ClInclude Include="HLE\sceMd5.h">
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
@@ -1685,6 +1700,9 @@
     </ClInclude>
     <ClInclude Include="HLE\sceImpose.h">
       <Filter>HLE\Libraries</Filter>
+    </ClInclude>
+    <ClInclude Include="HW\AvcDecoder.h">
+      <Filter>HW</Filter>
     </ClInclude>
     <ClInclude Include="HW\MediaEngine.h">
       <Filter>HW</Filter>
@@ -1864,6 +1882,9 @@
       <Filter>Dialog</Filter>
     </ClInclude>
     <ClInclude Include="Dialog\PSPNpSigninDialog.h">
+      <Filter>Dialog</Filter>
+    </ClInclude>
+    <ClInclude Include="Dialog\PSPHtmlViewerDialog.h">
       <Filter>Dialog</Filter>
     </ClInclude>
     <ClInclude Include="MIPS\JitCommon\JitState.h">
@@ -2201,9 +2222,6 @@
     </ClInclude>
     <ClInclude Include="TiltEventProcessor.h">
       <Filter>Core</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\MIPSVFPUFallbacks.h">
-      <Filter>MIPS</Filter>
     </ClInclude>
     <ClInclude Include="ConfigSettings.h">
       <Filter>Core</Filter>
