@@ -102,13 +102,13 @@ bool DataFormatIsBlockCompressed(DataFormat fmt, int *blockSize) {
 	case DataFormat::BC1_RGBA_UNORM_BLOCK:
 	case DataFormat::BC4_UNORM_BLOCK:
 	case DataFormat::ETC2_R8G8B8_UNORM_BLOCK:
+	case DataFormat::ETC2_R8G8B8A1_UNORM_BLOCK:
 		if (blockSize) *blockSize = 8;  // 64 bits
 		return true;
 	case DataFormat::BC2_UNORM_BLOCK:
 	case DataFormat::BC3_UNORM_BLOCK:
 	case DataFormat::BC5_UNORM_BLOCK:
 	case DataFormat::BC7_UNORM_BLOCK:
-	case DataFormat::ETC2_R8G8B8A1_UNORM_BLOCK:
 	case DataFormat::ETC2_R8G8B8A8_UNORM_BLOCK:
 	case DataFormat::ASTC_4x4_UNORM_BLOCK:
 		if (blockSize) *blockSize = 16;  // 128 bits

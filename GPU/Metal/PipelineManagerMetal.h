@@ -6,6 +6,11 @@
 #include "GPU/Metal/ShaderManagerMetal.h"
 #include "GPU/Common/VertexDecoderCommon.h"
 
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <vector>
+
 struct MetalGEBlendState {
 	bool enabled = false;
 	MTLBlendFactor srcColor = MTLBlendFactorOne;
@@ -31,6 +36,7 @@ struct MetalGEDepthStencilState {
 
 struct MetalGEPipeline {
 	id<MTLRenderPipelineState> state = nil;
+	MTLRenderPipelineDescriptor *descriptor = nil;
 	uint32_t stride = 0;
 	uint32_t textureMask = 0;
 };
@@ -44,23 +50,43 @@ public:
 	void Clear();
 	void DeviceLost();
 	void DeviceRestore(Metal::RenderManager *manager);
+	bool LoadCache(const Path &filename, ShaderManagerMetal &shaders);
+	void SaveCache(const Path &filename) const;
 
 	// The result is owned by this cache until Clear/DeviceLost or a shader cache
 	// generation change. Already encoded commands retain their native PSOs.
 	const MetalGEPipeline *GetOrCreate(ShaderManagerMetal &shaders, VShaderID vertexID, FShaderID fragmentID,
 		const DecVtxFormat *decoded, const MetalGEBlendState &blend, MTLPixelFormat colorFormat,
 		MTLPixelFormat depthStencilFormat, std::string *error, int sampleCount = 1);
+	const MetalGEPipeline *Request(ShaderManagerMetal &shaders, VShaderID vertexID, FShaderID fragmentID,
+		const DecVtxFormat *decoded, const MetalGEBlendState &blend, MTLPixelFormat colorFormat,
+		MTLPixelFormat depthStencilFormat, std::string *error, int sampleCount = 1);
 	id<MTLDepthStencilState> GetDepthStencil(const MetalGEDepthStencilState &state, std::string *error);
-	int GetNumPipelines() const { return (int)pipelines_.size(); }
+	int GetNumPipelines() const { return (int)(pipelines_.size() + pending_.size()); }
 	int GetNumDepthStencilStates() const { return (int)depthStates_.size(); }
 
 private:
 	// Explicit integer fields avoid struct padding and bitfield layout in keys.
 	using PipelineKey = std::array<uint64_t, 21>;
 	using DepthKey = std::array<uint64_t, 9>;
+	struct PendingPipeline {
+		std::mutex mutex;
+		std::condition_variable ready;
+		MetalGEPipeline pipeline;
+		std::string error;
+		bool complete = false;
+	};
+	const MetalGEPipeline *GetOrCreateInternal(ShaderManagerMetal &shaders, VShaderID vertexID, FShaderID fragmentID,
+		const DecVtxFormat *decoded, const MetalGEBlendState &blend, MTLPixelFormat colorFormat,
+		MTLPixelFormat depthStencilFormat, std::string *error, int sampleCount, bool async);
 	Metal::RenderManager *manager_ = nullptr;
 	const ShaderManagerMetal *shaderOwner_ = nullptr;
 	uint64_t shaderGeneration_ = 0;
 	std::map<PipelineKey, MetalGEPipeline> pipelines_;
+	std::map<PipelineKey, std::shared_ptr<PendingPipeline>> pending_;
 	std::map<DepthKey, id<MTLDepthStencilState>> depthStates_;
+#if PPSSPP_PLATFORM(MAC)
+	id<MTLBinaryArchive> binaryArchive_ = nil;
+	mutable std::vector<PipelineKey> binaryArchiveKeys_;
+#endif
 };

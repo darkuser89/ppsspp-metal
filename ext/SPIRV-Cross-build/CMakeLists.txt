@@ -64,7 +64,7 @@ target_include_directories(spirv-cross-core PUBLIC ${SRCDIR})
 # Keep Metal's recoverable compiler errors separate from the existing backends'
 # assertion-based SPIRV-Cross build. The namespace prevents duplicate symbols and
 # differing inline exception policies from violating the one-definition rule.
-if(APPLE AND NOT IOS AND NOT LIBRETRO)
+if(APPLE AND NOT LIBRETRO)
 	add_library(spirv-cross-metal STATIC
 		${SRCDIR}/spirv_cross.cpp
 		${SRCDIR}/spirv_cross_util.cpp

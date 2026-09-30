@@ -22,12 +22,18 @@ public:
 	virtual ~RenderManager() = default;
 	virtual RenderContext &Context() = 0;
 	virtual id<MTLRenderCommandEncoder> RenderEncoder() = 0;
+	// Changes whenever a new render encoder or a thin3d draw replaces dynamic state.
+	virtual uint64_t RenderStateSerial() const = 0;
 	virtual void EndRenderPass() = 0;
 	virtual Draw::Framebuffer *RenderTarget() const = 0;
 	virtual MTLPixelFormat ColorFormat() const = 0;
 	virtual MTLPixelFormat DepthStencilFormat() const = 0;
 	virtual int SampleCount() const = 0;
 	virtual void SetNativeSampler(int slot, id<MTLSamplerState> sampler) = 0;
+	// Shared texture passes may leave another target bound during unbuffered GE.
+	virtual bool RestoreBackbufferTarget(std::string *error) = 0;
+	// Copy the currently bound backbuffer for unbuffered GE shader blending.
+	virtual bool SnapshotBackbufferColor(int slot, std::string *error) = 0;
 	// Uses the bindings tracked by thin3d, including framebuffer/depal passes.
 	virtual bool BindTextures(id<MTLRenderCommandEncoder> encoder, uint32_t mask, std::string *error) = 0;
 

@@ -21,9 +21,28 @@ public:
 	void SetShaderManager(ShaderManagerMetal *manager) { shaderManager_ = manager; }
 	void SetTextureCache(TextureCacheMetal *cache) { textureCache_ = cache; }
 	void SetFramebufferManager(FramebufferManagerMetal *manager) { framebufferManager_ = manager; }
+	void LoadPipelineCache(const Path &filename) {
+		if (shaderManager_) {
+			pipelines_.LoadCache(filename, *shaderManager_);
+		}
+	}
+	void SavePipelineCache(const Path &filename) const { pipelines_.SaveCache(filename); }
+	int GetNumPipelines() const { return pipelines_.GetNumPipelines(); }
 	const std::string &LastError() const { return lastError_; }
 
 private:
+	struct EncoderState {
+		bool valid = false;
+		uint64_t serial = 0;
+		id<MTLRenderPipelineState> pipeline = nil;
+		id<MTLDepthStencilState> depth = nil;
+		NSUInteger stencil = 0;
+		MTLCullMode cull = MTLCullModeNone;
+		MTLDepthClipMode depthClip = MTLDepthClipModeClip;
+		MTLViewport viewport{};
+		MTLScissorRect scissor{};
+		uint32_t blendColor = 0;
+	};
 	bool FlushDraw(std::string *error);
 	bool ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state, ViewportAndScissor *viewport, std::string *error);
 	void Invalidate(InvalidationCallbackFlags flags);
@@ -35,4 +54,5 @@ private:
 	TextureCacheMetal *textureCache_ = nullptr;
 	FramebufferManagerMetal *framebufferManager_ = nullptr;
 	std::string lastError_;
+	EncoderState encoderState_;
 };

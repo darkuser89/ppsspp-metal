@@ -6,6 +6,17 @@
 #include "GPU/Common/SoftwareTransformCommon.h"
 #include "Common/Data/Convert/SmallDataConvert.h"
 
+namespace {
+bool SameViewport(const MTLViewport &a, const MTLViewport &b) {
+	return a.originX == b.originX && a.originY == b.originY && a.width == b.width && a.height == b.height &&
+		a.znear == b.znear && a.zfar == b.zfar;
+}
+
+bool SameScissor(const MTLScissorRect &a, const MTLScissorRect &b) {
+	return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+}
+}
+
 DrawEngineMetal::DrawEngineMetal(Draw::DrawContext *draw) {
 	DeviceRestore(draw);
 }
@@ -15,6 +26,7 @@ DrawEngineMetal::~DrawEngineMetal() {
 }
 
 void DrawEngineMetal::DeviceLost() {
+	encoderState_ = {};
 	if (draw_) {
 		draw_->SetInvalidationCallback({});
 	}
@@ -37,6 +49,7 @@ void DrawEngineMetal::DeviceRestore(Draw::DrawContext *draw) {
 
 void DrawEngineMetal::NotifyConfigChanged() {
 	DrawEngineCommon::NotifyConfigChanged();
+	encoderState_.valid = false;
 	pipelines_.Clear();
 	samplers_.Clear();
 }
@@ -48,6 +61,7 @@ void DrawEngineMetal::BeginFrame() {
 
 void DrawEngineMetal::Invalidate(InvalidationCallbackFlags flags) {
 	// GE native state is always rebound. Thin3d may also have replaced texture bindings.
+	encoderState_.valid = false;
 	gstate_c.Dirty(DIRTY_ALL_RENDER_STATE | DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
 }
 
@@ -58,25 +72,35 @@ bool DrawEngineMetal::ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state
 		if (pipelineState_.FramebufferRead()) {
 			FBOTexState binding = FBO_TEX_NONE;
 			ApplyFramebufferRead(&binding);
-			if (binding != FBO_TEX_COPY_BIND_TEX || !framebufferManager_->GetCurrentRenderVFB()) {
-				*error = "Metal shader blending requires a copyable current framebuffer";
-				return false;
-			}
 			auto &blend = pipelineState_.blendState;
 			ApplyStencilReplaceAndLogicOpIgnoreBlend(blend.replaceAlphaWithStencil, blend);
-			if (!framebufferManager_->BindFramebufferAsColorTexture(DRAW_BINDING_2ND_TEXTURE,
-				framebufferManager_->GetCurrentRenderVFB(), BINDFBCOLOR_MAY_COPY | BINDFBCOLOR_UNCACHED, 0)) {
-				*error = "Metal shader blending could not bind its framebuffer copy";
+			if (binding == FBO_TEX_COPY_BIND_TEX) {
+				auto *vfb = framebufferManager_->GetCurrentRenderVFB();
+				if (framebufferManager_->UseBufferedRendering() && vfb && vfb->fbo) {
+					if (!framebufferManager_->BindFramebufferAsColorTexture(DRAW_BINDING_2ND_TEXTURE,
+						vfb, BINDFBCOLOR_MAY_COPY | BINDFBCOLOR_UNCACHED, Draw::ALL_LAYERS)) {
+						*error = "Metal shader blending could not bind its framebuffer copy";
+						return false;
+					}
+				} else if (!framebufferManager_->UseBufferedRendering()) {
+					if (!manager_->SnapshotBackbufferColor(DRAW_BINDING_2ND_TEXTURE, error)) {
+						return false;
+					}
+				} else {
+					*error = "Metal shader blending has no current PSP framebuffer";
+					return false;
+				}
+				SamplerCacheKey key{};
+				key.sClamp = true;
+				key.tClamp = true;
+				manager_->SetNativeSampler(DRAW_BINDING_2ND_TEXTURE, samplers_.GetOrCreate(manager_->Context().Device(), key, error));
+				if (!error->empty()) {
+					return false;
+				}
+			} else if (binding != FBO_TEX_READ_FRAMEBUFFER) {
+				*error = "Metal shader blending has no framebuffer read path";
 				return false;
 			}
-			SamplerCacheKey key{};
-			key.sClamp = true;
-			key.tClamp = true;
-			manager_->SetNativeSampler(DRAW_BINDING_2ND_TEXTURE, samplers_.GetOrCreate(manager_->Context().Device(), key, error));
-			if (!error->empty()) {
-				return false;
-			}
-			framebufferManager_->RebindFramebuffer("Metal shader blending");
 			gstate_c.Dirty(DIRTY_FRAGMENTSHADER_STATE);
 		}
 		if (pipelineState_.blendState.dirtyShaderBlendFixValues) {
@@ -122,11 +146,16 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 			(!gstate.isLightingEnabled() || gstate.getAmbientA() == 255);
 	}
 	TextureApplyResult texture;
-	bool applyTexture = !gstate.isModeClear() && gstate.isTextureMapEnabled();
-	if (applyTexture) {
+	const bool textureEnabled = !gstate.isModeClear() && gstate.isTextureMapEnabled();
+	const bool textureNeedsApply = textureEnabled && gstate_c.IsDirty(DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
+	if (textureNeedsApply) {
+		textureCache_->ResetGETextureBindings();
 		gstate_c.Clean(DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
 		gstate_c.dstSquared = false;
 		texture = textureCache_->ApplyTexture(true);
+	} else if (gstate.getTextureAddress(0) == (gstate.getFrameBufRawAddress() | 0x04000000)) {
+		// A framebuffer clear may have changed texture memory without changing the texture registers.
+		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE);
 	}
 	uint16_t *indices = decIndex_;
 	const void *vertices = decoded_;
@@ -160,7 +189,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		count = transformed.drawIndexCount;
 		indexed = true;
 	}
-	if (applyTexture) {
+	if (textureNeedsApply) {
 		textureCache_->ApplySampler(texture, clipInfoFlags_ & ClipInfoFlags::FlatZ, transformed.pixelMapped);
 	}
 	if (action == SW_CULLED) {
@@ -169,12 +198,9 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	// Shared texture/depth conversions can leave an intermediate target bound.
 	// Restore the GE target before choosing attachment formats or drawing.
 	auto *vfb = framebufferManager_->GetCurrentRenderVFB();
-	if (vfb && vfb->fbo && manager_->RenderTarget() != vfb->fbo) {
+	if (framebufferManager_->UseBufferedRendering() && vfb && vfb->fbo && manager_->RenderTarget() != vfb->fbo) {
 		framebufferManager_->RebindFramebuffer("Metal GE target restore");
-	}
-	MetalDrawState state;
-	ViewportAndScissor viewport;
-	if (!ApplyDrawState(prim, &state, &viewport, error)) {
+	} else if (!framebufferManager_->UseBufferedRendering() && !manager_->RestoreBackbufferTarget(error)) {
 		return false;
 	}
 	if (action == SW_CLEAR) {
@@ -199,16 +225,32 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	if (count <= 0 || vertexCount <= 0) {
 		return true;
 	}
+	MetalDrawState state;
+	ViewportAndScissor viewport;
+	if (!ApplyDrawState(prim, &state, &viewport, error)) {
+		return false;
+	}
+	int x = std::max(0, viewport.scissorX);
+	int y = std::max(0, viewport.scissorY);
+	int w = std::min(framebufferManager_->GetRenderWidth(), viewport.scissorX + std::max(0, viewport.scissorW)) - x;
+	int h = std::min(framebufferManager_->GetRenderHeight(), viewport.scissorY + std::max(0, viewport.scissorH)) - y;
+	if (w <= 0 || h <= 0 || viewport.viewportW <= 0 || viewport.viewportH <= 0) {
+		return true;
+	}
 	const MetalGEVertexShader *vs;
 	const MetalGEFragmentShader *fs;
 	if (!shaderManager_->GetShaders(dec_->VertexType(), pipelineState_, hardware, clipInfoFlags_, &vs, &fs, error)) {
 		return false;
 	}
-	const auto *pipeline = pipelines_.GetOrCreate(*shaderManager_, vs->id, fs->id, hardware ? &dec_->GetDecVtxFmt() : nullptr,
+	const VShaderID vertexID = vs->id;
+	const FShaderID fragmentID = fs->id;
+	const DecVtxFormat *decodedFormat = hardware ? &dec_->GetDecVtxFmt() : nullptr;
+	const MetalGEPipeline *pipeline = pipelines_.Request(*shaderManager_, vertexID, fragmentID, decodedFormat,
 		state.blend, manager_->ColorFormat(), manager_->DepthStencilFormat(), error, manager_->SampleCount());
-	if (!pipeline) {
+	if (!error->empty()) {
 		return false;
 	}
+	const uint64_t shaderGeneration = shaderManager_->CacheGeneration();
 	auto depth = pipelines_.GetDepthStencil(state.depthStencil, error);
 	if (!depth) {
 		return false;
@@ -222,45 +264,91 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		return false;
 	}
 	auto &context = manager_->Context();
-	auto vb = context.Upload(vertices, (size_t)vertexCount * pipeline->stride, error);
+	const uint32_t stride = hardware ? decodedFormat->stride : sizeof(TransformedVertex);
+	const size_t vertexBytes = (size_t)vertexCount * stride;
+	Metal::UploadSlice vb;
+	Metal::UploadSlice ib;
+	if (indexed) {
+		const size_t indexOffset = (vertexBytes + sizeof(uint16_t) - 1) & ~(sizeof(uint16_t) - 1);
+		vb = context.ReserveUpload(indexOffset + (size_t)count * sizeof(uint16_t), error);
+		if (vb) {
+			memcpy((uint8_t *)vb.buffer.contents + vb.offset, vertices, vertexBytes);
+			memcpy((uint8_t *)vb.buffer.contents + vb.offset + indexOffset, indices, (size_t)count * sizeof(uint16_t));
+			ib = {vb.buffer, vb.offset + indexOffset};
+		}
+	} else {
+		vb = context.Upload(vertices, vertexBytes, error);
+	}
 	if (!vb) {
 		return false;
 	}
-	Metal::UploadSlice ib;
-	if (indexed) {
-		ib = context.Upload(indices, (size_t)count * sizeof(uint16_t), error);
+	if (!pipeline || shaderGeneration != shaderManager_->CacheGeneration()) {
+		pipeline = pipelines_.GetOrCreate(*shaderManager_, vertexID, fragmentID, decodedFormat,
+			state.blend, manager_->ColorFormat(), manager_->DepthStencilFormat(), error, manager_->SampleCount());
 	}
-	if (indexed && !ib) {
+	if (!pipeline) {
 		return false;
 	}
-	int x = std::max(0, viewport.scissorX);
-	int y = std::max(0, viewport.scissorY);
-	int w = std::min(framebufferManager_->GetRenderWidth(), viewport.scissorX + std::max(0, viewport.scissorW)) - x;
-	int h = std::min(framebufferManager_->GetRenderHeight(), viewport.scissorY + std::max(0, viewport.scissorH)) - y;
-	if (w <= 0 || h <= 0 || viewport.viewportW <= 0 || viewport.viewportH <= 0) {
-		return true;
+	if (textureEnabled) {
+		textureCache_->RestoreGETextureBindings();
 	}
 	if (!shaderManager_->BindUniforms(encoder, error) || !manager_->BindTextures(encoder, pipeline->textureMask, error)) {
 		return false;
 	}
-	[encoder setRenderPipelineState:pipeline->state];
-	[encoder setDepthStencilState:depth];
-	[encoder setStencilReferenceValue:transformed.setStencil ? transformed.stencilValue : state.stencilRef];
-	[encoder setCullMode:state.cull];
-	[encoder setFrontFacingWinding:MTLWindingCounterClockwise];
-	[encoder setDepthClipMode:state.depthClip];
-	[encoder setDepthBias:0 slopeScale:0 clamp:0];
-	[encoder setViewport:(MTLViewport){viewport.viewportX, viewport.viewportY, viewport.viewportW, viewport.viewportH, 0, 1}];
-	[encoder setScissorRect:(MTLScissorRect){(NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h}];
-	float blendColor[4];
-	Uint8x4ToFloat4(blendColor, state.blendColor);
-	[encoder setBlendColorRed:blendColor[0] green:blendColor[1] blue:blendColor[2] alpha:blendColor[3]];
+	const uint64_t serial = manager_->RenderStateSerial();
+	const bool sameEncoderState = encoderState_.valid && encoderState_.serial == serial;
+	const NSUInteger stencil = transformed.setStencil ? transformed.stencilValue : state.stencilRef;
+	const MTLViewport mtlViewport{viewport.viewportX, viewport.viewportY, viewport.viewportW, viewport.viewportH, 0, 1};
+	const MTLScissorRect mtlScissor{(NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h};
+	if (!sameEncoderState || encoderState_.pipeline != pipeline->state) {
+		[encoder setRenderPipelineState:pipeline->state];
+	}
+	if (!sameEncoderState || encoderState_.depth != depth) {
+		[encoder setDepthStencilState:depth];
+	}
+	if (!sameEncoderState || encoderState_.stencil != stencil) {
+		[encoder setStencilReferenceValue:stencil];
+	}
+	if (!sameEncoderState || encoderState_.cull != state.cull) {
+		[encoder setCullMode:state.cull];
+	}
+	if (!sameEncoderState) {
+		[encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+	}
+	if (!sameEncoderState || encoderState_.depthClip != state.depthClip) {
+		[encoder setDepthClipMode:state.depthClip];
+	}
+	if (!sameEncoderState) {
+		[encoder setDepthBias:0 slopeScale:0 clamp:0];
+	}
+	if (!sameEncoderState || !SameViewport(encoderState_.viewport, mtlViewport)) {
+		[encoder setViewport:mtlViewport];
+	}
+	if (!sameEncoderState || !SameScissor(encoderState_.scissor, mtlScissor)) {
+		[encoder setScissorRect:mtlScissor];
+	}
+	if (!sameEncoderState || encoderState_.blendColor != state.blendColor) {
+		float blendColor[4];
+		Uint8x4ToFloat4(blendColor, state.blendColor);
+		[encoder setBlendColorRed:blendColor[0] green:blendColor[1] blue:blendColor[2] alpha:blendColor[3]];
+	}
+	encoderState_.valid = true;
+	encoderState_.serial = serial;
+	encoderState_.pipeline = pipeline->state;
+	encoderState_.depth = depth;
+	encoderState_.stencil = stencil;
+	encoderState_.cull = state.cull;
+	encoderState_.depthClip = state.depthClip;
+	encoderState_.viewport = mtlViewport;
+	encoderState_.scissor = mtlScissor;
+	encoderState_.blendColor = state.blendColor;
 	[encoder setVertexBuffer:vb.buffer offset:vb.offset atIndex:Metal::VERTEX_BUFFER_SLOT];
 	MTLPrimitiveType topology = hardware && prim == GE_PRIM_TRIANGLE_STRIP ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
+	const NSUInteger instances = gstate_c.Use(GPU_USE_SINGLE_PASS_STEREO) && manager_->RenderTarget()->Layers() > 1 ? 2 : 1;
 	if (indexed) {
-		[encoder drawIndexedPrimitives:topology indexCount:count indexType:MTLIndexTypeUInt16 indexBuffer:ib.buffer indexBufferOffset:ib.offset];
+		[encoder drawIndexedPrimitives:topology indexCount:count indexType:MTLIndexTypeUInt16 indexBuffer:ib.buffer indexBufferOffset:ib.offset instanceCount:instances];
 	} else {
-		[encoder drawPrimitives:topology vertexStart:0 vertexCount:count];
+		[encoder drawPrimitives:topology vertexStart:0 vertexCount:count instanceCount:instances];
 	}
 	if (hardware && useDepthRaster_) {
 		DepthRasterSubmitRaw(prim, dec_, dec_->VertexType(), count);
@@ -277,6 +365,8 @@ void DrawEngineMetal::Flush() {
 	if (!FlushDraw(&lastError_)) {
 		ERROR_LOG(Log::G3D, "Metal draw failed: %s", lastError_.c_str());
 		gstate_c.Dirty(DIRTY_ALL_RENDER_STATE | DIRTY_ALL_UNIFORMS);
+		ResetAfterDrawInline();
+		return;
 	}
 	ResetAfterDrawInline();
 	if (framebufferManager_) {

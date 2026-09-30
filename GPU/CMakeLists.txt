@@ -195,7 +195,7 @@ set(GPU_SOURCES
 # from an archive, which sidesteps the GNU ld single-pass archive-ordering problem a normal
 # two-way STATIC dependency would hit. Core links this PUBLICLY so consumers of Core get it.
 add_library(GPU OBJECT ${GPU_SOURCES})
-if(APPLE AND NOT IOS AND NOT LIBRETRO)
+if(APPLE AND NOT LIBRETRO)
 	target_compile_definitions(GPU PUBLIC PPSSPP_HAS_METAL=1)
 	target_sources(GPU PRIVATE
 		Metal/GPU_Metal.h

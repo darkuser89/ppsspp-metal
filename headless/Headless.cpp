@@ -934,6 +934,14 @@ int main(int argc, const char* argv[]) {
 	g_Config.bUseOldAtrac = oldAtrac;
 	g_Config.bSkipDeadbeefFilling = false;
 
+	if (cmdLineOptions.appendConfig.has_value()) {
+		g_Config.SetAppendedConfigIni(Path(cmdLineOptions.appendConfig.value()), false);
+		if (!g_Config.LoadAppendedConfig()) {
+			fprintf(stderr, "Failed to load appended config: %s\n", cmdLineOptions.appendConfig.value().c_str());
+			return 1;
+		}
+	}
+
 	// ApplyToConfig() has the final say, applied after RestoreDefaults() and the headless
 	// overrides above, so a matching command line flag always wins.
 	cmdLineOptions.ApplyToConfig();

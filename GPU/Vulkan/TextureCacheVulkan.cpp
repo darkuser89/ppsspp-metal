@@ -736,8 +736,8 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 	copyBatch.reserve(levels);
 
 	for (int i = 0; i < levels; i++) {
-		const int mipUnscaledWidth = gstate.getTextureWidth(i);
-		const int mipUnscaledHeight = gstate.getTextureHeight(i);
+		const int mipUnscaledWidth = (entry->status & TexStatus::PSP_SIZE_CLIPPED) ? std::min(gstate.getTextureWidth(i), 512) : gstate.getTextureWidth(i);
+		const int mipUnscaledHeight = (entry->status & TexStatus::PSP_SIZE_CLIPPED) ? std::min(gstate.getTextureHeight(i), 512) : gstate.getTextureHeight(i);
 
 		int mipWidth;
 		int mipHeight;
@@ -900,6 +900,10 @@ VkFormat TextureCacheVulkan::GetDestFormat(GETextureFormat format, GEPaletteForm
 void TextureCacheVulkan::LoadVulkanTextureLevel(TexCacheEntry &entry, uint8_t *writePtr, int rowPitch, int level, int scaleFactor, VkFormat dstFmt) {
 	int w = gstate.getTextureWidth(level);
 	int h = gstate.getTextureHeight(level);
+	if (entry.status & TexStatus::PSP_SIZE_CLIPPED) {
+		w = std::min(w, 512);
+		h = std::min(h, 512);
+	}
 
 	GETextureFormat tfmt = (GETextureFormat)entry.format;
 	GEPaletteFormat clutformat = gstate.getClutPaletteFormat();
@@ -931,7 +935,8 @@ void TextureCacheVulkan::LoadVulkanTextureLevel(TexCacheEntry &entry, uint8_t *w
 		decPitch = rowPitch;
 	}
 
-	TextureAlpha alphaResult = DecodeTextureLevel((u8 *)pixelData, decPitch, tfmt, clutformat, texaddr, level, bufw, texDecFlags);
+	TextureAlpha alphaResult = DecodeTextureLevel((u8 *)pixelData, decPitch, tfmt, clutformat, texaddr, level, bufw, texDecFlags,
+		(entry.status & TexStatus::PSP_SIZE_CLIPPED) != 0);
 	entry.SetAlphaStatus(alphaResult, level);
 
 	if (scaleFactor > 1) {

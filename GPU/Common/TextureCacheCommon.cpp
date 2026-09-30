@@ -403,11 +403,14 @@ static u32 ComputeTextureHash(TextureReplacer &replacer, u32 addr, int bufw, int
 	const GETextureFormat format = entry->format;
 	// Swizzled CLUT4 glyph atlases can fill below the visible UV range while remaining
 	// 512 pixels tall.  Hashing only maxSeenV rows misses those updates (#21980).
-	const u16 hashMaxSeenV = h == 512 && swizzled && format == GE_TFMT_CLUT4 ? 512 : entry->maxSeenV;
+	const u16 hashMaxSeenV = h >= 512 && swizzled && format == GE_TFMT_CLUT4 ? 512 : entry->maxSeenV;
 	if (replacer.Enabled()) {
 		return replacer.ComputeHash(addr, bufw, w, h, swizzled, format, hashMaxSeenV);
 	}
 
+	if (!g_DoubleTextureCoordinates && !(entry->status & TexStatus::IS_PPGE_ATLAS)) {
+		h = std::min(h, 512);
+	}
 	if (h == 512 && hashMaxSeenV < 512 && hashMaxSeenV != 0) {
 		h = (int)hashMaxSeenV;
 	}
@@ -943,6 +946,13 @@ TextureApplyResult TextureCacheCommon::ApplyTexture(bool doBind) {
 
 TextureApplyResult TextureCacheCommon::ApplyTextureFinish(TexCacheEntry *entry, bool doBind) {
 	_dbg_assert_(entry);
+	if (entry->status & TexStatus::PSP_SIZE_CLIPPED) {
+		gstate_c.curTextureWidth = std::min(gstate.getTextureWidth(0), 512);
+		gstate_c.curTextureHeight = std::min(gstate.getTextureHeight(0), 512);
+	}
+	if (gstate.getTextureWidth(0) > 512 || gstate.getTextureHeight(0) > 512) {
+		gstate_c.Dirty(DIRTY_UVSCALEOFFSET | DIRTY_TEXCLAMP);
+	}
 
 	const bool isVideo = (entry->status & TexStatus::VIDEO) != 0;
 	gstate_c.SetTextureIsVideo(isVideo);
@@ -1994,7 +2004,7 @@ const u8 *TextureCacheCommon::UnswizzleToTemp(const u8 *texptr, int w, int h, in
 	return (const u8 *)tmpTexBuf32_.data();
 }
 
-TextureAlpha TextureCacheCommon::DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, TexDecodeFlags flags) {
+TextureAlpha TextureCacheCommon::DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, TexDecodeFlags flags, bool clipToPSPSize) {
 	u32 alphaSum = 0xFFFFFFFF;
 	u32 fullAlphaMask = 0x0;
 
@@ -2020,6 +2030,10 @@ TextureAlpha TextureCacheCommon::DecodeTextureLevel(u8 *out, int outPitch, GETex
 
 	int w = gstate.getTextureWidth(level);
 	int h = gstate.getTextureHeight(level);
+	if (clipToPSPSize) {
+		w = std::min(w, 512);
+		h = std::min(h, 512);
+	}
 
 	u32 ppgeOffset;
 	const bool isPPGE = IsPPGEAtlasFakeAddress(texaddr, &ppgeOffset);
@@ -2815,6 +2829,7 @@ std::string AttachCandidate::ToString() const {
 
 bool TextureCacheCommon::PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEntry *entry) {
 	gpuStats.perFrame.numTexturesDecoded++;
+	entry->status &= ~TexStatus::PSP_SIZE_CLIPPED;
 
 	plan.badMipSizes = false;
 	// maxLevel here is the max level to upload. Not the count.
@@ -2908,17 +2923,6 @@ bool TextureCacheCommon::PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEnt
 	// Don't scale the PPGe texture.
 	if (isPPGETexture) {
 		plan.scaleFactor = 1;
-	} else if (!g_DoubleTextureCoordinates) {
-		// Refuse to load invalid-ly sized textures, which can happen through display list corruption.
-		// However, turns out some games uses huge textures for font rendering for no apparent reason.
-		// These will only work correctly in the top 512x512 part. So, I've increased the threshold quite a bit.
-		// We probably should handle these differently, by clamping the texture size and texture coordinates, but meh.
-		if (plan.w > 2048 || plan.h > 2048) {
-			// Strangely, the homebrew "Kitten Cannon" hits this a bunch, with a clearly invalid 512x32768 texture.
-			// Some noise bit in the texture size command that we might just want to ignore.
-			ERROR_LOG(Log::TexCache, "Bad texture dimensions: %dx%d", plan.w, plan.h);
-			return false;
-		}
 	}
 
 	if (PSP_CoreParameter().compat.flags().ForceLowerResolutionForEffectsOn && gstate.FrameBufStride() < 0x1E0) {
@@ -2934,7 +2938,9 @@ bool TextureCacheCommon::PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEnt
 		} else {
 			entry->status &= ~TexStatus::TO_SCALE;
 			entry->status |= TexStatus::IS_SCALED_OR_REPLACED;
-			texelsScaledThisFrame_ += plan.w * plan.h;
+			const int sourceW = !isPPGETexture && !g_DoubleTextureCoordinates ? std::min(plan.w, 512) : plan.w;
+			const int sourceH = !isPPGETexture && !g_DoubleTextureCoordinates ? std::min(plan.h, 512) : plan.h;
+			texelsScaledThisFrame_ += sourceW * sourceH;
 		}
 	}
 
@@ -2975,6 +2981,19 @@ bool TextureCacheCommon::PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEnt
 	} else {
 		plan.replaced = nullptr;
 		plan.doReplace = false;
+	}
+	if (!isPPGETexture && !g_DoubleTextureCoordinates && !plan.doReplace && (plan.w > 512 || plan.h > 512)) {
+		// The PSP exposes at most 512x512 texels even when the GE register
+		// dimensions are larger. Keep those logical dimensions in gstate for UVs.
+		entry->status |= TexStatus::PSP_SIZE_CLIPPED;
+		plan.w = std::min(plan.w, 512);
+		plan.h = std::min(plan.h, 512);
+		if (plan.depth == 1) {
+			// Explicit logical mips above 512 can have the same physical size.
+			// A host mip chain cannot represent those duplicate dimensions.
+			plan.levelsToLoad = 1;
+			plan.levelsToCreate = 1;
+		}
 	}
 
 	// NOTE! Last chance to change scale factor here!
@@ -3045,6 +3064,10 @@ bool TextureCacheCommon::PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEnt
 void TextureCacheCommon::LoadTextureLevel(TexCacheEntry &entry, uint8_t *data, size_t dataSize, int stride, BuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags) {
 	int w = gstate.getTextureWidth(srcLevel);
 	int h = gstate.getTextureHeight(srcLevel);
+	if (entry.status & TexStatus::PSP_SIZE_CLIPPED) {
+		w = std::min(w, 512);
+		h = std::min(h, 512);
+	}
 
 	PROFILE_THIS_SCOPE("decodetex");
 
@@ -3078,7 +3101,8 @@ void TextureCacheCommon::LoadTextureLevel(TexCacheEntry &entry, uint8_t *data, s
 			texDecFlags |= TexDecodeFlags::TO_CLUT8;
 		}
 
-		TextureAlpha alphaResult = DecodeTextureLevel((u8 *)pixelData, decPitch, tfmt, clutformat, texaddr, srcLevel, bufw, texDecFlags);
+		TextureAlpha alphaResult = DecodeTextureLevel((u8 *)pixelData, decPitch, tfmt, clutformat, texaddr, srcLevel, bufw, texDecFlags,
+			(entry.status & TexStatus::PSP_SIZE_CLIPPED) != 0);
 		entry.SetAlphaStatus(alphaResult, srcLevel);
 
 		int scaledW = w, scaledH = h;
@@ -3131,6 +3155,9 @@ TextureAlpha TextureCacheCommon::CheckCLUTAlpha(const uint8_t *pixelData, GEPale
 
 std::string TexStatusToString(TexStatus status) {
 	std::string result;
+	if (status & TexStatus::PSP_SIZE_CLIPPED) {
+		result += "PSP_SIZE_CLIPPED ";
+	}
 	if (status & TexStatus::ALPHA_SOLID) {
 		result += "SOLID_ALPHA ";
 	}

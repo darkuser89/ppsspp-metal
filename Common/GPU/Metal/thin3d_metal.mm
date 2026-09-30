@@ -2,17 +2,28 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#if __has_include(<MetalFX/MetalFX.h>)
 #import <MetalFX/MetalFX.h>
+#define PPSSPP_HAS_METALFX 1
+#else
+#define PPSSPP_HAS_METALFX 0
+#endif
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <vector>
 
+#include "Common/Data/Convert/ColorConv.h"
 #include "Common/GPU/Metal/MetalResources.h"
 #include "Common/GPU/Metal/MetalRenderManager.h"
 #include "Common/GPU/Metal/thin3d_metal.h"
 #include "Common/Log.h"
+#include "Core/Config.h"
+#include "GPU/GPUState.h"
 
 namespace Draw {
 namespace {
@@ -38,6 +49,13 @@ struct MetalShader final : ShaderModule {
 	Metal::CompiledShader compiled;
 	ShaderStage GetStage() const override { return stage; }
 };
+struct MetalPipelineRequest {
+	std::mutex mutex;
+	std::condition_variable ready;
+	id<MTLRenderPipelineState> state = nil;
+	std::string error;
+	bool complete = false;
+};
 struct MetalPipeline final : Pipeline {
 	MTLRenderPipelineDescriptor *desc = nil;
 	DepthStencilStateDesc depth{};
@@ -46,10 +64,24 @@ struct MetalPipeline final : Pipeline {
 	int stride = 0;
 	size_t uniformSize = 0;
 	uint32_t textureMask = 0;
+	uint32_t vertexTextureMask = 0;
+	uint32_t fragmentTextureMask = 0;
+	bool multiview = false;
+	bool fan = false;
 	// Attachment formats are part of the PSO identity. This pipeline object
 	// already uniquely owns its shaders, vertex layout, blend, and topology.
 	std::map<std::array<uint64_t, 3>, id<MTLRenderPipelineState>> states;
+	std::map<std::array<uint64_t, 3>, std::shared_ptr<MetalPipelineRequest>> pending;
 	std::map<uint32_t, id<MTLDepthStencilState>> depthStates;
+};
+
+struct MetalDelayedReadback {
+	id<MTLTexture> source = nil;
+	id<MTLBuffer> ready = nil;
+	id<MTLBuffer> pending = nil;
+	id<MTLCommandBuffer> pendingCommands = nil;
+	size_t pitch = 0;
+	uint64_t lastUse = 0;
 };
 
 static MTLBlendFactor BlendFactorNative(BlendFactor factor) {
@@ -87,9 +119,11 @@ public:
 	Framebuffer *CreateFramebuffer(const FramebufferDesc &desc) override;
 	void UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) override;
 	void UpdateTextureLevels(Texture *texture, const uint8_t **data, TextureCallback callback, int levels) override;
+	void UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) override;
 	void CopyFramebufferImage(Framebuffer *src, int level, int x, int y, int z, Framebuffer *dst, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth, Aspect aspects, const char *tag) override;
 	bool BlitFramebuffer(Framebuffer *src, int sx1, int sy1, int sx2, int sy2, Framebuffer *dst, int dx1, int dy1, int dx2, int dy2, Aspect aspects, FBBlitFilter filter, const char *tag) override;
 	bool CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, int y, int w, int h, DataFormat format, void *pixels, int stride, ReadbackMode mode, const char *tag) override;
+	DataFormat PreferredFramebufferReadbackFormat(Framebuffer *src) override;
 	void BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) override;
 	void BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect aspect, int layer) override;
 	bool SupportsSpatialUpscaling() const override { return spatialSupported_; }
@@ -105,19 +139,19 @@ public:
 	void BindIndexBuffer(Buffer *buffer, int offset) override { BindRef(index_, static_cast<Metal::Buffer *>(buffer)); indexOffset_ = offset; }
 	void BindNativeTexture(int slot, void *texture) override;
 	void UpdateDynamicUniformBuffer(const void *data, size_t size) override;
-	// Every Apply writes all dynamic state, including after native API calls.
-	void Invalidate(InvalidationFlags flags) override {}
-	void BindPipeline(Pipeline *pipeline) override { BindRef(pipeline_, static_cast<MetalPipeline *>(pipeline)); }
+	void Invalidate(InvalidationFlags flags) override;
+	void BindPipeline(Pipeline *pipeline) override;
 	void Draw(int count, int offset) override;
 	void DrawIndexed(int count, int offset) override;
 	void DrawUP(const void *data, int count) override;
 	void DrawIndexedUP(const void *data, int count, const void *indices, int indexCount) override;
 	void DrawIndexedClippedBatchUP(const void *data, int count, const void *indices, int indexCount, Slice<ClippedDraw> draws, const void *uniforms, size_t size) override;
 	void BeginFrame(DebugFlags flags) override;
-	void EndFrame() override { EndPass(); }
+	void EndFrame() override { EndPass(); Invalidate(InvalidationFlags::CACHED_RENDER_STATE); }
 	void Present(PresentMode mode) override;
-	PresentMode GetCurrentPresentMode() const override { return PresentMode::FIFO; }
+	PresentMode GetCurrentPresentMode() const override { return presentMode_; }
 	void Clear(Aspect aspects, uint32_t color, float depth, int stencil) override;
+	void InvalidateFramebuffer(FBInvalidationStage stage, Aspect aspects) override;
 	std::string GetInfoString(InfoField info) const override;
 	uint64_t GetNativeObject(NativeObject obj, void *src) override;
 	void HandleEvent(Event event, int w, int h, void *p1, void *p2) override;
@@ -125,9 +159,19 @@ public:
 	int GetFrameCount() override { return frameCount_; }
 	BackendState GetCurrentBackendState() const override { return {passCount_, encoder_ != nil}; }
 	Metal::RenderContext &Context() override { return context_; }
-	id<MTLRenderCommandEncoder> RenderEncoder() override { return BeginPass() ? encoder_ : nil; }
+	id<MTLRenderCommandEncoder> RenderEncoder() override {
+		if (!BeginPass()) {
+			return nil;
+		}
+		// The GE draw sets native state directly on this encoder.
+		thin3DEncoderState_.valid = false;
+		return encoder_;
+	}
+	uint64_t RenderStateSerial() const override { return renderStateSerial_; }
 	void EndRenderPass() override { EndPass(); }
 	void SetNativeSampler(int slot, id<MTLSamplerState> sampler) override;
+	bool RestoreBackbufferTarget(std::string *error) override;
+	bool SnapshotBackbufferColor(int slot, std::string *error) override;
 	bool BindTextures(id<MTLRenderCommandEncoder> encoder, uint32_t mask, std::string *error) override;
 	Framebuffer *RenderTarget() const override { return target_.ptr; }
 	MTLPixelFormat ColorFormat() const override { return target_.ptr ? target_->Color().pixelFormat : MTLPixelFormatInvalid; }
@@ -137,24 +181,52 @@ public:
 	void ResizeSurface() override;
 
 private:
+	struct Thin3DEncoderState {
+		bool valid = false;
+		uintptr_t pipeline = 0;
+		uintptr_t depth = 0;
+		uintptr_t uniform = 0;
+		size_t uniformOffset = 0;
+		NSUInteger stencil = 0;
+		MTLCullMode cull = MTLCullModeNone;
+		MTLWinding winding = MTLWindingCounterClockwise;
+		MTLViewport viewport{};
+		MTLScissorRect scissor{};
+		std::array<float, 4> blendColor{};
+		bool viewMaskBound = false;
+	};
 	bool Commands();
 	void EndPass();
 	bool BeginPass();
+	void RequestPipeline();
 	bool Apply(id<MTLBuffer> vertices, size_t offset);
+	NSUInteger InstanceCount() const { return pipeline_->multiview ? target_->Layers() : 1; }
 	void Error(const std::string &message);
 	void ReleaseDrawable();
 	Metal::Framebuffer *Resolve(Framebuffer *framebuffer);
+	id<MTLTexture> NullTexture(bool array);
 	bool Copy(Framebuffer *src, int sx, int sy, Framebuffer *dst, int dx, int dy, int w, int h, Aspect aspects);
-	id<MTLBuffer> Upload(const void *data, size_t size);
+	bool ReadbackDelayedColor(id<MTLTexture> source, int x, int y, int w, int h, DataFormat format,
+		void *pixels, int stride, std::string *error);
+	void DrawFan(id<MTLBuffer> vertices, size_t vertexOffset, const uint16_t *indices, int count, int firstVertex);
 	Metal::RenderContext context_;
 	Metal::FramebufferCopy framebufferCopy_;
+	std::map<std::array<uintptr_t, 5>, MetalDelayedReadback> delayedReadbacks_;
+	uint64_t delayedReadbackUse_ = 0;
 	bool spatialSupported_ = false;
 	std::array<uint64_t, 5> spatialKey_{};
-	id<MTLFXSpatialScaler> spatialScaler_ = nil;
+	int spatialRetryFrame_ = 0;
+#if PPSSPP_HAS_METALFX
+	id<MTLFXSpatialScaler> spatialScaler_ API_AVAILABLE(macos(13.0), ios(16.0)) = nil;
+#endif
 	id<MTLTexture> spatialInput_ = nil;
 	id<MTLTexture> spatialOutput_ = nil;
+	id<MTLTexture> nullTexture_ = nil;
+	id<MTLTexture> nullTextureArray_ = nil;
 	DeviceCaps caps_{};
 	id<MTLRenderCommandEncoder> encoder_ = nil;
+	uint64_t renderStateSerial_ = 0;
+	Thin3DEncoderState thin3DEncoderState_;
 	AutoRef<Metal::Framebuffer> target_;
 	AutoRef<Metal::Framebuffer> backbuffer_;
 	CAMetalLayer *layer_ = nil;
@@ -166,60 +238,102 @@ private:
 	int vertexOffset_ = 0, indexOffset_ = 0;
 	std::array<id<MTLTexture>, MAX_TEXTURE_SLOTS> textures_{};
 	std::array<id<MTLSamplerState>, MAX_TEXTURE_SLOTS> samplers_{};
-	id<MTLBuffer> uniform_ = nil;
+	uint32_t vertexTextureMask_ = 0;
+	uint32_t fragmentTextureMask_ = 0;
+	// Identity only: do not retain a previous drawable or render target here.
+	std::array<uintptr_t, MAX_TEXTURE_SLOTS> boundVertexTextures_{};
+	std::array<uintptr_t, MAX_TEXTURE_SLOTS> boundVertexSamplers_{};
+	std::array<uintptr_t, MAX_TEXTURE_SLOTS> boundFragmentTextures_{};
+	std::array<uintptr_t, MAX_TEXTURE_SLOTS> boundFragmentSamplers_{};
+	uint64_t boundFragmentSerial_ = 0;
+	bool boundVertexValid_ = false;
+	bool boundFragmentValid_ = false;
+	std::vector<uint8_t> uniformData_;
+	Metal::UploadSlice uniform_;
+	uint64_t uniformGeneration_ = 0;
 	std::array<float, 4> blendColor_{};
 	std::array<int, 4> scissor_{};
 	Viewport viewport_{};
 	uint8_t stencilRef_ = 0, stencilWrite_ = 255, stencilCompare_ = 255;
 	RenderPassInfo pass_{RPAction::KEEP, RPAction::KEEP, RPAction::KEEP, 0, 1.0f, 0, "Metal"};
+	Aspect discardStoreAspects_ = Aspect::NO_BIT;
 	int frameCount_ = 0;
 	uint32_t passCount_ = 0;
+	PresentMode presentMode_ = PresentMode::FIFO;
 	InvalidationCallback invalidation_;
 	ErrorCallbackFn errorCallback_ = nullptr;
 	void *errorUserdata_ = nullptr;
 };
 
 bool MetalDrawContext::Init(std::string *error) {
-	if (!context_.Init(error)) {
+	if (!context_.Init(error, std::clamp(g_Config.iInflightFrames, 1, 2))) {
 		return false;
 	}
+	context_.SetBeginCommandsCallback([this]() {
+		if (invalidation_) {
+			invalidation_(InvalidationCallbackFlags::COMMAND_BUFFER_STATE);
+		}
+	});
 	shaderLanguageDesc_.Init(GLSL_VULKAN);
-	shaderLanguageDesc_.framebufferArrayTextures = false;
-	caps_.vendor = GPUVendor::VENDOR_APPLE;
+	shaderLanguageDesc_.framebufferArrayTextures = true;
+	const bool appleGPU = [context_.Device() supportsFamily:MTLGPUFamilyApple1];
+	caps_.vendor = appleGPU ? GPUVendor::VENDOR_APPLE : GPUVendor::VENDOR_UNKNOWN;
 	caps_.deviceName = context_.DeviceName();
-	caps_.maxTextureSize = 16384;
+	caps_.maxTextureSize = Metal::MaxTextureDimension(context_.Device());
 	caps_.coordConvention = CoordConvention::Vulkan;
 	caps_.preferredDepthBufferFormat = DataFormat::D32F_S8;
 	caps_.fragmentShaderFullPrecisionFloat = true;
 	caps_.fragmentShaderInt32Supported = true;
 	caps_.fragmentShaderDepthWriteSupported = true;
+	caps_.fragmentShaderStencilWriteSupported = true;
 	caps_.blendMinMaxSupported = true;
 	caps_.dualSourceBlend = true;
 	caps_.depthClampSupported = true;
 	caps_.maxClipDistances = 8;
 	caps_.anisoSupported = true;
+	caps_.samplerLodControl = true;
+	caps_.setMaxFrameLatencySupported = true;
 	caps_.framebufferCopySupported = true;
+	caps_.framebufferFetchSupported = appleGPU;
+	caps_.framebufferBlitSupported = true;
+	caps_.framebufferDepthBlitSupported = true;
+	caps_.framebufferStencilBlitSupported = true;
 	caps_.framebufferDepthCopySupported = true;
 	caps_.framebufferSeparateDepthCopySupported = true;
 	caps_.textureDepthSupported = true;
 	caps_.texture3DSupported = true;
-	caps_.isTilingGPU = true;
+	caps_.isTilingGPU = appleGPU;
 	caps_.textureSwizzleSupported = true;
+	if (@available(macOS 13.0, iOS 16.0, *)) {
+		caps_.multiViewSupported = [context_.Device() supportsFamily:MTLGPUFamilyApple5] ||
+			[context_.Device() supportsFamily:MTLGPUFamilyMac2];
+	}
 	caps_.multiSampleLevelsMask = 1;
-	for (int level = 1; level <= 4; ++level) {
-		if ([context_.Device() supportsTextureSampleCount:1u << level]) {
-			caps_.multiSampleLevelsMask |= 1u << level;
+	if (Metal::SupportsDepthStencilResolve(context_.Device())) {
+		for (int level = 1; level <= 4; ++level) {
+			if ([context_.Device() supportsTextureSampleCount:1u << level]) {
+				caps_.multiSampleLevelsMask |= 1u << level;
+			}
 		}
 	}
 	caps_.presentModesSupported = PresentMode::FIFO;
 	caps_.presentMaxInterval = 1;
+#if PPSSPP_PLATFORM(MAC)
+	caps_.presentModesSupported |= PresentMode::IMMEDIATE;
+	caps_.presentInstantModeChange = true;
+#endif
+#if PPSSPP_HAS_METALFX
 	if (@available(macOS 13.0, iOS 16.0, *)) {
 		spatialSupported_ = [MTLFXSpatialScalerDescriptor supportsDevice:context_.Device()];
 	}
+#endif
 	return true;
 }
 
 bool MetalDrawContext::UpscaleBoundTexture(int binding, int width, int height, UVRect *uv) {
+#if !PPSSPP_HAS_METALFX
+	return false;
+#else
 	if (!spatialSupported_ || binding < 0 || binding >= MAX_TEXTURE_SLOTS || width <= 0 || height <= 0 ||
 		width > caps_.maxTextureSize || height > caps_.maxTextureSize) {
 		return false;
@@ -258,7 +372,7 @@ bool MetalDrawContext::UpscaleBoundTexture(int binding, int width, int height, U
 	}
 	if (@available(macOS 13.0, iOS 16.0, *)) {
 		const std::array<uint64_t, 5> key{(uint64_t)sw, (uint64_t)sh, (uint64_t)width, (uint64_t)height, source.pixelFormat};
-		if (key != spatialKey_) {
+		if (key != spatialKey_ || (!spatialScaler_ && frameCount_ >= spatialRetryFrame_)) {
 			spatialKey_ = key;
 			spatialScaler_ = nil;
 			spatialInput_ = nil;
@@ -284,11 +398,12 @@ bool MetalDrawContext::UpscaleBoundTexture(int binding, int width, int height, U
 				spatialOutput_ = [context_.Device() newTextureWithDescriptor:textureDesc];
 			}
 			if (!spatialScaler_ || !spatialInput_ || !spatialOutput_) {
-				// Keep the failed key so an allocation failure does not retry every frame.
+				// Resource pressure can be temporary. Retry without allocating every frame.
 				WARN_LOG(Log::G3D, "MetalFX Spatial could not allocate %dx%d output; using normal presentation", width, height);
 				spatialScaler_ = nil;
 				spatialInput_ = nil;
 				spatialOutput_ = nil;
+				spatialRetryFrame_ = frameCount_ + 120;
 			}
 		}
 		if (!spatialScaler_ || !Commands()) {
@@ -314,6 +429,7 @@ bool MetalDrawContext::UpscaleBoundTexture(int binding, int width, int height, U
 		return true;
 	}
 	return false;
+#endif
 }
 
 void MetalDrawContext::Error(const std::string &message) {
@@ -332,17 +448,26 @@ bool MetalDrawContext::Commands() {
 		Error(error);
 		return false;
 	}
-	if (invalidation_) {
-		invalidation_(InvalidationCallbackFlags::COMMAND_BUFFER_STATE);
-	}
 	return true;
 }
 
 void MetalDrawContext::EndPass() {
 	if (encoder_) {
+		const bool multisample = target_ && target_->MultiSampleLevel() > 0;
+		[encoder_ setColorStoreAction:(discardStoreAspects_ & Aspect::COLOR_BIT) ? MTLStoreActionDontCare :
+			multisample ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore atIndex:0];
+		if (target_ && target_->DepthStencil()) {
+			const bool resolveDepthStencil = multisample;
+			[encoder_ setDepthStoreAction:(discardStoreAspects_ & Aspect::DEPTH_BIT) ? MTLStoreActionDontCare :
+				resolveDepthStencil ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore];
+			[encoder_ setStencilStoreAction:(discardStoreAspects_ & Aspect::STENCIL_BIT) ? MTLStoreActionDontCare :
+				resolveDepthStencil ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore];
+		}
 		[encoder_ endEncoding];
 		encoder_ = nil;
+		thin3DEncoderState_.valid = false;
 	}
+	discardStoreAspects_ = Aspect::NO_BIT;
 }
 
 void MetalDrawContext::Wait() {
@@ -432,7 +557,12 @@ ShaderModule *MetalDrawContext::CreateShaderModule(ShaderStage stage, ShaderLang
 	}
 	Metal::CompiledShader compiled;
 	std::string error;
-	if (!Metal::CompileShader(std::string_view((const char *)data, size), stage, {}, &compiled, &error)) {
+	Metal::ShaderCompileOptions options;
+	options.multiview = gstate_c.Use(GPU_USE_SINGLE_PASS_STEREO);
+#if PPSSPP_PLATFORM(IOS)
+	options.ios = true;
+#endif
+	if (!Metal::CompileShader(std::string_view((const char *)data, size), stage, options, &compiled, &error)) {
 		Error(error);
 		return nullptr;
 	}
@@ -457,15 +587,23 @@ ShaderModule *MetalDrawContext::CreateShaderModule(ShaderStage stage, ShaderLang
 }
 
 Pipeline *MetalDrawContext::CreateGraphicsPipeline(const PipelineDesc &desc, const char *tag) {
-	if (!desc.blend || !desc.depthStencil || !desc.raster || desc.prim > Primitive::TRIANGLE_STRIP) {
+	if (!desc.blend || !desc.depthStencil || !desc.raster || desc.prim > Primitive::TRIANGLE_FAN) {
 		Error("Incomplete or unsupported Metal pipeline");
 		return nullptr;
 	}
 	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
 	size_t requiredUniforms = 0;
 	uint32_t textureMask = 0;
+	uint32_t vertexTextureMask = 0;
+	uint32_t fragmentTextureMask = 0;
+	bool multiview = false;
 	for (auto module : desc.shaders) {
+		if (!module) {
+			Error("Metal pipeline has a null shader module");
+			return nullptr;
+		}
 		auto shader = static_cast<MetalShader *>(module);
+		multiview |= shader->compiled.needsViewMaskBuffer;
 		if (shader->stage == ShaderStage::Vertex) {
 			pd.vertexFunction = shader->function;
 		} else if (shader->stage == ShaderStage::Fragment) {
@@ -475,7 +613,13 @@ Pipeline *MetalDrawContext::CreateGraphicsPipeline(const PipelineDesc &desc, con
 			if (resource.kind == Metal::ResourceKind::UniformBuffer) {
 				requiredUniforms = std::max(requiredUniforms, (size_t)resource.byteSize);
 			} else if (resource.kind == Metal::ResourceKind::SampledTexture) {
-				textureMask |= 1u << resource.index;
+				const uint32_t bit = 1u << resource.index;
+				textureMask |= bit;
+				if (shader->stage == ShaderStage::Vertex) {
+					vertexTextureMask |= bit;
+				} else if (shader->stage == ShaderStage::Fragment) {
+					fragmentTextureMask |= bit;
+				}
 			}
 		}
 	}
@@ -490,6 +634,9 @@ Pipeline *MetalDrawContext::CreateGraphicsPipeline(const PipelineDesc &desc, con
 	if (desc.inputLayout) {
 		pd.vertexDescriptor = static_cast<MetalInput *>(desc.inputLayout)->desc;
 	}
+	pd.inputPrimitiveTopology = desc.prim == Primitive::POINT_LIST ? MTLPrimitiveTopologyClassPoint :
+		(desc.prim == Primitive::LINE_LIST || desc.prim == Primitive::LINE_STRIP) ? MTLPrimitiveTopologyClassLine :
+		MTLPrimitiveTopologyClassTriangle;
 	const auto &blend = static_cast<MetalBlend *>(desc.blend)->desc;
 	auto color = pd.colorAttachments[0];
 	color.blendingEnabled = blend.enabled;
@@ -510,9 +657,49 @@ Pipeline *MetalDrawContext::CreateGraphicsPipeline(const PipelineDesc &desc, con
 	pipeline->stride = desc.inputLayout ? static_cast<MetalInput *>(desc.inputLayout)->stride : 0;
 	pipeline->uniformSize = desc.uniformDesc ? desc.uniformDesc->uniformBufferSize : 0;
 	pipeline->textureMask = textureMask;
+	pipeline->vertexTextureMask = vertexTextureMask;
+	pipeline->fragmentTextureMask = fragmentTextureMask;
+	pipeline->multiview = multiview;
+	pipeline->fan = desc.prim == Primitive::TRIANGLE_FAN;
 	const MTLPrimitiveType types[] = {MTLPrimitiveTypePoint, MTLPrimitiveTypeLine, MTLPrimitiveTypeLineStrip, MTLPrimitiveTypeTriangle, MTLPrimitiveTypeTriangleStrip};
-	pipeline->primitive = types[(size_t)desc.prim];
+	pipeline->primitive = pipeline->fan ? MTLPrimitiveTypeTriangle : types[(size_t)desc.prim];
 	return pipeline;
+}
+
+void MetalDrawContext::BindPipeline(Pipeline *pipeline) {
+	BindRef(pipeline_, static_cast<MetalPipeline *>(pipeline));
+	RequestPipeline();
+}
+
+void MetalDrawContext::RequestPipeline() {
+	if (!pipeline_ || !target_) {
+		return;
+	}
+	const auto colorFormat = target_->Color().pixelFormat;
+	const auto depthFormat = target_->DepthStencil() ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
+	const std::array<uint64_t, 3> key{(uint64_t)colorFormat, (uint64_t)depthFormat, (uint64_t)target_->SampleCount()};
+	if (pipeline_->states.find(key) != pipeline_->states.end() || pipeline_->pending.find(key) != pipeline_->pending.end()) {
+		return;
+	}
+	MTLRenderPipelineDescriptor *desc = [pipeline_->desc copy];
+	desc.colorAttachments[0].pixelFormat = colorFormat;
+	desc.depthAttachmentPixelFormat = depthFormat;
+	desc.stencilAttachmentPixelFormat = depthFormat;
+	desc.rasterSampleCount = target_->SampleCount();
+	auto request = std::make_shared<MetalPipelineRequest>();
+	pipeline_->pending.emplace(key, request);
+	[context_.Device() newRenderPipelineStateWithDescriptor:desc completionHandler:^(id<MTLRenderPipelineState> state, NSError *nativeError) {
+		@autoreleasepool {
+			std::lock_guard<std::mutex> lock(request->mutex);
+			request->state = state;
+			if (!state) {
+				const char *description = nativeError.localizedDescription.UTF8String;
+				request->error = description ? description : "Metal pipeline creation failed";
+			}
+			request->complete = true;
+		}
+		request->ready.notify_all();
+	}];
 }
 
 Texture *MetalDrawContext::CreateTexture(const TextureDesc &desc) {
@@ -545,6 +732,17 @@ void MetalDrawContext::UpdateTextureLevels(Texture *texture, const uint8_t **dat
 	EndPass();
 	std::string error;
 	if (!texture || !static_cast<Metal::Texture *>(texture)->Update(context_, data, callback, levels, &error)) {
+		Error(error.empty() ? "No Metal texture to update" : error);
+	}
+}
+
+void MetalDrawContext::UpdateTextureRegions(Texture *texture, int level, const TextureRegionUpdate *regions, int numRegions) {
+	if (numRegions <= 0) {
+		return;
+	}
+	EndPass();
+	std::string error;
+	if (!texture || !static_cast<Metal::Texture *>(texture)->UpdateRegions(context_, level, regions, numRegions, &error)) {
 		Error(error.empty() ? "No Metal texture to update" : error);
 	}
 }
@@ -602,11 +800,34 @@ void MetalDrawContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h
 }
 
 void MetalDrawContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	// A KEEP rebind of the active target does not need another MSAA resolve.
+	// Keep the split when a bound texture aliases the target or a store discard is pending.
+	if (encoder_ && fbo && target_.ptr == fbo &&
+		rp.color == RPAction::KEEP && rp.depth == RPAction::KEEP && rp.stencil == RPAction::KEEP &&
+		discardStoreAspects_ == Aspect::NO_BIT) {
+		bool readsTarget = false;
+		for (id<MTLTexture> texture : textures_) {
+			if (texture && target_->OwnsTexture(texture)) {
+				readsTarget = true;
+				break;
+			}
+		}
+		if (!readsTarget) {
+			return;
+		}
+	}
 	EndPass();
 	BindRef(target_, Resolve(fbo));
 	pass_ = rp;
+	discardStoreAspects_ = Aspect::NO_BIT;
+	RequestPipeline();
 	// Execute a clear even when this pass has no draws or is immediately rebound.
-	BeginPass();
+	if (rp.color == RPAction::CLEAR || rp.depth == RPAction::CLEAR || rp.stencil == RPAction::CLEAR) {
+		BeginPass();
+	} else if (target_ && invalidation_) {
+		// GE state must be dirtied when the target changes, even if encoding waits for a draw.
+		invalidation_(InvalidationCallbackFlags::RENDER_PASS_STATE);
+	}
 }
 
 bool MetalDrawContext::BeginPass() {
@@ -619,6 +840,11 @@ bool MetalDrawContext::BeginPass() {
 	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 	const MTLLoadAction actions[] = {MTLLoadActionLoad, MTLLoadActionClear, MTLLoadActionDontCare};
 	target_->SetRenderAttachments(rp);
+	rp.colorAttachments[0].storeAction = MTLStoreActionUnknown;
+	if (target_->DepthStencil()) {
+		rp.depthAttachment.storeAction = MTLStoreActionUnknown;
+		rp.stencilAttachment.storeAction = MTLStoreActionUnknown;
+	}
 	rp.colorAttachments[0].loadAction = actions[(size_t)pass_.color];
 	const uint32_t c = pass_.clearColor;
 	rp.colorAttachments[0].clearColor = MTLClearColorMake((c & 255) / 255.0, ((c >> 8) & 255) / 255.0, ((c >> 16) & 255) / 255.0, (c >> 24) / 255.0);
@@ -633,6 +859,16 @@ bool MetalDrawContext::BeginPass() {
 		Error("Failed to begin Metal render pass");
 		return false;
 	}
+	++renderStateSerial_;
+	thin3DEncoderState_.valid = false;
+	vertexTextureMask_ = 0;
+	fragmentTextureMask_ = 0;
+	boundVertexTextures_.fill(0);
+	boundVertexSamplers_.fill(0);
+	boundFragmentTextures_.fill(0);
+	boundFragmentSamplers_.fill(0);
+	boundVertexValid_ = false;
+	boundFragmentValid_ = false;
 	// A transfer/readback may split this logical pass. Its continuation must
 	// load the stored contents, never replay the original clear/don't-care.
 	pass_.color = pass_.depth = pass_.stencil = RPAction::KEEP;
@@ -644,18 +880,26 @@ bool MetalDrawContext::BeginPass() {
 }
 
 void MetalDrawContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect aspect, int layer) {
-	if (binding < 0 || binding >= (int)MAX_TEXTURE_SLOTS || (layer != 0 && layer != ALL_LAYERS)) {
+	if (binding < 0 || binding >= (int)MAX_TEXTURE_SLOTS || (layer < 0 && layer != ALL_LAYERS)) {
 		Error("Invalid Metal framebuffer texture binding");
 		return;
 	}
 	auto source = Resolve(fbo);
-	if (!source || (aspect != Aspect::COLOR_BIT && aspect != Aspect::DEPTH_BIT)) {
+	if (!source || (aspect != Aspect::COLOR_BIT && aspect != Aspect::DEPTH_BIT) || layer >= source->Layers()) {
 		textures_[binding] = nil;
 		Error("Metal framebuffer texture binding requires color or depth");
 		return;
 	}
-	textures_[binding] = aspect == Aspect::DEPTH_BIT ? source->DepthStencil() : source->Color();
-	if (source->MultiSampleLevel() > 0) {
+	if (layer == ALL_LAYERS) {
+		textures_[binding] = aspect == Aspect::DEPTH_BIT ?
+			(shaderLanguageDesc_.framebufferArrayTextures ? source->DepthStencilArray() : source->DepthStencil()) :
+			(shaderLanguageDesc_.framebufferArrayTextures ? source->ColorArray() : source->Color());
+	} else {
+		textures_[binding] = aspect == Aspect::DEPTH_BIT ? source->DepthStencilLayer(layer) : source->ColorLayer(layer);
+	}
+	// A different MSAA target was resolved when its own pass ended. Only the
+	// current target needs its active pass closed before sampling its resolve.
+	if (source->MultiSampleLevel() > 0 && target_.ptr == source) {
 		EndPass();
 	}
 	if (!textures_[binding]) {
@@ -706,10 +950,112 @@ void MetalDrawContext::CopyFramebufferImage(Framebuffer *src, int level, int x, 
 }
 
 bool MetalDrawContext::BlitFramebuffer(Framebuffer *src, int sx1, int sy1, int sx2, int sy2, Framebuffer *dst, int dx1, int dy1, int dx2, int dy2, Aspect aspects, FBBlitFilter filter, const char *tag) {
-	if (sx2 - sx1 != dx2 - dx1 || sy2 - sy1 != dy2 - dy1 || sx2 <= sx1 || sy2 <= sy1) {
+	if (sx2 <= sx1 || sy2 <= sy1 || dx2 <= dx1 || dy2 <= dy1) {
 		return false;
 	}
-	return Copy(src, sx1, sy1, dst, dx1, dy1, sx2 - sx1, sy2 - sy1, aspects);
+	if (sx2 - sx1 == dx2 - dx1 && sy2 - sy1 == dy2 - dy1 && filter == FB_BLIT_NEAREST) {
+		return Copy(src, sx1, sy1, dst, dx1, dy1, sx2 - sx1, sy2 - sy1, aspects);
+	}
+	EndPass();
+	auto source = Resolve(src);
+	auto dest = Resolve(dst);
+	if (!source || !dest) {
+		return false;
+	}
+	std::string error;
+	if (!framebufferCopy_.Blit(context_, source, sx1, sy1, sx2 - sx1, sy2 - sy1,
+		dest, dx1, dy1, dx2 - dx1, dy2 - dy1, aspects, filter, &error)) {
+		Error(error);
+		return false;
+	}
+	return true;
+}
+
+bool MetalDrawContext::ReadbackDelayedColor(id<MTLTexture> source, int x, int y, int w, int h, DataFormat format,
+	void *pixels, int stride, std::string *error) {
+	error->clear();
+	if (!pixels || stride < 0 || !source || source.sampleCount != 1 ||
+		(source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
+		(source.pixelFormat != MTLPixelFormatRGBA8Unorm && source.pixelFormat != MTLPixelFormatBGRA8Unorm) ||
+		(format != DataFormat::R8G8B8A8_UNORM && format != DataFormat::B8G8R8A8_UNORM &&
+			format != DataFormat::R8G8B8_UNORM && format != DataFormat::R5G6B5_UNORM_PACK16 &&
+			format != DataFormat::A1R5G5B5_UNORM_PACK16 && format != DataFormat::A4R4G4B4_UNORM_PACK16) ||
+		x < 0 || y < 0 || w <= 0 || h <= 0 || (uint64_t)x + w > source.width || (uint64_t)y + h > source.height) {
+		*error = "Invalid delayed Metal color readback";
+		return false;
+	}
+	const std::array<uintptr_t, 5> key{(uintptr_t)(__bridge void *)source, (uintptr_t)x, (uintptr_t)y, (uintptr_t)w, (uintptr_t)h};
+	auto found = delayedReadbacks_.find(key);
+	if (found == delayedReadbacks_.end() && delayedReadbacks_.size() >= 8) {
+		auto victim = delayedReadbacks_.end();
+		for (auto it = delayedReadbacks_.begin(); it != delayedReadbacks_.end(); ++it) {
+			const auto commands = it->second.pendingCommands;
+			if (commands && commands.status != MTLCommandBufferStatusCompleted && commands.status != MTLCommandBufferStatusError) {
+				continue;
+			}
+			if (victim == delayedReadbacks_.end() || it->second.lastUse < victim->second.lastUse) {
+				victim = it;
+			}
+		}
+		if (victim == delayedReadbacks_.end()) {
+			// Keep the cache bounded even when many different targets are read in
+			// one frame. A blocking readback is still correct for this rare case.
+			return Metal::Readback(context_, source, Aspect::COLOR_BIT, x, y, w, h, format, pixels, stride, error);
+		}
+		delayedReadbacks_.erase(victim);
+	}
+	auto &readback = delayedReadbacks_[key];
+	readback.source = source;
+	readback.lastUse = ++delayedReadbackUse_;
+	if (readback.pendingCommands) {
+		if (readback.pendingCommands.status == MTLCommandBufferStatusCompleted) {
+			readback.ready = readback.pending;
+			readback.pending = nil;
+			readback.pendingCommands = nil;
+		} else if (readback.pendingCommands.status == MTLCommandBufferStatusError) {
+			readback.pending = nil;
+			readback.pendingCommands = nil;
+		}
+	}
+	if (!readback.pendingCommands) {
+		const size_t pitch = ((size_t)w * 4 + 255) & ~size_t(255);
+		if (pitch > context_.Device().maxBufferLength / h || !Commands()) {
+			*error = "Failed to prepare delayed Metal readback";
+			return false;
+		}
+		id<MTLBuffer> buffer = [context_.Device() newBufferWithLength:pitch * h options:MTLResourceStorageModeShared];
+		if (!buffer) {
+			*error = "Failed to allocate delayed Metal readback buffer";
+			return false;
+		}
+		id<MTLBlitCommandEncoder> blit = [context_.Commands() blitCommandEncoder];
+		if (!blit) {
+			*error = "Failed to encode delayed Metal readback";
+			return false;
+		}
+		[blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
+			sourceSize:MTLSizeMake(w, h, 1) toBuffer:buffer destinationOffset:0
+			destinationBytesPerRow:pitch destinationBytesPerImage:pitch * h options:MTLBlitOptionNone];
+		[blit endEncoding];
+		readback.pending = buffer;
+		readback.pendingCommands = context_.Commands();
+		readback.pitch = pitch;
+	}
+	if (!readback.ready) {
+		return false;
+	}
+	if (source.pixelFormat == MTLPixelFormatBGRA8Unorm) {
+		ConvertFromBGRA8888((uint8_t *)pixels, (const uint8_t *)readback.ready.contents, stride, (uint32_t)readback.pitch / 4, w, h, format);
+	} else if (format == DataFormat::B8G8R8A8_UNORM) {
+		for (int row = 0; row < h; ++row) {
+			auto dst = (uint32_t *)pixels + row * stride;
+			auto src = (const uint32_t *)((const uint8_t *)readback.ready.contents + row * readback.pitch);
+			ConvertRGBA8888ToBGRA8888(dst, src, w);
+		}
+	} else {
+		ConvertFromRGBA8888((uint8_t *)pixels, (const uint8_t *)readback.ready.contents, stride, (uint32_t)readback.pitch / 4, w, h, format);
+	}
+	return true;
 }
 
 bool MetalDrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, int y, int w, int h, DataFormat format, void *pixels, int stride, ReadbackMode mode, const char *tag) {
@@ -719,11 +1065,20 @@ bool MetalDrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, 
 		return false;
 	}
 	std::string error;
-	if (!Metal::Readback(context_, aspect == Aspect::COLOR_BIT ? fbo->Color() : fbo->DepthStencil(), aspect, x, y, w, h, format, pixels, stride, &error)) {
+	const bool success = mode == ReadbackMode::OLD_DATA_OK && aspect == Aspect::COLOR_BIT ?
+		ReadbackDelayedColor(fbo->Color(), x, y, w, h, format, pixels, stride, &error) :
+		Metal::Readback(context_, aspect == Aspect::COLOR_BIT ? fbo->Color() : fbo->DepthStencil(), aspect, x, y, w, h, format, pixels, stride, &error);
+	if (!success && !error.empty()) {
 		Error(std::string(tag ? tag : "framebuffer readback") + ": " + error);
-		return false;
 	}
-	return true;
+	return success;
+}
+
+DataFormat MetalDrawContext::PreferredFramebufferReadbackFormat(Framebuffer *src) {
+	if (!src && backbuffer_ && backbuffer_->Color().pixelFormat == MTLPixelFormatBGRA8Unorm) {
+		return DataFormat::B8G8R8A8_UNORM;
+	}
+	return DrawContext::PreferredFramebufferReadbackFormat(src);
 }
 
 void MetalDrawContext::BindSamplerStates(int start, int count, SamplerState **states) {
@@ -736,13 +1091,44 @@ void MetalDrawContext::BindSamplerStates(int start, int count, SamplerState **st
 	}
 }
 
+id<MTLTexture> MetalDrawContext::NullTexture(bool array) {
+	if (!nullTexture_) {
+		MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			width:1 height:1 mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+		nullTexture_ = [context_.Device() newTextureWithDescriptor:desc];
+		if (!nullTexture_) {
+			Error("Failed to create Metal null texture");
+			return nil;
+		}
+		const uint32_t transparentBlack = 0;
+		[nullTexture_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0
+			withBytes:&transparentBlack bytesPerRow:sizeof(transparentBlack)];
+	}
+	if (array && !nullTextureArray_) {
+		nullTextureArray_ = [nullTexture_ newTextureViewWithPixelFormat:nullTexture_.pixelFormat
+			textureType:MTLTextureType2DArray levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+		if (!nullTextureArray_) {
+			Error("Failed to create Metal null texture array view");
+		}
+	}
+	return array ? nullTextureArray_ : nullTexture_;
+}
+
 void MetalDrawContext::BindTextures(int start, int count, Texture **textures, TextureBindFlags flags) {
 	if (start < 0 || count < 0 || start > (int)MAX_TEXTURE_SLOTS - count) {
 		Error("Invalid Metal texture range");
 		return;
 	}
 	for (int i = 0; i < count; ++i) {
-		textures_[start + i] = textures[i] ? static_cast<Metal::Texture *>(textures[i])->Native() : nil;
+		auto *texture = textures[i] ? static_cast<Metal::Texture *>(textures[i]) : nullptr;
+		textures_[start + i] = texture ?
+			((flags & TextureBindFlags::VULKAN_BIND_ARRAY) ? texture->ArrayView() : texture->Native()) :
+			NullTexture(flags & TextureBindFlags::VULKAN_BIND_ARRAY);
+		if (texture && !textures_[start + i]) {
+			Error("Failed to create Metal texture array view");
+		}
 	}
 }
 
@@ -758,6 +1144,49 @@ void MetalDrawContext::SetNativeSampler(int slot, id<MTLSamplerState> sampler) {
 	}
 }
 
+bool MetalDrawContext::RestoreBackbufferTarget(std::string *error) {
+	if (!backbuffer_) {
+		*error = "Metal unbuffered GE draw has no backbuffer";
+		return false;
+	}
+	if (target_.ptr != backbuffer_.ptr) {
+		BindFramebufferAsRenderTarget(backbuffer_.ptr, {RPAction::KEEP, RPAction::KEEP, RPAction::KEEP}, "Metal unbuffered GE target restore");
+	}
+	return true;
+}
+
+bool MetalDrawContext::SnapshotBackbufferColor(int slot, std::string *error) {
+	if (slot < 0 || slot >= (int)MAX_TEXTURE_SLOTS || !backbuffer_ || target_.ptr != backbuffer_.ptr) {
+		*error = "Metal shader blending requires the bound backbuffer";
+		return false;
+	}
+	id<MTLTexture> source = backbuffer_->Color();
+	if (!source || source.textureType != MTLTextureType2D || source.sampleCount != 1) {
+		*error = "Metal shader blending requires a single-sample backbuffer";
+		return false;
+	}
+	EndPass();
+	MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+		width:source.width height:source.height mipmapped:NO];
+	desc.storageMode = MTLStorageModePrivate;
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	id<MTLTexture> snapshot = [context_.Device() newTextureWithDescriptor:desc];
+	if (!snapshot) {
+		*error = "Failed to allocate Metal backbuffer snapshot";
+		return false;
+	}
+	if (!Metal::CopyImage(context_, source, 0, 0, snapshot, 0, 0, (int)source.width, (int)source.height, error)) {
+		return false;
+	}
+	textures_[slot] = [snapshot newTextureViewWithPixelFormat:snapshot.pixelFormat textureType:MTLTextureType2DArray
+		levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+	if (!textures_[slot]) {
+		*error = "Failed to create Metal backbuffer snapshot array view";
+		return false;
+	}
+	return true;
+}
+
 bool MetalDrawContext::BindTextures(id<MTLRenderCommandEncoder> encoder, uint32_t mask, std::string *error) {
 	error->clear();
 	if (!encoder || encoder != encoder_ || !target_ || (mask >> MAX_TEXTURE_SLOTS)) {
@@ -769,37 +1198,66 @@ bool MetalDrawContext::BindTextures(id<MTLRenderCommandEncoder> encoder, uint32_
 			continue;
 		}
 		if (!textures_[i] || !samplers_[i]) {
-			*error = "Missing Metal GE texture or sampler";
+			*error = "Missing Metal GE texture or sampler at slot " + std::to_string(i) +
+				" (texture=" + (textures_[i] ? "yes" : "no") + ", sampler=" + (samplers_[i] ? "yes" : "no") + ")";
 			return false;
 		}
-		if (textures_[i] == target_->Color() || textures_[i] == target_->DepthStencil()) {
+		if (target_->OwnsTexture(textures_[i])) {
 			*error = "Metal GE framebuffer feedback requires a separate copy";
 			return false;
 		}
 	}
-	for (int i = 0; i < (int)MAX_TEXTURE_SLOTS; ++i) {
-		[encoder setFragmentTexture:(mask & (1u << i)) ? textures_[i] : nil atIndex:i];
-		[encoder setFragmentSamplerState:(mask & (1u << i)) ? samplers_[i] : nil atIndex:i];
+	const uint32_t slotsToUpdate = mask | fragmentTextureMask_;
+	const bool rebind = !boundFragmentValid_ || boundFragmentSerial_ != renderStateSerial_;
+	if (rebind) {
+		boundFragmentTextures_.fill(0);
+		boundFragmentSamplers_.fill(0);
 	}
+	for (int i = 0; i < (int)MAX_TEXTURE_SLOTS; ++i) {
+		if (!(slotsToUpdate & (1u << i))) {
+			continue;
+		}
+		id<MTLTexture> texture = (mask & (1u << i)) ? textures_[i] : nil;
+		id<MTLSamplerState> sampler = (mask & (1u << i)) ? samplers_[i] : nil;
+		const uintptr_t textureID = (uintptr_t)(__bridge void *)texture;
+		const uintptr_t samplerID = (uintptr_t)(__bridge void *)sampler;
+		if (rebind || boundFragmentTextures_[i] != textureID) {
+			[encoder setFragmentTexture:texture atIndex:i];
+		}
+		if (rebind || boundFragmentSamplers_[i] != samplerID) {
+			[encoder setFragmentSamplerState:sampler atIndex:i];
+		}
+		boundFragmentTextures_[i] = textureID;
+		boundFragmentSamplers_[i] = samplerID;
+	}
+	boundFragmentSerial_ = renderStateSerial_;
+	boundFragmentValid_ = true;
+	fragmentTextureMask_ = mask;
 	return true;
 }
 
-id<MTLBuffer> MetalDrawContext::Upload(const void *data, size_t size) {
+void MetalDrawContext::UpdateDynamicUniformBuffer(const void *data, size_t size) {
+	uniform_ = {};
+	uniformGeneration_ = 0;
 	if (!data || !size) {
-		return nil;
+		uniformData_.clear();
+		return;
 	}
-	if (@available(macOS 13.0, iOS 16.0, *)) {
-		if (size > context_.Device().maxBufferLength) {
-			return nil;
-		}
-	} else {
-		return nil;
+	if (!context_.Device() || size > context_.Device().maxBufferLength) {
+		uniformData_.clear();
+		Error("Invalid Metal dynamic uniform size or device");
+		return;
 	}
-	return [context_.Device() newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+	uniformData_.assign((const uint8_t *)data, (const uint8_t *)data + size);
 }
 
-void MetalDrawContext::UpdateDynamicUniformBuffer(const void *data, size_t size) {
-	uniform_ = Upload(data, size);
+void MetalDrawContext::Invalidate(InvalidationFlags flags) {
+	if (flags & InvalidationFlags::CACHED_RENDER_STATE) {
+		thin3DEncoderState_.valid = false;
+		pipeline_.reset(nullptr);
+		textures_.fill(nil);
+		samplers_.fill(nil);
+	}
 }
 
 bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
@@ -809,11 +1267,12 @@ bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
 		return false;
 	}
 	if (!pipeline_ || !target_ || (pipeline_->stride && (!vertices || offset >= vertices.length)) ||
-		(pipeline_->uniformSize && uniform_.length < pipeline_->uniformSize)) {
+		(pipeline_->uniformSize && uniformData_.size() < pipeline_->uniformSize)) {
 		Error("Incomplete Metal draw bindings");
 		return false;
 	}
-	if (pipeline_->raster.cull == CullMode::FRONT_AND_BACK) {
+	if (pipeline_->raster.cull == CullMode::FRONT_AND_BACK &&
+		(pipeline_->primitive == MTLPrimitiveTypeTriangle || pipeline_->primitive == MTLPrimitiveTypeTriangleStrip)) {
 		return false;
 	}
 	for (int i = 0; i < (int)MAX_TEXTURE_SLOTS; ++i) {
@@ -824,7 +1283,7 @@ bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
 			Error("Missing Metal shader texture or sampler binding");
 			return false;
 		}
-		if (textures_[i] == target_->Color() || textures_[i] == target_->DepthStencil()) {
+		if (target_->OwnsTexture(textures_[i])) {
 			Error("Metal framebuffer feedback requires a separate copy");
 			return false;
 		}
@@ -841,16 +1300,24 @@ bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
 	const auto colorFormat = target_->Color().pixelFormat;
 	const auto depthFormat = target_->DepthStencil() ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
 	const std::array<uint64_t, 3> key{(uint64_t)colorFormat, (uint64_t)depthFormat, (uint64_t)target_->SampleCount()};
-	id<MTLRenderPipelineState> state = pipeline_->states[key];
+	auto found = pipeline_->states.find(key);
+	id<MTLRenderPipelineState> state = found == pipeline_->states.end() ? nil : found->second;
 	if (!state) {
-		pipeline_->desc.colorAttachments[0].pixelFormat = colorFormat;
-		pipeline_->desc.depthAttachmentPixelFormat = depthFormat;
-		pipeline_->desc.stencilAttachmentPixelFormat = depthFormat;
-		pipeline_->desc.rasterSampleCount = target_->SampleCount();
-		NSError *error = nil;
-		state = [context_.Device() newRenderPipelineStateWithDescriptor:pipeline_->desc error:&error];
+		RequestPipeline();
+		auto pending = pipeline_->pending.find(key);
+		if (pending == pipeline_->pending.end()) {
+			Error("Metal pipeline request is unavailable");
+			return false;
+		}
+		auto request = pending->second;
+		std::unique_lock<std::mutex> lock(request->mutex);
+		request->ready.wait(lock, [&] { return request->complete; });
+		state = request->state;
+		const std::string error = request->error;
+		lock.unlock();
+		pipeline_->pending.erase(pending);
 		if (!state) {
-			Error(error ? error.localizedDescription.UTF8String : "Metal pipeline creation failed");
+			Error(error);
 			return false;
 		}
 		pipeline_->states[key] = state;
@@ -875,35 +1342,162 @@ bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
 			dd.backFaceStencil = s;
 		}
 		depthState = [context_.Device() newDepthStencilStateWithDescriptor:dd];
+		if (!depthState) {
+			Error("Failed to create Metal depth/stencil state");
+			return false;
+		}
 		pipeline_->depthStates[depthKey] = depthState;
 	}
 	if (!BeginPass()) {
 		return false;
 	}
-	[encoder_ setRenderPipelineState:state];
-	[encoder_ setDepthStencilState:depthState];
-	[encoder_ setStencilReferenceValue:stencilRef_];
-	[encoder_ setCullMode:pipeline_->raster.cull == CullMode::BACK ? MTLCullModeBack : pipeline_->raster.cull == CullMode::FRONT ? MTLCullModeFront : MTLCullModeNone];
-	[encoder_ setFrontFacingWinding:pipeline_->raster.frontFace == Facing::CCW ? MTLWindingCounterClockwise : MTLWindingClockwise];
+	if (!uniformData_.empty() && (!uniform_ || uniformGeneration_ != context_.CommandGeneration())) {
+		std::string error;
+		uniform_ = context_.Upload(uniformData_.data(), uniformData_.size(), &error);
+		if (!uniform_) {
+			Error(error);
+			return false;
+		}
+		uniformGeneration_ = context_.CommandGeneration();
+	}
+	++renderStateSerial_;
+	auto &bound = thin3DEncoderState_;
+	const bool valid = bound.valid;
+	const uintptr_t pipelineID = (uintptr_t)(__bridge void *)state;
+	const uintptr_t depthID = (uintptr_t)(__bridge void *)depthState;
+	const MTLCullMode cull = pipeline_->raster.cull == CullMode::BACK ? MTLCullModeBack :
+		pipeline_->raster.cull == CullMode::FRONT ? MTLCullModeFront : MTLCullModeNone;
+	const MTLWinding winding = pipeline_->raster.frontFace == Facing::CCW ? MTLWindingCounterClockwise : MTLWindingClockwise;
+	const MTLViewport viewport{viewport_.TopLeftX, viewport_.TopLeftY, viewport_.Width, viewport_.Height, viewport_.MinDepth, viewport_.MaxDepth};
+	const MTLScissorRect scissor{(NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h};
+	if (!valid || bound.pipeline != pipelineID) {
+		[encoder_ setRenderPipelineState:state];
+	}
+	if (!valid || bound.depth != depthID) {
+		[encoder_ setDepthStencilState:depthState];
+	}
+	if (!valid || bound.stencil != stencilRef_) {
+		[encoder_ setStencilReferenceValue:stencilRef_];
+	}
+	if (!valid || bound.cull != cull) {
+		[encoder_ setCullMode:cull];
+	}
+	if (!valid || bound.winding != winding) {
+		[encoder_ setFrontFacingWinding:winding];
+	}
 	// GE draws can enable depth clamping on this encoder; thin3d uses clipping.
-	[encoder_ setDepthClipMode:MTLDepthClipModeClip];
-	[encoder_ setViewport:(MTLViewport){viewport_.TopLeftX, viewport_.TopLeftY, viewport_.Width, viewport_.Height, viewport_.MinDepth, viewport_.MaxDepth}];
-	[encoder_ setScissorRect:MTLScissorRect{(NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h}];
-	[encoder_ setBlendColorRed:blendColor_[0] green:blendColor_[1] blue:blendColor_[2] alpha:blendColor_[3]];
+	if (!valid) {
+		[encoder_ setDepthClipMode:MTLDepthClipModeClip];
+	}
+	if (!valid || bound.viewport.originX != viewport.originX || bound.viewport.originY != viewport.originY ||
+		bound.viewport.width != viewport.width || bound.viewport.height != viewport.height ||
+		bound.viewport.znear != viewport.znear || bound.viewport.zfar != viewport.zfar) {
+		[encoder_ setViewport:viewport];
+	}
+	if (!valid || bound.scissor.x != scissor.x || bound.scissor.y != scissor.y ||
+		bound.scissor.width != scissor.width || bound.scissor.height != scissor.height) {
+		[encoder_ setScissorRect:scissor];
+	}
+	if (!valid || bound.blendColor != blendColor_) {
+		[encoder_ setBlendColorRed:blendColor_[0] green:blendColor_[1] blue:blendColor_[2] alpha:blendColor_[3]];
+	}
+	bound.pipeline = pipelineID;
+	bound.depth = depthID;
+	bound.stencil = stencilRef_;
+	bound.cull = cull;
+	bound.winding = winding;
+	bound.viewport = viewport;
+	bound.scissor = scissor;
+	bound.blendColor = blendColor_;
 	if (vertices) {
 		[encoder_ setVertexBuffer:vertices offset:offset atIndex:Metal::VERTEX_BUFFER_SLOT];
 	}
 	if (uniform_) {
-		[encoder_ setVertexBuffer:uniform_ offset:0 atIndex:0];
-		[encoder_ setFragmentBuffer:uniform_ offset:0 atIndex:0];
+		const uintptr_t uniformID = (uintptr_t)(__bridge void *)uniform_.buffer;
+		if (!valid || bound.uniform != uniformID || bound.uniformOffset != uniform_.offset) {
+			[encoder_ setVertexBuffer:uniform_.buffer offset:uniform_.offset atIndex:0];
+			[encoder_ setFragmentBuffer:uniform_.buffer offset:uniform_.offset atIndex:0];
+		}
+		bound.uniform = uniformID;
+		bound.uniformOffset = uniform_.offset;
 	}
+	if (pipeline_->multiview && (!valid || !bound.viewMaskBound)) {
+		const uint32_t viewMask[] = { 0, 2 };
+		[encoder_ setVertexBytes:viewMask length:sizeof(viewMask) atIndex:Metal::VIEW_MASK_BUFFER_SLOT];
+		[encoder_ setFragmentBytes:viewMask length:sizeof(viewMask) atIndex:Metal::VIEW_MASK_BUFFER_SLOT];
+		bound.viewMaskBound = true;
+	}
+	const uint32_t vertexSlots = pipeline_->vertexTextureMask | vertexTextureMask_;
+	const uint32_t fragmentSlots = pipeline_->fragmentTextureMask | fragmentTextureMask_;
 	for (int i = 0; i < (int)MAX_TEXTURE_SLOTS; ++i) {
-		[encoder_ setVertexTexture:textures_[i] atIndex:i];
-		[encoder_ setFragmentTexture:textures_[i] atIndex:i];
-		[encoder_ setVertexSamplerState:samplers_[i] atIndex:i];
-		[encoder_ setFragmentSamplerState:samplers_[i] atIndex:i];
+		const uint32_t bit = 1u << i;
+		if (vertexSlots & bit) {
+			const bool used = (pipeline_->vertexTextureMask & bit) != 0;
+			id<MTLTexture> texture = used ? textures_[i] : nil;
+			id<MTLSamplerState> sampler = used ? samplers_[i] : nil;
+			const uintptr_t textureID = (uintptr_t)(__bridge void *)texture;
+			const uintptr_t samplerID = (uintptr_t)(__bridge void *)sampler;
+			if (!boundVertexValid_ || boundVertexTextures_[i] != textureID) {
+				[encoder_ setVertexTexture:texture atIndex:i];
+			}
+			if (!boundVertexValid_ || boundVertexSamplers_[i] != samplerID) {
+				[encoder_ setVertexSamplerState:sampler atIndex:i];
+			}
+			boundVertexTextures_[i] = textureID;
+			boundVertexSamplers_[i] = samplerID;
+		}
+		if (fragmentSlots & bit) {
+			const bool used = (pipeline_->fragmentTextureMask & bit) != 0;
+			id<MTLTexture> texture = used ? textures_[i] : nil;
+			id<MTLSamplerState> sampler = used ? samplers_[i] : nil;
+			const uintptr_t textureID = (uintptr_t)(__bridge void *)texture;
+			const uintptr_t samplerID = (uintptr_t)(__bridge void *)sampler;
+			if (!boundFragmentValid_ || boundFragmentTextures_[i] != textureID) {
+				[encoder_ setFragmentTexture:texture atIndex:i];
+			}
+			if (!boundFragmentValid_ || boundFragmentSamplers_[i] != samplerID) {
+				[encoder_ setFragmentSamplerState:sampler atIndex:i];
+			}
+			boundFragmentTextures_[i] = textureID;
+			boundFragmentSamplers_[i] = samplerID;
+		}
 	}
+	vertexTextureMask_ = pipeline_->vertexTextureMask;
+	fragmentTextureMask_ = pipeline_->fragmentTextureMask;
+	boundVertexValid_ = true;
+	boundFragmentSerial_ = renderStateSerial_;
+	boundFragmentValid_ = true;
+	bound.valid = true;
 	return true;
+}
+
+void MetalDrawContext::DrawFan(id<MTLBuffer> vertices, size_t vertexOffset, const uint16_t *indices, int count, int firstVertex) {
+	if (count < 3) {
+		return;
+	}
+	const size_t indexCount = (size_t)(count - 2) * 3;
+	if (indexCount > context_.Device().maxBufferLength / sizeof(uint32_t) || !Commands()) {
+		Error("Metal triangle fan exceeds the index buffer limit");
+		return;
+	}
+	std::vector<uint32_t> fan(indexCount);
+	const uint32_t center = indices ? indices[0] : (uint32_t)firstVertex;
+	for (int i = 1; i < count - 1; ++i) {
+		const size_t out = (size_t)(i - 1) * 3;
+		fan[out] = center;
+		fan[out + 1] = indices ? indices[i] : (uint32_t)firstVertex + (uint32_t)i;
+		fan[out + 2] = indices ? indices[i + 1] : (uint32_t)firstVertex + (uint32_t)i + 1;
+	}
+	std::string error;
+	auto uploaded = context_.Upload(fan.data(), fan.size() * sizeof(uint32_t), &error);
+	if (!uploaded) {
+		Error(error);
+		return;
+	}
+	if (Apply(vertices, vertexOffset)) {
+		[encoder_ drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt32
+			indexBuffer:uploaded.buffer indexBufferOffset:uploaded.offset instanceCount:InstanceCount()];
+	}
 }
 
 void MetalDrawContext::Draw(int count, int offset) {
@@ -915,13 +1509,17 @@ void MetalDrawContext::Draw(int count, int offset) {
 		Error("Metal draw exceeds vertex buffer");
 		return;
 	}
+	if (pipeline_->fan) {
+		DrawFan(vertices, vertexOffset_, nullptr, count, offset);
+		return;
+	}
 	if (Apply(vertices, vertexOffset_)) {
-		[encoder_ drawPrimitives:pipeline_->primitive vertexStart:offset vertexCount:count];
+		[encoder_ drawPrimitives:pipeline_->primitive vertexStart:offset vertexCount:count instanceCount:InstanceCount()];
 	}
 }
 
 void MetalDrawContext::DrawIndexed(int count, int offset) {
-	if (count <= 0 || offset < 0 || indexOffset_ < 0 || vertexOffset_ < 0 || !index_) {
+	if (count <= 0 || offset < 0 || indexOffset_ < 0 || vertexOffset_ < 0 || !index_ || !pipeline_) {
 		return;
 	}
 	id<MTLBuffer> indices = index_->Native();
@@ -930,8 +1528,16 @@ void MetalDrawContext::DrawIndexed(int count, int offset) {
 		Error("Metal draw exceeds index buffer");
 		return;
 	}
+	if (pipeline_->fan) {
+		if (!indices.contents) {
+			Error("Metal triangle fan indices are not CPU-readable");
+			return;
+		}
+		DrawFan(vertex_ ? vertex_->Native() : nil, vertexOffset_, (const uint16_t *)((const uint8_t *)indices.contents + start), count, 0);
+		return;
+	}
 	if (Apply(vertex_ ? vertex_->Native() : nil, vertexOffset_)) {
-		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:count indexType:MTLIndexTypeUInt16 indexBuffer:indices indexBufferOffset:start];
+		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:count indexType:MTLIndexTypeUInt16 indexBuffer:indices indexBufferOffset:start instanceCount:InstanceCount()];
 	}
 }
 
@@ -948,13 +1554,17 @@ void MetalDrawContext::DrawUP(const void *data, int count) {
 		Error(error);
 		return;
 	}
+	if (pipeline_->fan) {
+		DrawFan(vertices.buffer, vertices.offset, nullptr, count, 0);
+		return;
+	}
 	if (Apply(vertices.buffer, vertices.offset)) {
-		[encoder_ drawPrimitives:pipeline_->primitive vertexStart:0 vertexCount:count];
+		[encoder_ drawPrimitives:pipeline_->primitive vertexStart:0 vertexCount:count instanceCount:InstanceCount()];
 	}
 }
 
 void MetalDrawContext::DrawIndexedUP(const void *data, int count, const void *indices, int indexCount) {
-	if (!pipeline_ || count <= 0 || indexCount <= 0 || pipeline_->stride <= 0) {
+	if (!pipeline_ || count <= 0 || !indices || indexCount <= 0 || pipeline_->stride <= 0) {
 		return;
 	}
 	if (!Commands()) {
@@ -966,13 +1576,17 @@ void MetalDrawContext::DrawIndexedUP(const void *data, int count, const void *in
 		Error(error);
 		return;
 	}
+	if (pipeline_->fan) {
+		DrawFan(vertices.buffer, vertices.offset, (const uint16_t *)indices, indexCount, 0);
+		return;
+	}
 	auto index = context_.Upload(indices, (size_t)indexCount * 2, &error);
 	if (!index) {
 		Error(error);
 		return;
 	}
 	if (Apply(vertices.buffer, vertices.offset)) {
-		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:indexCount indexType:MTLIndexTypeUInt16 indexBuffer:index.buffer indexBufferOffset:index.offset];
+		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:indexCount indexType:MTLIndexTypeUInt16 indexBuffer:index.buffer indexBufferOffset:index.offset instanceCount:InstanceCount()];
 	}
 }
 
@@ -998,14 +1612,21 @@ void MetalDrawContext::DrawIndexedClippedBatchUP(const void *data, int count, co
 }
 
 void MetalDrawContext::BeginFrame(DebugFlags flags) {
-	Present(PresentMode::FIFO);
+	Present(presentMode_);
 	attemptedDrawable_ = false;
+	passCount_ = 0;
 	++frameCount_;
 	Commands();
 }
 
 void MetalDrawContext::Present(PresentMode mode) {
 	EndPass();
+#if PPSSPP_PLATFORM(MAC)
+	presentMode_ = mode == PresentMode::IMMEDIATE ? PresentMode::IMMEDIATE : PresentMode::FIFO;
+	if (layer_) {
+		layer_.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
+	}
+#endif
 	std::string error;
 	// A readback may have submitted all render commands already. Present on a
 	// fresh buffer in the same queue so it remains ordered after that work.
@@ -1028,7 +1649,7 @@ void MetalDrawContext::ReleaseDrawable() {
 	}
 	if (backbuffer_) {
 		for (auto &texture : textures_) {
-			if (texture == backbuffer_->Color() || texture == backbuffer_->DepthStencil()) {
+			if (backbuffer_->OwnsTexture(texture)) {
 				texture = nil;
 			}
 		}
@@ -1054,10 +1675,10 @@ bool MetalDrawContext::SetSurface(CAMetalLayer *layer, std::string *error) {
 			layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
 			// Screenshots and framebuffer transfers can read the drawable.
 			layer_.framebufferOnly = NO;
-			layer_.maximumDrawableCount = 3;
+			layer_.maximumDrawableCount = std::clamp(g_Config.iInflightFrames + 1, 2, 3);
 			layer_.allowsNextDrawableTimeout = YES;
 #if PPSSPP_PLATFORM(MAC)
-			layer_.displaySyncEnabled = YES;
+			layer_.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
 #endif
 			ResizeSurface();
 		}
@@ -1085,6 +1706,9 @@ void MetalDrawContext::ResizeSurface() {
 }
 
 void MetalDrawContext::Clear(Aspect aspects, uint32_t color, float depth, int stencil) {
+	if (aspects == Aspect::NO_BIT) {
+		return;
+	}
 	EndPass();
 	pass_ = {(aspects & Aspect::COLOR_BIT) ? RPAction::CLEAR : RPAction::KEEP,
 		(aspects & Aspect::DEPTH_BIT) ? RPAction::CLEAR : RPAction::KEEP,
@@ -1093,12 +1717,32 @@ void MetalDrawContext::Clear(Aspect aspects, uint32_t color, float depth, int st
 	BeginPass();
 }
 
+void MetalDrawContext::InvalidateFramebuffer(FBInvalidationStage stage, Aspect aspects) {
+	if (stage == FB_INVALIDATION_STORE) {
+		discardStoreAspects_ |= aspects;
+	} else if (stage == FB_INVALIDATION_LOAD) {
+		if (encoder_) {
+			discardStoreAspects_ |= aspects;
+			EndPass();
+		}
+		if (aspects & Aspect::COLOR_BIT) {
+			pass_.color = RPAction::DONT_CARE;
+		}
+		if (aspects & Aspect::DEPTH_BIT) {
+			pass_.depth = RPAction::DONT_CARE;
+		}
+		if (aspects & Aspect::STENCIL_BIT) {
+			pass_.stencil = RPAction::DONT_CARE;
+		}
+	}
+}
+
 std::string MetalDrawContext::GetInfoString(InfoField info) const {
 	switch (info) {
 	case InfoField::APINAME: return "Metal";
 	case InfoField::APIVERSION: return "3";
 	case InfoField::SHADELANGVERSION: return "MSL 3.0";
-	case InfoField::VENDOR: return "Apple";
+	case InfoField::VENDOR: return caps_.vendor == GPUVendor::VENDOR_APPLE ? "Apple" : "Unknown";
 	case InfoField::VENDORSTRING: return context_.DeviceName();
 	default: return "";
 	}
@@ -1110,6 +1754,8 @@ uint64_t MetalDrawContext::GetNativeObject(NativeObject obj, void *src) {
 	case NativeObject::RENDER_MANAGER: return (uint64_t)static_cast<Metal::RenderManager *>(this);
 	case NativeObject::DEVICE: return (uint64_t)(__bridge void *)context_.Device();
 	case NativeObject::TEXTURE_VIEW: return src ? (uint64_t)(__bridge void *)static_cast<Metal::Texture *>(src)->Native() : 0;
+	case NativeObject::NULL_IMAGEVIEW: return (uint64_t)(__bridge void *)NullTexture(false);
+	case NativeObject::NULL_IMAGEVIEW_ARRAY: return (uint64_t)(__bridge void *)NullTexture(true);
 	case NativeObject::BOUND_TEXTURE0_IMAGEVIEW: return (uint64_t)(__bridge void *)textures_[0];
 	case NativeObject::BOUND_TEXTURE1_IMAGEVIEW: return (uint64_t)(__bridge void *)textures_[1];
 	case NativeObject::BACKBUFFER_COLOR_TEX:

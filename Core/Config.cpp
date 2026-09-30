@@ -504,6 +504,11 @@ static int DefaultGPUBackend() {
 #endif
 
 #elif PPSSPP_PLATFORM(IOS_APP_STORE)
+#if defined(PPSSPP_IOS_DEFAULT_METAL) && defined(PPSSPP_HAS_METAL)
+	if (MetalIsAvailable()) {
+		return (int)GPUBackend::METAL;
+	}
+#endif
 	return (int)GPUBackend::VULKAN;
 #endif
 
@@ -1279,7 +1284,9 @@ bool Config::LoadAppendedConfig() {
 
 	INFO_LOG(Log::Config, "Loaded appended config '%s'.", appendedConfigFileName_.c_str());
 
-	Save("Loaded appended config"); // Let's prevent reset
+	if (saveAppendedConfigAfterLoad_) {
+		Save("Loaded appended config"); // Let's prevent reset
+	}
 	return true;
 }
 

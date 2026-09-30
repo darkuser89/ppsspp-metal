@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <map>
 #include <vector>
 #include <memory>
@@ -139,7 +140,7 @@ struct TextureDefinition {
 
 enum class TexStatus : u16 {
 	VIDEO = (1 << 0),
-	// Free bit 1
+	PSP_SIZE_CLIPPED = (1 << 1),  // Source is limited to the PSP's 512x512 texture area.
 	ALPHA_SOLID = (1 << 2),      // Has no alpha channel, or always solid (==1.0) alpha.
 
 	MANY_CLUT_VARIANTS = (1 << 3),   // Has multiple CLUT variants.
@@ -214,7 +215,8 @@ struct TexCacheEntry {
 	// This is the full size in RAM, not the half size we use sometimes as a "safe" underestimate.
 	// And also not the exact hashed size, see ComputeTextureHash.
 	u32 SizeInRAM() const {
-		return (textureBitsPerPixel[format] * bufw * dimHeight(dim)) / 8;
+		const int height = (status & TexStatus::PSP_SIZE_CLIPPED) ? std::min(dimHeight(dim), 512) : dimHeight(dim);
+		return (textureBitsPerPixel[format] * bufw * height) / 8;
 	}
 
 	bool MatchesProperties(u16 dim2, u8 format2, u8 maxLevel2) const;
@@ -417,7 +419,7 @@ protected:
 
 	virtual void BindAsClutTexture(Draw::Texture *tex, bool smooth) {}
 
-	TextureAlpha DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, TexDecodeFlags flags);
+	TextureAlpha DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, TexDecodeFlags flags, bool clipToPSPSize);
 	static void UnswizzleFromMem(u32 *dest, u32 destPitch, const u8 *texptr, u32 bufw, u32 height, u32 bytesPerPixel);
 	// Unswizzles into tmpTexBuf32_, sized for what the decode will read. bytesPerPixel 0 means
 	// 4-bit indices. Returns the buffer.

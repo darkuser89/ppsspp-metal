@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 
+#include "Common/File/Path.h"
 #include "Common/GPU/Metal/MetalRenderManager.h"
 #include "GPU/Common/ShaderCommon.h"
 #include "GPU/Common/ShaderId.h"
@@ -55,16 +56,20 @@ public:
 		ClipInfoFlags clipInfoFlags, const MetalGEVertexShader **vertex, const MetalGEFragmentShader **fragment, std::string *error);
 	const MetalGEVertexShader *GetVertexShaderFromID(VShaderID id, std::string *error);
 	const MetalGEFragmentShader *GetFragmentShaderFromID(FShaderID id, std::string *error);
+	void DiscardFailedShaders();
 	uint64_t CacheGeneration() const { return generation_; }
+	bool CacheMatchesEnvironment() const;
 	int GetNumVertexShaders() const { return (int)vertexCache_.size(); }
 	int GetNumFragmentShaders() const { return (int)fragmentCache_.size(); }
+	bool LoadCache(const Path &filename);
+	void SaveCache(const Path &filename) const;
 
 	// Uploads immutable snapshots. Failure retains the previous snapshots and all
 	// dirty flags. Upload slices remain immutable until their submission finishes,
 	// and are refreshed after command buffer changes, even without dirty uniforms.
 	bool UpdateUniforms(bool useBufferedRendering, bool pixelMapped, std::string *error);
 	void SetSamplerLodBias(float bias);
-	bool BindUniforms(id<MTLRenderCommandEncoder> encoder, std::string *error) const;
+	bool BindUniforms(id<MTLRenderCommandEncoder> encoder, std::string *error);
 	const MetalGEUniformBuffers &Uniforms() const { return buffers_; }
 
 	std::vector<std::string> DebugGetShaderIDs(DebugShaderType type) override;
@@ -84,6 +89,10 @@ private:
 	UB_VS_FS_Base base_{};
 	UB_VS_Lights lights_{};
 	MetalGEUniformBuffers buffers_;
+	MetalGEUniformBuffers boundBuffers_;
+	uint64_t boundRenderStateSerial_ = 0;
+	bool boundUniformsValid_ = false;
+	bool boundStereoViewMask_ = false;
 	bool uniformOptionsValid_ = false;
 	bool buffered_ = false;
 	bool pixelMapped_ = false;

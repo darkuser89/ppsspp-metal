@@ -66,6 +66,8 @@ TextureReplacer::TextureReplacer(Draw::DrawContext *draw) {
 	// In tests, draw may be null; formats then just default to unsupported.
 	if (draw) {
 		if (draw->GetDataFormatSupport(Draw::DataFormat::BC3_UNORM_BLOCK)) formatSupport_.bc123 = true;
+		if (draw->GetDataFormatSupport(Draw::DataFormat::BC4_UNORM_BLOCK)) formatSupport_.bc4 = true;
+		if (draw->GetDataFormatSupport(Draw::DataFormat::BC5_UNORM_BLOCK)) formatSupport_.bc5 = true;
 		if (draw->GetDataFormatSupport(Draw::DataFormat::ASTC_4x4_UNORM_BLOCK)) formatSupport_.astc = true;
 		if (draw->GetDataFormatSupport(Draw::DataFormat::BC7_UNORM_BLOCK)) formatSupport_.bc7 = true;
 		if (draw->GetDataFormatSupport(Draw::DataFormat::ETC2_R8G8B8_UNORM_BLOCK)) formatSupport_.etc2 = true;

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <map>
 
 #include "Common/GPU/Metal/MetalRenderContext.h"
@@ -13,6 +14,8 @@ namespace Metal {
 MTLPixelFormat PixelFormat(Draw::DataFormat format);
 MTLVertexFormat VertexFormat(Draw::DataFormat format);
 uint32_t FormatSupport(id<MTLDevice> device, Draw::DataFormat format);
+int MaxTextureDimension(id<MTLDevice> device);
+bool SupportsDepthStencilResolve(id<MTLDevice> device);
 
 class Buffer final : public Draw::Buffer {
 public:
@@ -30,12 +33,15 @@ class Texture final : public Draw::Texture {
 public:
 	static Texture *Create(RenderContext &context, const Draw::TextureDesc &desc, std::string *error, bool storage = false);
 	bool Update(RenderContext &context, const uint8_t **data, Draw::TextureCallback callback, int levels, std::string *error);
+	bool UpdateRegions(RenderContext &context, int level, const Draw::TextureRegionUpdate *regions, int numRegions, std::string *error);
 	id<MTLTexture> Native() const { return texture_; }
+	id<MTLTexture> ArrayView() const;
 
 private:
 	bool Upload(RenderContext &context, const uint8_t **data, Draw::TextureCallback callback, int levels,
 		bool initialize, std::string *error);
 	id<MTLTexture> texture_ = nil;
+	mutable id<MTLTexture> arrayView_ = nil;
 };
 
 class Framebuffer final : public Draw::Framebuffer {
@@ -46,18 +52,29 @@ public:
 	const char *Tag() const override { return tag_.c_str(); }
 	id<MTLTexture> Color() const { return color_; }
 	id<MTLTexture> DepthStencil() const { return depthStencil_; }
+	id<MTLTexture> ColorArray() const;
+	id<MTLTexture> DepthStencilArray() const;
 	id<MTLTexture> ColorAttachment() const { return multisampleColor_ ? multisampleColor_ : color_; }
 	id<MTLTexture> DepthStencilAttachment() const { return multisampleDepthStencil_ ? multisampleDepthStencil_ : depthStencil_; }
+	id<MTLTexture> ColorLayer(int layer) const { return layers_ == 1 ? color_ : colorLayers_[layer]; }
+	id<MTLTexture> DepthStencilLayer(int layer) const { return layers_ == 1 ? depthStencil_ : depthStencilLayers_[layer]; }
+	id<MTLTexture> ColorAttachmentLayer(int layer) const { return multisampleColor_ ? multisampleColor_ : ColorLayer(layer); }
+	id<MTLTexture> DepthStencilAttachmentLayer(int layer) const { return multisampleDepthStencil_ ? multisampleDepthStencil_ : DepthStencilLayer(layer); }
+	bool OwnsTexture(id<MTLTexture> texture) const;
 	int SampleCount() const { return 1 << multiSampleLevel_; }
 	// Resolve at the end of each pass while retaining the individual samples
 	// for subsequent draws. Color()/DepthStencil() expose the resolved images.
-	void SetRenderAttachments(MTLRenderPassDescriptor *pass) const;
+	void SetRenderAttachments(MTLRenderPassDescriptor *pass, int layer = -1) const;
 
 private:
 	id<MTLTexture> color_ = nil;
 	id<MTLTexture> depthStencil_ = nil;
+	mutable id<MTLTexture> colorArray_ = nil;
+	mutable id<MTLTexture> depthStencilArray_ = nil;
 	id<MTLTexture> multisampleColor_ = nil;
 	id<MTLTexture> multisampleDepthStencil_ = nil;
+	std::array<id<MTLTexture>, 2> colorLayers_{};
+	std::array<id<MTLTexture>, 2> depthStencilLayers_{};
 	std::string tag_;
 };
 
@@ -67,13 +84,16 @@ class FramebufferCopy {
 public:
 	bool Copy(RenderContext &context, Framebuffer *src, int sx, int sy, Framebuffer *dst,
 		int dx, int dy, int width, int height, Draw::Aspect aspects, std::string *error);
+	bool Blit(RenderContext &context, Framebuffer *src, int sx, int sy, int srcWidth, int srcHeight,
+		Framebuffer *dst, int dx, int dy, int dstWidth, int dstHeight, Draw::Aspect aspects,
+		Draw::FBBlitFilter filter, std::string *error);
 
 private:
 	struct Pipeline {
 		id<MTLRenderPipelineState> render = nil;
 		id<MTLDepthStencilState> depthStencil = nil;
 	};
-	std::map<std::array<uint64_t, 5>, Pipeline> pipelines_;
+	std::map<std::array<uint64_t, 7>, Pipeline> pipelines_;
 	id<MTLFunction> vertex_ = nil;
 };
 

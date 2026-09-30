@@ -12,7 +12,12 @@
 # PPSSPP platform flags
 set(MOBILE_DEVICE ON)
 set(USING_GLES2 ON)
-set(IPHONEOS_DEPLOYMENT_TARGET 13.0)
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES PPSSPP_IOS_DEPLOYMENT_TARGET)
+if(DEFINED PPSSPP_IOS_DEPLOYMENT_TARGET)
+  set(IPHONEOS_DEPLOYMENT_TARGET ${PPSSPP_IOS_DEPLOYMENT_TARGET})
+else()
+  set(IPHONEOS_DEPLOYMENT_TARGET 13.0)
+endif()
 add_definitions(
   -DGL_ETC1_RGB8_OES=0
   -U__STRICT_ANSI__
@@ -73,11 +78,13 @@ set(CMAKE_IOS_SDK_ROOT ${CMAKE_IOS_SDK_ROOT} CACHE PATH "Location of the selecte
 # Set the sysroot default to the most recent SDK
 set(CMAKE_OSX_SYSROOT ${CMAKE_IOS_SDK_ROOT} CACHE PATH "Sysroot used for iOS support")
 
-# set the architecture for iOS 
-if(IOS_PLATFORM STREQUAL "OS" OR IOS_PLATFORM STREQUAL "TVOS")
-  set(IOS_ARCH "arm64")
-else()
-  set(IOS_ARCH "i386;x86_64")
+# Set the target architecture, unless explicitly selected by the caller.
+if(NOT IOS_ARCH)
+  if(IOS_PLATFORM STREQUAL "OS" OR IOS_PLATFORM STREQUAL "TVOS" OR CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
+    set(IOS_ARCH "arm64")
+  else()
+    set(IOS_ARCH "x86_64")
+  endif()
 endif()
 
 set(CMAKE_OSX_ARCHITECTURES "${IOS_ARCH}" CACHE STRING "Build architecture for iOS")

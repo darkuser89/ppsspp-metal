@@ -264,6 +264,9 @@ static std::string ReadShaderSrc(const Path &filename) {
 // Also takes care of making sure the appropriate stereo shader is compiled.
 bool PresentationCommon::UpdatePostShader(const DisplayLayoutConfig &config) {
 	DestroyStereoShader();
+	if (gstate_c.Use(GPU_USE_SIMPLE_STEREO_PERSPECTIVE) || !g_Config.vPostShaderNames.empty()) {
+		ReloadAllPostShaderInfo(draw_);
+	}
 
 	if (gstate_c.Use(GPU_USE_SIMPLE_STEREO_PERSPECTIVE)) {
 		const ShaderInfo *stereoShaderInfo = GetPostShaderInfo(g_Config.sStereoToMonoShader);
@@ -279,7 +282,6 @@ bool PresentationCommon::UpdatePostShader(const DisplayLayoutConfig &config) {
 
 	std::vector<const ShaderInfo *> shaderInfo;
 	if (!g_Config.vPostShaderNames.empty()) {
-		ReloadAllPostShaderInfo(draw_);
 		shaderInfo = GetFullPostShadersChain(g_Config.vPostShaderNames);
 	}
 

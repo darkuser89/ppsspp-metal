@@ -2,9 +2,12 @@
 #include <cstring>
 #include <vector>
 
+#include "Common/Data/Format/DDSLoad.h"
 #include "Common/Data/Format/PNGLoad.h"
 #include "Common/File/FileUtil.h"
 #include "Common/File/Path.h"
+#include "Common/File/VFS/DirectoryReader.h"
+#include "Common/GPU/DataFormat.h"
 #include "Common/Thread/ThreadManager.h"
 #include "GPU/Common/TextureReplacer.h"
 
@@ -32,6 +35,34 @@ static bool CreateTestPNG(const Path &filename, int w, int h, u32 color) {
 		buf[i * 4 + 3] = color & 0xFF;
 	}
 	return pngSave(filename, buf.data(), w, h, 4);
+}
+
+static bool CreateTestDDS(const Path &filename, u32 dxgiFormat, const u8 *block, size_t blockSize) {
+	DDSHeader header{};
+	header.dwMagic = 0x20534444;  // DDS magic
+	header.dwSize = 124;
+	header.dwFlags = 0x81007;  // Required dimensions, pixel format, caps and linear size
+	header.dwHeight = 4;
+	header.dwWidth = 4;
+	header.dwPitchOrLinearSize = (u32)blockSize;
+	header.dwMipMapCount = 1;
+	header.ddspf.dwSize = 32;
+	header.ddspf.dwFlags = DDPF_FOURCC;
+	header.ddspf.dwFourCC = 0x30315844;  // DX10
+	header.dwCaps = DDSCAPS_TEXTURE;
+	DDSHeaderDXT10 header10{};
+	header10.dxgiFormat = dxgiFormat;
+	header10.resourceDimension = 3;
+	header10.arraySize = 1;
+	FILE *f = File::OpenCFile(filename, "wb");
+	if (!f) {
+		return false;
+	}
+	bool good = fwrite(&header, 1, sizeof(header), f) == sizeof(header);
+	good = fwrite(&header10, 1, sizeof(header10), f) == sizeof(header10) && good;
+	good = fwrite(block, 1, blockSize, f) == blockSize && good;
+	fclose(f);
+	return good;
 }
 
 static bool CreateTestPack(const Path &packDir) {
@@ -70,11 +101,15 @@ static bool CreateTestPack(const Path &packDir) {
 	if (!CreateTestPNG(packDir / "tex_b0.png", 64, 64, 0x00FF00FF)) return false;
 	if (!CreateTestPNG(packDir / "tex_b1.png", 32, 32, 0x00FF00FF)) return false;
 	if (!CreateTestPNG(packDir / "tex_c.png", 256, 256, 0x0000FFFF)) return false;
+	const u8 bc4Block[8] = { 173, 173, 0, 0, 0, 0, 0, 0 };
+	const u8 bc5Block[16] = { 173, 173, 0, 0, 0, 0, 0, 0, 89, 89, 0, 0, 0, 0, 0, 0 };
+	if (!CreateTestDDS(packDir / "bc4.dds", 80, bc4Block, sizeof(bc4Block))) return false;
+	if (!CreateTestDDS(packDir / "bc5.dds", 83, bc5Block, sizeof(bc5Block))) return false;
 
 	return true;
 }
 
-static bool TestLookups(TextureReplacer *replacer) {
+static bool TestLookups(TextureReplacer *replacer, const Path &packDir) {
 	// Key A: single mip, found.
 	ReplacedTexture *texA = replacer->FindReplacement(ReplacementCacheKey(KEY_A, HASH_A), 64, 64);
 	EXPECT_TRUE(texA != nullptr);
@@ -137,11 +172,43 @@ static bool TestLookups(TextureReplacer *replacer) {
 	EXPECT_TRUE(texE->Poll(1.0));
 	EXPECT_TRUE(texE->State() == ReplacementState::NOT_FOUND);
 
+	// DX10 DDS BC4/BC5 loading and per-format capability checks.
+	DirectoryReader reader(packDir);
+	for (int i = 0; i < 2; ++i) {
+		const bool bc5 = i == 1;
+		const u8 expected[16] = { 173, 173, 0, 0, 0, 0, 0, 0, 89, 89, 0, 0, 0, 0, 0, 0 };
+		const int blockSize = bc5 ? 16 : 8;
+		ReplacementDesc desc{};
+		desc.newW = desc.newH = desc.w = desc.h = 4;
+		desc.filenames.push_back(bc5 ? "bc5.dds" : "bc4.dds");
+		desc.formatSupport.bc4 = !bc5;
+		desc.formatSupport.bc5 = bc5;
+		ReplacedTexture texture(&reader, desc);
+		EXPECT_TRUE(texture.Poll(1.0));
+		EXPECT_TRUE(texture.State() == ReplacementState::ACTIVE);
+		EXPECT_TRUE(texture.Format() == (bc5 ? Draw::DataFormat::BC5_UNORM_BLOCK : Draw::DataFormat::BC4_UNORM_BLOCK));
+		EXPECT_EQ_INT(texture.GetLevelDataSizeAfterCopy(0), blockSize);
+		u8 actual[16]{};
+		EXPECT_TRUE(texture.CopyLevelTo(0, actual, sizeof(actual), blockSize));
+		EXPECT_TRUE(memcmp(actual, expected, blockSize) == 0);
+		desc.formatSupport.bc4 = false;
+		desc.formatSupport.bc5 = false;
+		ReplacedTexture unsupported(&reader, desc);
+		EXPECT_TRUE(unsupported.Poll(1.0));
+		EXPECT_TRUE(unsupported.State() == ReplacementState::NOT_FOUND);
+	}
+
 	g_threadManager.Teardown();
 	return true;
 }
 
 bool TestTextureReplacer() {
+	int blockSize = 0;
+	EXPECT_TRUE(Draw::DataFormatIsBlockCompressed(Draw::DataFormat::ETC2_R8G8B8A1_UNORM_BLOCK, &blockSize));
+	EXPECT_EQ_INT(blockSize, 8);
+	EXPECT_TRUE(Draw::DataFormatIsBlockCompressed(Draw::DataFormat::ETC2_R8G8B8A8_UNORM_BLOCK, &blockSize));
+	EXPECT_EQ_INT(blockSize, 16);
+
 	Path packDir = Path("unittest_texture_pack");
 	if (!CreateTestPack(packDir)) {
 		return false;
@@ -155,7 +222,7 @@ bool TestTextureReplacer() {
 		return false;
 	}
 
-	if (!TestLookups(&replacer)) {
+	if (!TestLookups(&replacer, packDir)) {
 		File::DeleteDirRecursively(packDir);
 		return false;
 	}

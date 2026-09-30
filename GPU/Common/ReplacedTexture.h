@@ -59,6 +59,8 @@ const char *StateString(ReplacementState state);
 
 struct GPUFormatSupport {
 	bool bc123;
+	bool bc4;
+	bool bc5;
 	bool astc;
 	bool bc7;
 	bool etc2;

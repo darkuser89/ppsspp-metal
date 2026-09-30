@@ -80,6 +80,9 @@ bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompi
 		ppsspp_metal_spirv::CompilerMSL::Options mslOptions;
 		mslOptions.platform = options.ios ? ppsspp_metal_spirv::CompilerMSL::Options::iOS : ppsspp_metal_spirv::CompilerMSL::Options::macOS;
 		mslOptions.set_msl_version(3, 0);
+		mslOptions.multiview = options.multiview;
+		mslOptions.use_framebuffer_fetch_subpasses = options.framebufferFetch;
+		mslOptions.view_mask_buffer_index = VIEW_MASK_BUFFER_SLOT;
 		compiler.set_msl_options(mslOptions);
 		auto commonOptions = compiler.get_common_options();
 		commonOptions.vertex.flip_vert_y = options.flipVertexY;
@@ -88,11 +91,27 @@ bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompi
 
 		CompiledShader compiled;
 		auto reflected = compiler.get_shader_resources();
-		if (!reflected.push_constant_buffers.empty() || !reflected.subpass_inputs.empty() ||
+		if (!reflected.push_constant_buffers.empty() ||
 			!reflected.separate_images.empty() || !reflected.separate_samplers.empty() ||
 			!reflected.atomic_counters.empty()) {
 			*error = "Metal shader uses a resource outside the shared shader binding layout";
 			return false;
+		}
+		if (reflected.subpass_inputs.size() != (options.framebufferFetch ? 1u : 0u)) {
+			*error = "Metal shader has an unexpected framebuffer input attachment";
+			return false;
+		}
+		if (options.framebufferFetch) {
+			const auto &input = reflected.subpass_inputs[0];
+			if (stage != ShaderStage::Fragment ||
+				!compiler.has_decoration(input.id, spv::DecorationInputAttachmentIndex) ||
+				compiler.get_decoration(input.id, spv::DecorationInputAttachmentIndex) != 0 ||
+				compiler.get_decoration(input.id, spv::DecorationDescriptorSet) != 0 ||
+				!compiler.has_decoration(input.id, spv::DecorationBinding) ||
+				compiler.get_decoration(input.id, spv::DecorationBinding) != 1) {
+				*error = "Metal framebuffer fetch must read color attachment 0 at set 0, binding 1";
+				return false;
+			}
 		}
 		auto mapResources = [&](const auto &list, ResourceKind kind) {
 			for (const auto &resource : list) {
@@ -151,7 +170,8 @@ bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompi
 			}
 		}
 		compiled.entryPoint = compiler.get_cleansed_entry_point_name("main", model);
-		if (compiler.needs_swizzle_buffer() || compiler.needs_buffer_size_buffer() || compiler.needs_view_mask_buffer() ||
+		compiled.needsViewMaskBuffer = compiler.needs_view_mask_buffer();
+		if (compiler.needs_swizzle_buffer() || compiler.needs_buffer_size_buffer() ||
 			compiler.needs_output_buffer() || compiler.needs_patch_output_buffer()) {
 			*error = "Metal shader requires unsupported auxiliary buffers";
 			return false;

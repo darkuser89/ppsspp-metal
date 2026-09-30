@@ -55,7 +55,7 @@ enum class DataFormat : uint8_t {
 
 	// Ericsson texture compression.
 	ETC2_R8G8B8_UNORM_BLOCK,  // Color-only, 64 bits per 4x4 block.
-	ETC2_R8G8B8A1_UNORM_BLOCK,  // Color + alpha, 128 bits per 4x4 block.
+	ETC2_R8G8B8A1_UNORM_BLOCK,  // Color + 1-bit alpha, 64 bits per 4x4 block.
 	ETC2_R8G8B8A8_UNORM_BLOCK,  // Color + alpha, 128 bits per 4x4 block.
 
 	// This is the one ASTC format used by UASTC / basis Universal.

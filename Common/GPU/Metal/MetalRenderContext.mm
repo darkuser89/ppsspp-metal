@@ -17,10 +17,14 @@ RenderContext::~RenderContext() {
 	WaitUntilIdle(&error);
 }
 
-bool RenderContext::Init(std::string *error) {
+bool RenderContext::Init(std::string *error, size_t inflightFrames) {
 	error->clear();
 	if (device_) {
 		*error = "Metal context is already initialized";
+		return false;
+	}
+	if (inflightFrames < 1 || inflightFrames > submitted_.size()) {
+		*error = "Invalid Metal in-flight frame count";
 		return false;
 	}
 	if (@available(macOS 13.0, iOS 16.0, *)) {
@@ -37,6 +41,7 @@ bool RenderContext::Init(std::string *error) {
 		queue.label = @"PPSSPP";
 		device_ = device;
 		queue_ = queue;
+		inflightFrames_ = inflightFrames;
 		return true;
 	}
 	*error = "Metal 3 requires macOS 13 or iOS 16 or later";
@@ -69,8 +74,27 @@ bool RenderContext::WaitForSubmission(size_t slot, std::string *error) {
 		}
 		success = false;
 	}
+	if (success && submitted_[slot] && submittedSerial_[slot] > lastCompletedSerial_) {
+		if (@available(macOS 13.0, iOS 16.0, *)) {
+			const double start = submitted_[slot].GPUStartTime;
+			const double end = submitted_[slot].GPUEndTime;
+			double seconds = start > 0.0 && end >= start ? end - start : -1.0;
+			if (submittedInitializations_[slot]) {
+				const double initializationStart = submittedInitializations_[slot].GPUStartTime;
+				const double initializationEnd = submittedInitializations_[slot].GPUEndTime;
+				if (seconds >= 0.0 && initializationStart > 0.0 && initializationEnd >= initializationStart) {
+					seconds += initializationEnd - initializationStart;
+				} else {
+					seconds = -1.0;
+				}
+			}
+			lastSubmissionGPUTimeMs_.store(seconds >= 0.0 ? seconds * 1000.0 : -1.0, std::memory_order_relaxed);
+		}
+		lastCompletedSerial_ = submittedSerial_[slot];
+	}
 	submitted_[slot] = nil;
 	submittedInitializations_[slot] = nil;
+	submittedSerial_[slot] = 0;
 	return success;
 }
 
@@ -119,13 +143,16 @@ bool RenderContext::BeginCommands(std::string *error) {
 	}
 	commands_.label = @"PPSSPP render commands";
 	++commandGeneration_;
+	if (beginCommandsCallback_) {
+		beginCommandsCallback_();
+	}
 	return true;
 }
 
-UploadSlice RenderContext::Upload(const void *data, size_t size, std::string *error) {
+UploadSlice RenderContext::ReserveUpload(size_t size, std::string *error) {
 	error->clear();
-	if (!device_ || !data || !size || size > device_.maxBufferLength) {
-		*error = "Invalid Metal transient upload size, data or device";
+	if (!device_ || !size || size > device_.maxBufferLength) {
+		*error = "Invalid Metal transient upload size or device";
 		return {};
 	}
 	if (!commands_) {
@@ -138,7 +165,6 @@ UploadSlice RenderContext::Upload(const void *data, size_t size, std::string *er
 		// One alignment works for both vertex and index bindings on Metal 3.
 		const size_t offset = (block.used + 255) & ~size_t(255);
 		if (offset <= block.buffer.length && size <= block.buffer.length - offset) {
-			memcpy((uint8_t *)block.buffer.contents + offset, data, size);
 			block.used = offset + size;
 			return {block.buffer, offset};
 		}
@@ -151,9 +177,20 @@ UploadSlice RenderContext::Upload(const void *data, size_t size, std::string *er
 		return {};
 	}
 	buffer.label = @"PPSSPP transient uploads";
-	memcpy(buffer.contents, data, size);
 	blocks.push_back({buffer, size});
 	return {buffer, 0};
+}
+
+UploadSlice RenderContext::Upload(const void *data, size_t size, std::string *error) {
+	if (!data) {
+		*error = "Invalid Metal transient upload data";
+		return {};
+	}
+	auto slice = ReserveUpload(size, error);
+	if (slice) {
+		memcpy((uint8_t *)slice.buffer.contents + slice.offset, data, size);
+	}
+	return slice;
 }
 
 bool RenderContext::SubmitCommands(bool wait, std::string *error) {
@@ -173,8 +210,9 @@ bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 	const size_t slot = nextSubmission_;
 	submitted_[slot] = submitted;
 	submittedInitializations_[slot] = initializationCommands_;
+	submittedSerial_[slot] = ++nextSubmissionSerial_;
 	initializationCommands_ = nil;
-	nextSubmission_ = (nextSubmission_ + 1) % submitted_.size();
+	nextSubmission_ = (nextSubmission_ + 1) % inflightFrames_;
 	return !wait || WaitForSubmission(slot, error);
 }
 

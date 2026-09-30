@@ -15,6 +15,7 @@ namespace Metal {
 // Uniform/storage buffers retain their explicit GLSL binding. Reserve one slot
 // for vertex data, outside the range used by the shared PSP shader generators.
 constexpr uint32_t VERTEX_BUFFER_SLOT = 16;
+constexpr uint32_t VIEW_MASK_BUFFER_SLOT = 5;
 
 enum class ResourceKind {
 	UniformBuffer,
@@ -37,6 +38,10 @@ struct ShaderCompileOptions {
 	// GLSL_VULKAN and Metal both use 0..1 depth, but opposite viewport Y signs.
 	bool flipVertexY = true;
 	bool ios = false;
+	// Translate a single input attachment into Metal's color-attachment fetch.
+	bool framebufferFetch = false;
+	// SPIRV-Cross emulates Vulkan multiview using Metal instance IDs.
+	bool multiview = false;
 	// Keep large compute helpers out of line to avoid pathological pipeline
 	// compilation after SPIRV-Cross's default forced inlining.
 	std::vector<std::string> noInlineFunctions;
@@ -47,6 +52,7 @@ struct CompiledShader {
 	std::string entryPoint;
 	std::vector<ShaderResource> resources;
 	uint32_t workgroupSize[3] = { 1, 1, 1 };
+	bool needsViewMaskBuffer = false;
 };
 
 // Consumes the GLSL 450 produced by the shared shader generators, not arbitrary

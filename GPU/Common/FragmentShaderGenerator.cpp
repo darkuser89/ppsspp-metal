@@ -181,8 +181,9 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 	bool fetchFramebuffer = needFramebufferRead && id.Bit(FS_BIT_USE_FRAMEBUFFER_FETCH);
 	bool readFramebufferTex = needFramebufferRead && !id.Bit(FS_BIT_USE_FRAMEBUFFER_FETCH);
 
-	if (fetchFramebuffer && (compat.shaderLanguage != GLSL_3xx || !compat.lastFragData)) {
-		*errorString = "framebuffer fetch requires GLSL 3xx";
+	if (fetchFramebuffer && compat.shaderLanguage != GLSL_VULKAN &&
+		(compat.shaderLanguage != GLSL_3xx || !compat.lastFragData)) {
+		*errorString = "framebuffer fetch requires GLSL Vulkan or GLSL 3xx";
 		return false;
 	}
 
@@ -213,6 +214,9 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 
 		if (readFramebufferTex) {
 			p.F("layout (set = 0, binding = %d) uniform sampler2D%s fbotex;\n", DRAW_BINDING_2ND_TEXTURE, compat.framebufferArrayTextures ? "Array" : "");
+		}
+		if (fetchFramebuffer) {
+			p.F("layout (input_attachment_index = 0, set = 0, binding = %d) uniform subpassInput inputColor;\n", DRAW_BINDING_2ND_TEXTURE);
 		}
 
 		if (shaderDepalMode != ShaderDepalMode::OFF) {
@@ -627,13 +631,14 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 						_dbg_assert_(compat.shaderLanguage == GLSL_VULKAN);
 						// Used for stereo rendering.
 						const char *arrayIndex = useStereo ? "float(gl_ViewIndex)" : "0.0";
+						const char *bias = samplerLodBiasInShader ? ", u_samplerLodBias" : "";
 						if (doTextureProjection) {
 							// There's no textureProj for array textures, so we need to emulate it.
 							// Should be fine on any Vulkan-compatible hardware.
 							WRITE(p, "  vec2 uv_proj = (%s.xy) / (%s.z);\n", texcoord, texcoord);
-							WRITE(p, "  vec4 t = %s(tex, vec3(uv_proj, %s));\n", compat.texture, texcoord, arrayIndex);
+							WRITE(p, "  vec4 t = %s(tex, vec3(uv_proj, %s)%s);\n", compat.texture, texcoord, arrayIndex, bias);
 						} else {
-							WRITE(p, "  vec4 t = %s(tex, vec3(%s.xy, %s));\n", compat.texture, texcoord, arrayIndex);
+							WRITE(p, "  vec4 t = %s(tex, vec3(%s.xy, %s)%s);\n", compat.texture, texcoord, arrayIndex, bias);
 						}
 					} else {
 						const char *bias = samplerLodBiasInShader ? ", u_samplerLodBias" : "";
@@ -1232,4 +1237,3 @@ bool GenerateFragmentShader(const FShaderID &id, char *buffer, const ShaderLangu
 
 	return true;
 }
-

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "GPU/Common/TextureCacheCommon.h"
 #include "Common/GPU/Metal/MetalRenderManager.h"
 
@@ -13,11 +15,13 @@ class TextureScalerMetal {
 public:
 	bool Configure(Metal::RenderContext &context, const TextureShaderInfo &info, std::string *error);
 	Metal::Texture *Scale(Metal::RenderContext &context, const uint32_t *pixels, int width, int height, int mipLevels, std::string *error);
-	void Clear() { pipeline_ = nil; scaleFactor_ = 0; }
+	void Clear() { pipelines_.fill(nil); pipelineCount_ = 0; constants_ = nil; scaleFactor_ = 0; }
 	int ScaleFactor() const { return scaleFactor_; }
 
 private:
-	id<MTLComputePipelineState> pipeline_ = nil;
+	std::array<id<MTLComputePipelineState>, 4> pipelines_{};
+	int pipelineCount_ = 0;
+	id<MTLBuffer> constants_ = nil;
 	int scaleFactor_ = 0;
 };
 
@@ -42,6 +46,8 @@ public:
 	void NotifyConfigChanged() override;
 	bool GetCurrentTextureDebug(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) override;
 	void *GetNativeTextureView(const TexCacheEntry *entry, bool flat) const override;
+	void ResetGETextureBindings();
+	void RestoreGETextureBindings();
 
 protected:
 	void BindTexture(TexCacheEntry *entry) override;
@@ -50,11 +56,20 @@ protected:
 	void ReleaseTexture(TexCacheEntry *entry, bool deleteThem) override;
 	void BindAsClutTexture(Draw::Texture *texture, bool smooth) override;
 	void ApplySamplerByKey(const SamplerCacheKey &key) override;
+	void BoundFramebufferTexture() override;
 
 private:
 	void UpdateScalingShader();
+	bool ReadCompressedTextureDebug(id<MTLTexture> texture, int mip, int width, int height, GPUDebugBuffer &buffer, std::string *error);
 	Metal::RenderManager *manager_ = nullptr;
+	id<MTLTexture> missingTexture_ = nil;
+	id<MTLTexture> missingTexture3D_ = nil;
+	id<MTLTexture> geTexture_ = nil;
+	id<MTLSamplerState> geSampler_ = nil;
+	id<MTLTexture> geClutTexture_ = nil;
+	id<MTLSamplerState> geClutSampler_ = nil;
 	SamplerCacheMetal samplers_;
 	TextureScalerMetal textureScaler_;
+	id<MTLRenderPipelineState> debugReadbackPipeline_ = nil;
 	std::string scalingShader_;
 };

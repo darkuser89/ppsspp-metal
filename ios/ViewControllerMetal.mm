@@ -7,6 +7,7 @@
 #include "Common/GPU/Vulkan/VulkanContext.h"
 #include "Common/GPU/Vulkan/VulkanRenderManager.h"
 #include "Common/GPU/Vulkan/VulkanGraphicsContext.h"
+#include "Common/GPU/Metal/MetalGraphicsContext.h"
 #include "Common/GPU/thin3d.h"
 #include "Common/GPU/thin3d_create.h"
 #include "Common/Data/Text/Parsers.h"
@@ -69,25 +70,21 @@ static void VulkanRenderLoop(GraphicsContext *graphicsContext, CAMetalLayer *met
 	//	desiredBackbufferSizeX, desiredBackbufferSizeY);
 	std::string errorMessage;
 	if (!graphicsContext->InitSurface(WINDOWSYSTEM_METAL_EXT, (__bridge void *)metalLayer, nullptr, &errorMessage)) {
-		// On Android, if we get here, really no point in continuing.
-		// The UI is supposed to render on any device both on OpenGL and Vulkan. If either of those don't work
-		// on a device, we blacklist it. Hopefully we should have already failed in InitAPI anyway and reverted to GL back then.
-		ERROR_LOG(Log::G3D, "Failed to initialize graphics context.");
-		System_Toast("Failed to initialize graphics context.");
-
-		delete graphicsContext;
-		graphicsContext = nullptr;
+		ERROR_LOG(Log::G3D, "Failed to initialize graphics surface: %s", errorMessage.c_str());
+		System_Toast("Failed to initialize graphics surface.");
+		// The view controller owns graphicsContext and may retry when the app resumes.
 		renderLoopRunning = false;
+		exitRenderLoop = false;
 		return;
 	}
 
 	if (!exitRenderLoop) {
-		if (!NativeInitGraphics(graphicsContext)) {
+		const bool graphicsInitialized = NativeInitGraphics(graphicsContext);
+		if (!graphicsInitialized) {
 			ERROR_LOG(Log::G3D, "Failed to initialize graphics.");
-			// Gonna be in a weird state here..
 		}
 		graphicsContext->ThreadStart();
-		while (!exitRenderLoop) {
+		while (graphicsInitialized && !exitRenderLoop) {
 			NativeFrame(graphicsContext);
 		}
 		INFO_LOG(Log::G3D, "Leaving Vulkan main loop.");
@@ -129,11 +126,9 @@ static void VulkanRenderLoop(GraphicsContext *graphicsContext, CAMetalLayer *met
 - (void)requestExitVulkanRenderLoop {
 	INFO_LOG(Log::G3D, "requestExitVulkanRenderLoop");
 
-	if (!renderLoopRunning) {
-		ERROR_LOG(Log::System, "Render loop already exited");
+	if (!g_renderLoopThread.joinable()) {
 		return;
 	}
-	_assert_(g_renderLoopThread.joinable());
 	exitRenderLoop = true;
 	g_renderLoopThread.join();
 
@@ -159,13 +154,12 @@ static void VulkanRenderLoop(GraphicsContext *graphicsContext, CAMetalLayer *met
 }
 
 - (void)shutdown {
+	[self requestExitVulkanRenderLoop];
 	[super shutdown];
 
 	INFO_LOG(Log::System, "shutdown");
 
 	g_Config.Save("shutdown vk");
-
-	// Hopefully requestExitVulkanRenderLoop has been called from willResignActive here...
 
 	if (graphicsContext) {
 		graphicsContext->ShutdownAPI();
@@ -196,16 +190,30 @@ static void VulkanRenderLoop(GraphicsContext *graphicsContext, CAMetalLayer *met
 	// self.view.insetsLayoutMarginsFromSafeArea = NO;
 	// self.view.clipsToBounds = YES;
 
-	graphicsContext = new VulkanGraphicsContext();
+	const bool nativeMetal = g_Config.iGPUBackend == (int)GPUBackend::METAL;
+	graphicsContext = nativeMetal ? static_cast<GraphicsContext *>(new MetalGraphicsContext()) :
+		static_cast<GraphicsContext *>(new VulkanGraphicsContext());
 	std::string errorMessage;
-	if (!graphicsContext->InitAPI(nullptr, &g_Config.sVulkanDevice, &errorMessage)) {
-		ERROR_LOG(Log::System, "Failed to initialize Vulkan, switching to OpenGL: %s", errorMessage.c_str());
-		g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
-		SetGPUBackend(GPUBackend::OPENGL);
+	if (!graphicsContext->InitAPI(nullptr, nativeMetal ? nullptr : &g_Config.sVulkanDevice, &errorMessage)) {
+		ERROR_LOG(Log::System, "Failed to initialize %s: %s", nativeMetal ? "Metal" : "Vulkan", errorMessage.c_str());
 		delete graphicsContext;
 		graphicsContext = nullptr;  // The render loop and shutdown check for this.
-		// TODO: What to do here? We've switched the config over to GL, but we're still the Metal view controller,
-		// so we won't render anything until the app gets restarted.
+		if (nativeMetal && g_Config.IsBackendEnabled(GPUBackend::VULKAN)) {
+			graphicsContext = new VulkanGraphicsContext();
+			if (graphicsContext->InitAPI(nullptr, &g_Config.sVulkanDevice, &errorMessage)) {
+				g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
+				SetGPUBackend(GPUBackend::VULKAN);
+			} else {
+				ERROR_LOG(Log::System, "Failed to initialize Vulkan fallback: %s", errorMessage.c_str());
+				delete graphicsContext;
+				graphicsContext = nullptr;
+			}
+		}
+		if (!graphicsContext) {
+			g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
+			SetGPUBackend(GPUBackend::OPENGL);
+			// The OpenGL view controller needs an app restart.
+		}
 	}
 
 	[self updateResolutionWithView:self.view];
@@ -221,13 +229,22 @@ static void VulkanRenderLoop(GraphicsContext *graphicsContext, CAMetalLayer *met
 	[super viewWillAppear:animated];
 	INFO_LOG(Log::G3D, "viewWillAppear");
 	// This is to make sure we get 1:1 pixels.
-	UIWindowScene *scene = self.view.window.windowScene;
-	if (scene) {
-		self.view.contentScaleFactor = scene.screen.nativeScale;
+	if (@available(iOS 13.0, *)) {
+		UIWindowScene *scene = self.view.window.windowScene;
+		if (scene) {
+			self.view.contentScaleFactor = scene.screen.nativeScale;
+		}
 	}
 	if (@available(iOS 16.0, *)) {
         [self setNeedsUpdateOfSupportedInterfaceOrientations];
     }
+}
+
+- (void)updateResolutionWithView:(UIView *)view {
+	[super updateResolutionWithView:view];
+	CAMetalLayer *layer = (CAMetalLayer *)view.layer;
+	// On iOS, contentsScale alone can leave drawableSize at zero.
+	layer.drawableSize = CGSizeMake(g_display.pixel_xres, g_display.pixel_yres);
 }
 
 - (void)viewWillDisappear:(BOOL)animated {

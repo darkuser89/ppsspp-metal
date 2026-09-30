@@ -180,7 +180,7 @@ static NSString *ExtractGameInfoScheme(NSURL *url) {
 //	self.window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
 
 	// Choose viewcontroller depending on backend.
-	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
+	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN || g_Config.iGPUBackend == (int)GPUBackend::METAL) {
 		PPSSPPViewControllerMetal *vc = [[PPSSPPViewControllerMetal alloc] init];
 		// sharedViewController gets initialized in the constructor.
 		self.window.rootViewController = vc;

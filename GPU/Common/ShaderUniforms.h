@@ -118,13 +118,8 @@ void CalcTexClamp(float texClamp[4], float texClampOffset[2]);
 
 // This happens so much that I want it inline.
 inline void UpdateUVScaleOff(const GEState &state, float uvScaleOff[4]) {
-	if (gstate_c.textureIsFramebuffer) {
-		uvScaleOff[0] = (float)gstate.getTextureWidth(0) / (float)gstate_c.curTextureWidth;
-		uvScaleOff[1] = (float)gstate.getTextureHeight(0) / (float)gstate_c.curTextureHeight;
-	} else {
-		uvScaleOff[0] = 1.0f;
-		uvScaleOff[1] = 1.0f;
-	}
+	uvScaleOff[0] = gstate_c.curTextureWidth ? (float)state.getTextureWidth(0) / (float)gstate_c.curTextureWidth : 1.0f;
+	uvScaleOff[1] = gstate_c.curTextureHeight ? (float)state.getTextureHeight(0) / (float)gstate_c.curTextureHeight : 1.0f;
 	uvScaleOff[2] = 0.0f;
 	uvScaleOff[3] = 0.0f;
 }

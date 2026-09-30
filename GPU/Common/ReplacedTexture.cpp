@@ -426,6 +426,20 @@ ReplacedTexture::LoadLevelResult ReplacedTexture::LoadLevelData(VFSFileReference
 					}
 					*pixelFormat = Draw::DataFormat::BC3_UNORM_BLOCK;
 					break;
+				case 80: // DXGI_FORMAT_BC4_UNORM
+					if (!desc_.formatSupport.bc4) {
+						WARN_LOG(Log::TexReplacement, "BC4 format not supported, skipping texture");
+						good = false;
+					}
+					*pixelFormat = Draw::DataFormat::BC4_UNORM_BLOCK;
+					break;
+				case 83: // DXGI_FORMAT_BC5_UNORM
+					if (!desc_.formatSupport.bc5) {
+						WARN_LOG(Log::TexReplacement, "BC5 format not supported, skipping texture");
+						good = false;
+					}
+					*pixelFormat = Draw::DataFormat::BC5_UNORM_BLOCK;
+					break;
 				case 98: // DXGI_FORMAT_BC7_UNORM:
 				case 99: // DXGI_FORMAT_BC7_UNORM_SRGB:
 					if (!desc_.formatSupport.bc7) {
