@@ -2414,10 +2414,9 @@ static int sceIoWaitAsync(int id, u32 address) {
 
 			return hleLogDebug(Log::sceIo, 0, "complete");
 		} else {
-			// This is normal in some games.
-			return hleLogInfo(Log::sceIo, SCE_KERNEL_ERROR_NOASYNC, "no async pending");
+			// This is normal.
+			return hleLogDebug(Log::sceIo, SCE_KERNEL_ERROR_NOASYNC, "no async pending");
 		}
-		return 0; //completed
 	} else {
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_BADF, "invalid fd");
 	}
@@ -3129,7 +3128,7 @@ const HLEFunction IoFileMgrForUser[] = {
 	{0x68963324, &WrapU_III<sceIoLseek32>,              "sceIoLseek32",                'i', "iii"   },
 	{0X1B385D8F, &WrapU_III<sceIoLseek32Async>,         "sceIoLseek32Async",           'i', "iii"   },
 	{0X71B19E77, &WrapU_II64I<sceIoLseekAsync>,         "sceIoLseekAsync",             'i', "iIi"   },
-	{0x109F50BC, &WrapU_CII<sceIoOpen>,                 "sceIoOpen",                   'i', "sii"   },
+	{0x109F50BC, &WrapU_CII<sceIoOpen>,                 "sceIoOpen",                   'i', "sii",    HLE_NOT_IN_INTERRUPT },
 	{0x89AA9906, &WrapU_CII<sceIoOpenAsync>,            "sceIoOpenAsync",              'i', "sii"   },
 	{0x06A70004, &WrapU_CI<sceIoMkdir>,                 "sceIoMkdir",                  'i', "si"    },
 	{0x3251EA56, &WrapU_IU<sceIoPollAsync>,             "sceIoPollAsync",              'i', "iP"    },
