@@ -121,7 +121,7 @@ class ReplacedTexture;
 // replacement (texture == nullptr).
 struct ReplacedTextureRef {
 	ReplacedTexture *texture;  // shortcut
-	std::string hashfiles;  // key into the cache
+	std::string hashfiles;  // key into levelCache_
 };
 
 // Metadata about a given texture level.

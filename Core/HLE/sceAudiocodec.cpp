@@ -239,13 +239,17 @@ static int MECall(int result, int us) {
 	return hleDelayResult(result, "audiocodec", MEScheduleJob(PowerScaleFromDefaultClock(us)));
 }
 
-static int InitUs(int codec, const SceAudiocodecCodec *ctx) {
+int AudioCodecInitUs(int codec, bool monoAt3Plus) {
 	switch (codec) {
-	case PSP_CODEC_AT3PLUS: return ((ctx->fmt.at3.formatByte1 >> 2) & 7) == 1 ? 524 : 646;
+	case PSP_CODEC_AT3PLUS: return monoAt3Plus ? 524 : 646;
 	case PSP_CODEC_AT3: return 210;
 	case PSP_CODEC_MP3: return 517;
 	default: return 230;
 	}
+}
+
+static int InitUs(int codec, const SceAudiocodecCodec *ctx) {
+	return AudioCodecInitUs(codec, codec == PSP_CODEC_AT3PLUS && ((ctx->fmt.at3.formatByte1 >> 2) & 7) == 1);
 }
 
 // libmp4.prx puts the sample rate here. On hardware 22050 and 44100 are accepted, 0 and 12345
@@ -393,6 +397,11 @@ static int EstimateDecodeUs(int codec, int channels, int frameBytes, const SceAu
 	default:
 		return 0;
 	}
+}
+
+int AudioCodecDecodeUs(int codec, int channels, int frameBytes) {
+	_dbg_assert_(codec == PSP_CODEC_AT3PLUS || codec == PSP_CODEC_AT3);
+	return EstimateDecodeUs(codec, channels, frameBytes, nullptr);
 }
 
 static int sceAudiocodecInit(u32 ctxPtr, int codec) {
@@ -746,6 +755,20 @@ static bool Atrac3LayoutFromContext(const SceAudiocodecCodec *ctx, int *bytesPer
 	}
 	WARN_LOG(Log::ME, "Unknown Atrac3 parameter %02x", param);
 	return true;
+}
+
+// libatrac3plus.prx's SetData picks the parameter by frame size and the header's joint
+// stereo flag, scanning from the last entry, and the channel count plays no part. LocoRoco 2 writes
+// 2 channels into every track header it builds, and its 0xC0 MuiMui house track is mono (#8647).
+// No match fails SetData with 0x80630008.
+bool Atrac3DecoderChannels(int bytesPerFrame, bool jointStereo, int *channels) {
+	for (int i = ARRAY_SIZE(at3Params) - 1; i >= 0; i--) {
+		if (at3Params[i].bytes == bytesPerFrame && (at3Params[i].jointStereo != 0) == jointStereo) {
+			*channels = at3Params[i].channels;
+			return true;
+		}
+	}
+	return false;
 }
 
 bool IsAtrac3StreamJointStereo(int codecType, int bytesPerFrame, int channels) {

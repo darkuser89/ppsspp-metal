@@ -419,7 +419,7 @@ void PSPThread::Cleanup() {
 }
 
 void PSPThread::DoState(PointerWrap &p) {
-	auto s = p.Section("Thread", 1, 5);
+	auto s = p.Section("Thread", 1, 7);
 	if (!s)
 		return;
 
@@ -460,6 +460,16 @@ void PSPThread::DoState(PointerWrap &p) {
 		Do(p, waitingThreads);
 		Do(p, pausedWaits);
 	}
+	if (s >= 6) {
+		Do(p, hasWaited);
+	} else {
+		hasWaited = true;
+	}
+	if (s >= 7) {
+		Do(p, waitPausedForCallback);
+	} else {
+		waitPausedForCallback = false;
+	}
 }
 
 
@@ -467,6 +477,7 @@ struct WaitTypeFuncs
 {
 	WaitBeginCallbackFunc beginFunc;
 	WaitEndCallbackFunc endFunc;
+	WaitTimeoutFunc timeoutFunc;
 };
 
 bool __KernelExecuteMipsCallOnCurrentThread(u32 callId, bool reschedAfter);
@@ -484,6 +495,17 @@ bool __KernelCheckThreadCallbacks(PSPThread *thread, bool force);
 static int g_inCbCount = 0;
 static SceUID currentCallbackThreadID = 0;
 static int readyCallbacksCount = 0;
+// Syscalls keeping the CPU busy, see __KernelBusyDelayResult().
+struct BusySyscall {
+	SceUID threadID;
+	s64 remainingCycles;
+	bool counting;
+};
+static std::vector<BusySyscall> busySyscalls;
+// See __KernelChance().
+static int g_chanceAccumulator = 50;
+static int eventBusySyscallDone = -1;
+static void __KernelBusySyscallDone(u64 userdata, int cyclesLate);
 static SceUID currentThread;
 // When the running thread last changed, so each thread can be billed for the time it actually ran
 // (nt.runForClocks). Not serialized - it's re-based on load, which only skews the very first slice.
@@ -513,7 +535,7 @@ static ThreadQueueList threadReadyQueue;
 static SceUID threadIdleID[2];
 
 static int eventScheduledWakeup;
-static int eventThreadEndTimeout;
+static int eventWaitTimeout;
 
 static bool dispatchEnabled = true;
 
@@ -676,7 +698,7 @@ static void __KernelSleepEndCallback(SceUID threadID, SceUID prevCallbackId) {
 }
 
 static void __KernelThreadEndBeginCallback(SceUID threadID, SceUID prevCallbackId) {
-	auto result = HLEKernel::WaitBeginCallback<PSPThread, WAITTYPE_THREADEND, SceUID>(threadID, prevCallbackId, eventThreadEndTimeout);
+	auto result = HLEKernel::WaitBeginCallback<PSPThread, WAITTYPE_THREADEND, SceUID>(threadID, prevCallbackId, eventWaitTimeout);
 	if (result == HLEKernel::WAIT_CB_SUCCESS)
 		DEBUG_LOG(Log::sceKernel, "sceKernelWaitThreadEndCB: Suspending wait for callback");
 	else if (result == HLEKernel::WAIT_CB_BAD_WAIT_DATA)
@@ -692,7 +714,8 @@ static bool __KernelCheckResumeThreadEnd(PSPThread *t, SceUID waitingThreadID, u
 	if (t->nt.status == THREADSTATUS_DORMANT) {
 		u32 timeoutPtr = __KernelGetWaitTimeoutPtr(waitingThreadID, error);
 		// Note: unlike the helper in KernelWaitHelpers.h, we unschedule even without a timeout ptr.
-		s64 cyclesLeft = CoreTiming::UnscheduleEvent(eventThreadEndTimeout, waitingThreadID);
+		s64 cyclesLeft = CoreTiming::UnscheduleEvent(eventWaitTimeout, waitingThreadID);
+		cyclesLeft -= usToCycles(WAIT_TIMEOUT_LATENCY_US);
 		if (cyclesLeft < 0)
 			cyclesLeft = 0;
 		if (timeoutPtr != 0)
@@ -707,7 +730,7 @@ static bool __KernelCheckResumeThreadEnd(PSPThread *t, SceUID waitingThreadID, u
 
 static void __KernelThreadEndEndCallback(SceUID threadID, SceUID prevCallbackId)
 {
-	auto result = HLEKernel::WaitEndCallback<PSPThread, WAITTYPE_THREADEND, SceUID>(threadID, prevCallbackId, eventThreadEndTimeout, __KernelCheckResumeThreadEnd);
+	auto result = HLEKernel::WaitEndCallback<PSPThread, WAITTYPE_THREADEND, SceUID>(threadID, prevCallbackId, eventWaitTimeout, __KernelCheckResumeThreadEnd);
 	if (result == HLEKernel::WAIT_CB_RESUMED_WAIT)
 		DEBUG_LOG(Log::sceKernel, "sceKernelWaitThreadEndCB: Resuming wait from callback");
 }
@@ -739,6 +762,7 @@ u32 __KernelSetThreadRA(SceUID threadID, u32 nid) {
 
 void hleScheduledWakeup(u64 userdata, int cyclesLate);
 void hleThreadEndTimeout(u64 userdata, int cyclesLate);
+static void __KernelWaitTimeoutFired(u64 userdata, int cyclesLate);
 
 static void __KernelWriteFakeSysCall(u32 nid, u32 *ptr, u32 &pos) {
 	*ptr = pos;
@@ -757,6 +781,7 @@ u32 HLEMipsCallReturnAddress() {
 }
 
 void __KernelThreadingInit() {
+	g_chanceAccumulator = 50;
 	struct ThreadHack {
 		u32 nid;
 		u32 *addr;
@@ -801,7 +826,9 @@ void __KernelThreadingInit() {
 	}
 
 	eventScheduledWakeup = CoreTiming::RegisterEvent("ScheduledWakeup", &hleScheduledWakeup);
-	eventThreadEndTimeout = CoreTiming::RegisterEvent("ThreadEndTimeout", &hleThreadEndTimeout);
+	eventWaitTimeout = CoreTiming::RegisterEvent("WaitTimeout", &__KernelWaitTimeoutFired);
+	eventBusySyscallDone = CoreTiming::RegisterEvent("BusySyscallDone", &__KernelBusySyscallDone);
+	busySyscalls.clear();
 	actionAfterMipsCall = __KernelRegisterActionType(ActionAfterMipsCall::Create);
 	actionAfterCallback = __KernelRegisterActionType(ActionAfterCallback::Create);
 	actionAfterExitCallback = __KernelRegisterActionType(ActionAfterExitCallback::Create);
@@ -818,7 +845,7 @@ void __KernelThreadingInit() {
 
 	__KernelRegisterWaitTypeFuncs(WAITTYPE_DELAY, __KernelDelayBeginCallback, __KernelDelayEndCallback);
 	__KernelRegisterWaitTypeFuncs(WAITTYPE_SLEEP, __KernelSleepBeginCallback, __KernelSleepEndCallback);
-	__KernelRegisterWaitTypeFuncs(WAITTYPE_THREADEND, __KernelThreadEndBeginCallback, __KernelThreadEndEndCallback);
+	__KernelRegisterWaitTypeFuncs(WAITTYPE_THREADEND, __KernelThreadEndBeginCallback, __KernelThreadEndEndCallback, &hleThreadEndTimeout);
 }
 
 void __KernelThreadingDoState(PointerWrap &p)
@@ -828,7 +855,7 @@ void __KernelThreadingDoState(PointerWrap &p)
 		g_exitCallbackPending = false;
 	}
 
-	auto s = p.Section("sceKernelThread", 1, 5);
+	auto s = p.Section("sceKernelThread", 1, 7);
 	if (!s)
 		return;
 
@@ -858,8 +885,8 @@ void __KernelThreadingDoState(PointerWrap &p)
 
 	Do(p, eventScheduledWakeup);
 	CoreTiming::RestoreRegisterEvent(eventScheduledWakeup, "ScheduledWakeup", &hleScheduledWakeup);
-	Do(p, eventThreadEndTimeout);
-	CoreTiming::RestoreRegisterEvent(eventThreadEndTimeout, "ThreadEndTimeout", &hleThreadEndTimeout);
+	Do(p, eventWaitTimeout);
+	CoreTiming::RestoreRegisterEvent(eventWaitTimeout, "WaitTimeout", &__KernelWaitTimeoutFired);
 	Do(p, actionAfterMipsCall);
 	__KernelRestoreActionType(actionAfterMipsCall, ActionAfterMipsCall::Create);
 	Do(p, actionAfterCallback);
@@ -874,6 +901,27 @@ void __KernelThreadingDoState(PointerWrap &p)
 	}
 
 	Do(p, pausedDelays);
+
+	if (s >= 6) {
+		Do(p, eventBusySyscallDone);
+		u32 busyCount = (u32)busySyscalls.size();
+		Do(p, busyCount);
+		busySyscalls.resize(busyCount);
+		for (BusySyscall &busy : busySyscalls) {
+			Do(p, busy.threadID);
+			Do(p, busy.remainingCycles);
+			Do(p, busy.counting);
+		}
+	} else {
+		eventBusySyscallDone = -1;
+		busySyscalls.clear();
+	}
+	CoreTiming::RestoreRegisterEvent(eventBusySyscallDone, "BusySyscallDone", &__KernelBusySyscallDone);
+	if (s >= 7) {
+		Do(p, g_chanceAccumulator);
+	} else {
+		g_chanceAccumulator = 50;
+	}
 
 	__SetCurrentThread(kernelObjects.GetFast<PSPThread>(currentThread), currentThread, __KernelGetThreadName(currentThread));
 	lastSwitchCycles = CoreTiming::GetTicks(currentMIPS);
@@ -1416,6 +1464,7 @@ void __KernelWaitCurThread(WaitType type, SceUID waitID, u32 waitValue, u32 time
 		WARN_LOG_REPORT(Log::sceKernel, "Waiting thread for %d that was already waiting for %d", type, thread->nt.waitType);
 	thread->nt.waitID = waitID;
 	thread->nt.waitType = type;
+	thread->hasWaited = true;
 	__KernelChangeThreadState(thread, ThreadStatus(THREADSTATUS_WAIT | (thread->nt.status & THREADSTATUS_SUSPEND)));
 	thread->nt.numReleases++;
 	thread->waitInfo.waitValue = waitValue;
@@ -1470,21 +1519,87 @@ void __KernelCancelWakeup(SceUID threadID)
 	CoreTiming::UnscheduleEvent(eventScheduledWakeup, threadID);
 }
 
+// On hardware these outcomes depend on the phase of the clock. We go with the likelier one, except
+// that always taking a likely-but-not-certain one could lock a polling loop into never yielding.
+// Those are true for the given share of calls, spread evenly: 60 is true three times in five.
+static bool __KernelChance(int percent) {
+	if (percent < 50) {
+		return false;
+	} else if (percent >= 100) {
+		return true;
+	}
+	g_chanceAccumulator += percent;
+	if (g_chanceAccumulator >= 100) {
+		g_chanceAccumulator -= 100;
+		return true;
+	}
+	return false;
+}
+
+// How a wait's timeout plays out on hardware (pspautotests threads/scheduling/waittimeouts). The
+// deadline is taken, and the alarm set up a moment later. If the deadline has passed by then, the
+// wait fails with SCE_KERNEL_ERROR_WAIT_TIMEOUT at once, without giving up the CPU or writing the
+// timeout back. For most calls that happens about 85% of the time for 0us, half the time for 1us,
+// 15% for 2us and never from 3us on. sceKernelAllocateVpl does more first: always up to 1us, then
+// about 17% less per us. Longer ones end max(timeout, 205us) plus about 35us after the call. The
+// deadline is taken late in the call, so the time left written back when something else ends the
+// wait counts from there.
+bool __KernelWaitTimesOutAtOnce(u32 timeoutPtr, int basePercent, int stepPercent) {
+	if (!Memory::IsValid4AlignedAddress(timeoutPtr)) {
+		return false;
+	}
+	const u32 micro = std::min(Memory::ReadUnchecked_U32(timeoutPtr), 100U);
+	return __KernelChance(basePercent - (int)micro * stepPercent);
+}
+
+s64 __KernelWaitTimeoutUs(u32 micro) {
+	return (s64)std::max(micro, 205U) + WAIT_TIMEOUT_DEADLINE_US + WAIT_TIMEOUT_LATENCY_US;
+}
+
 void hleThreadEndTimeout(u64 userdata, int cyclesLate)
 {
 	SceUID threadID = (SceUID) userdata;
 	HLEKernel::WaitExecTimeout<PSPThread, WAITTYPE_THREADEND>(threadID);
 }
 
-static void __KernelScheduleThreadEndTimeout(SceUID threadID, SceUID waitForID, s64 usFromNow)
-{
-	s64 cycles = usToCycles(usFromNow);
-	CoreTiming::ScheduleEvent(cycles, eventThreadEndTimeout, threadID);
+// One event times out every kernel object wait (the thread only has one wait at a time), and hands
+// over to the timeout function registered for the thread's wait type.
+static void __KernelWaitTimeoutFired(u64 userdata, int cyclesLate) {
+	u32 error;
+	const PSPThread *thread = kernelObjects.Get<PSPThread>((SceUID)userdata, error);
+	if (!thread) {
+		return;
+	}
+	const WaitTimeoutFunc func = waitTypeFuncs[thread->nt.waitType].timeoutFunc;
+	if (func) {
+		func(userdata, cyclesLate);
+	}
+}
+
+int __KernelWaitTimeoutEvent() {
+	return eventWaitTimeout;
+}
+
+void __KernelScheduleWaitTimeout(SceUID threadID, u32 timeoutPtr) {
+	if (timeoutPtr == 0) {
+		return;
+	}
+	const u32 micro = Memory::ReadOrException_U32(timeoutPtr);
+	CoreTiming::ScheduleEvent(usToCycles(__KernelWaitTimeoutUs(micro)), eventWaitTimeout, threadID);
+}
+
+void __KernelWaitCurThreadWithTimeout(WaitType type, SceUID waitID, u32 waitValue, u32 timeoutPtr, bool processCallbacks, const char *reason) {
+	__KernelScheduleWaitTimeout(__KernelGetCurThread(), timeoutPtr);
+	__KernelWaitCurThread(type, waitID, waitValue, timeoutPtr, processCallbacks, reason);
+}
+
+void __KernelRestoreOldWaitTimeoutEvent(int &eventType, const char *name) {
+	CoreTiming::RestoreRegisterEvent(eventType, name, &__KernelWaitTimeoutFired);
 }
 
 void __KernelCancelThreadEndTimeout(SceUID threadID)
 {
-	CoreTiming::UnscheduleEvent(eventThreadEndTimeout, threadID);
+	CoreTiming::UnscheduleEvent(eventWaitTimeout, threadID);
 }
 
 static void __KernelRemoveFromThreadQueue(SceUID threadID) {
@@ -1513,7 +1628,7 @@ void __KernelStopThread(SceUID threadID, int exitStatus, const char *reason)
 			u32 timeoutPtr = __KernelGetWaitTimeoutPtr(waitingThread, error);
 			if (HLEKernel::VerifyWait(waitingThread, WAITTYPE_THREADEND, threadID))
 			{
-				s64 cyclesLeft = CoreTiming::UnscheduleEvent(eventThreadEndTimeout, waitingThread);
+				s64 cyclesLeft = CoreTiming::UnscheduleEvent(eventWaitTimeout, waitingThread) - usToCycles(WAIT_TIMEOUT_LATENCY_US);
 				if (cyclesLeft < 0)
 					cyclesLeft = 0;
 				if (timeoutPtr != 0)
@@ -1601,11 +1716,121 @@ static void __ReportThreadQueueEmpty() {
 }
 
 // Returns NULL if the current thread is fine.
+// A syscall that keeps the CPU busy for a long time, like sceKernelCreateThread filling a big
+// stack. The kernel runs it with interrupts on, so a better thread that wakes meanwhile preempts
+// it, and the time that thread takes doesn't count towards the syscall. Worse threads don't get a
+// look in. (tests/threads/scheduling/preemptsyscall.) Modelled as a wait that only an idle thread
+// may stand in for, whose countdown only runs while one does.
+// hleDelayResult waits with id 1.
+static const SceUID BUSY_SYSCALL_WAIT_ID = 2;
+
+static bool __KernelIsIdleThread(SceUID threadID) {
+	return threadID == threadIdleID[0] || threadID == threadIdleID[1];
+}
+
+// Also drops entries for threads that stopped waiting (terminated, say.)
+static PSPThread *__KernelBestBusyThread() {
+	PSPThread *best = nullptr;
+	for (size_t i = 0; i < busySyscalls.size(); ) {
+		u32 error;
+		PSPThread *t = kernelObjects.Get<PSPThread>(busySyscalls[i].threadID, error);
+		if (!t || !t->isWaitingFor(WAITTYPE_HLEDELAY, BUSY_SYSCALL_WAIT_ID)) {
+			if (busySyscalls[i].counting) {
+				CoreTiming::UnscheduleEvent(eventBusySyscallDone, busySyscalls[i].threadID);
+			}
+			busySyscalls.erase(busySyscalls.begin() + i);
+			continue;
+		}
+		if (!best || t->nt.currentPriority < best->nt.currentPriority) {
+			best = t;
+		}
+		++i;
+	}
+	return best;
+}
+
+// The best busy syscall makes progress only while an idle thread stands in for it.
+static void __KernelUpdateBusySyscalls(PSPThread *target) {
+	if (busySyscalls.empty()) {
+		return;
+	}
+	PSPThread *best = __KernelBestBusyThread();
+	const bool idleStandsIn = target && __KernelIsIdleThread(target->GetUID());
+	for (BusySyscall &busy : busySyscalls) {
+		const bool shouldCount = idleStandsIn && best && busy.threadID == best->GetUID();
+		if (shouldCount && !busy.counting) {
+			CoreTiming::ScheduleEvent(busy.remainingCycles, eventBusySyscallDone, busy.threadID);
+			busy.counting = true;
+		} else if (!shouldCount && busy.counting) {
+			const s64 left = CoreTiming::UnscheduleEvent(eventBusySyscallDone, busy.threadID);
+			busy.remainingCycles = left > 0 ? left : 0;
+			busy.counting = false;
+		}
+	}
+}
+
+static void __KernelBusySyscallDone(u64 userdata, int cyclesLate) {
+	const SceUID threadID = (SceUID)userdata;
+	for (size_t i = 0; i < busySyscalls.size(); ++i) {
+		if (busySyscalls[i].threadID == threadID) {
+			busySyscalls.erase(busySyscalls.begin() + i);
+			break;
+		}
+	}
+	u32 error;
+	PSPThread *t = kernelObjects.Get<PSPThread>(threadID, error);
+	if (t && t->isWaitingFor(WAITTYPE_HLEDELAY, BUSY_SYSCALL_WAIT_ID)) {
+		__KernelResumeThreadFromWait(threadID, t->getWaitInfo().waitValue);
+		// It never gave up the CPU, so it goes back ahead of threads of the same priority.
+		if (t->nt.status == THREADSTATUS_READY) {
+			threadReadyQueue.remove(t->nt.currentPriority, threadID);
+			threadReadyQueue.push_front(t->nt.currentPriority, threadID);
+		}
+		__KernelReSchedule("busy syscall done");
+	}
+}
+
+u32 __KernelBusyDelayResult(u32 result, int cycles, const char *reason) {
+	if (cycles <= 0 || !__KernelIsDispatchEnabled() || __IsInInterrupt()) {
+		hleEatCycles(cycles);
+		return result;
+	}
+	busySyscalls.push_back(BusySyscall{ __KernelGetCurThread(), cycles, false });
+	__KernelWaitCurThread(WAITTYPE_HLEDELAY, BUSY_SYSCALL_WAIT_ID, result, 0, false, reason);
+	return result;
+}
+
 static PSPThread *__KernelNextThread() {
 	SceUID bestThread;
 
 	// If the current thread is running, it's a valid candidate.
 	PSPThread *cur = __GetCurrentThread();
+
+	// A busy syscall keeps the CPU unless something better wants it. An idle thread stands in.
+	PSPThread *busy = busySyscalls.empty() ? nullptr : __KernelBestBusyThread();
+	if (busy) {
+		const u32 busyPriority = busy->nt.currentPriority;
+		const SceUID bestReady = threadReadyQueue.peek_first();
+		PSPThread *bestReadyThread = bestReady != 0 ? kernelObjects.GetFast<PSPThread>(bestReady) : nullptr;
+		const bool readyOutranks = bestReadyThread && bestReadyThread->nt.currentPriority < busyPriority;
+		const bool curOutranks = cur && cur->isRunning() && !__KernelIsIdleThread(currentThread) && cur->nt.currentPriority < busyPriority;
+		if (!readyOutranks && !curOutranks) {
+			if (cur && cur->isRunning() && __KernelIsIdleThread(currentThread)) {
+				return nullptr;
+			}
+			for (SceUID idleID : threadIdleID) {
+				PSPThread *idle = kernelObjects.GetFast<PSPThread>(idleID);
+				if (idle && idle->nt.status == THREADSTATUS_READY) {
+					threadReadyQueue.remove(idle->nt.currentPriority, idleID);
+					if (cur && cur->isRunning()) {
+						__KernelChangeReadyState(cur, currentThread, true);
+					}
+					return idle;
+				}
+			}
+		}
+	}
+
 	if (cur && cur->isRunning()) {
 		bestThread = threadReadyQueue.pop_first_better(cur->nt.currentPriority);
 		if (bestThread != 0)
@@ -1747,6 +1972,7 @@ void __KernelResetThread(PSPThread *t, int lowestPriority) {
 
 	t->nt.exitStatus = SCE_KERNEL_ERROR_NOT_DORMANT;
 	t->isProcessingCallbacks = false;
+	t->hasWaited = false;
 	t->currentCallbackId = 0;
 	t->currentMipscallId = 0;
 	t->pendingMipsCalls.clear();
@@ -1850,7 +2076,7 @@ SceUID __KernelCreateThreadInternal(const char *threadName, SceUID moduleID, u32
 }
 
 // Note: Removed all the uses of hleReport* etc.
-int __KernelCreateThread(const char *threadName, SceUID moduleID, u32 entry, u32 prio, int stacksize, u32 attr, u32 optionAddr, bool allowKernel) {
+int __KernelCreateThread(const char *threadName, SceUID moduleID, u32 entry, u32 prio, int stacksize, u32 attr, u32 optionAddr, bool allowKernel, int *busyCyclesOut) {
 	if (!threadName) {
 		ERROR_LOG(Log::sceKernel, "__KernelCreateThread: NULL thread name");
 		return SCE_KERNEL_ERROR_ERROR;
@@ -1921,18 +2147,25 @@ int __KernelCreateThread(const char *threadName, SceUID moduleID, u32 entry, u32
 
 	// Measured by tests/threads/scheduling/costs: about 150us, plus filling the stack with 0xFF at
 	// around a cycle per byte - 1.3ms for a 256KB stack.
-	int createCycles = 32000;
+	int fillCycles = 0;
 	if ((attr & PSP_THREAD_ATTR_NO_FILLSTACK) == 0 && stacksize > 0) {
-		createCycles += stacksize - stacksize / 64;
+		fillCycles = stacksize - stacksize / 64;
 	}
-	hleEatCycles(createCycles);
+	hleEatCycles(32000);
 	// This won't schedule to the new thread, but it may to one woken from eating cycles.
-	// Technically, this should not eat all at once, and reschedule in the middle, but that's hard.
 	hleReSchedule("thread created");
 
 	// Before triggering, set v0, since we restore on return.
 	RETURN(id);
-	__KernelThreadTriggerEvent((attr & PSP_THREAD_ATTR_KERNEL) != 0, id, THREADEVENT_CREATE);
+	const bool handled = __KernelThreadTriggerEvent((attr & PSP_THREAD_ATTR_KERNEL) != 0, id, THREADEVENT_CREATE);
+	if (busyCyclesOut && !handled) {
+		*busyCyclesOut = fillCycles;
+	} else {
+		// A handler is about to run as a call on this thread, so no busy wait around it.
+		hleEatCycles(fillCycles);
+		if (busyCyclesOut)
+			*busyCyclesOut = 0;
+	}
 	return id;
 }
 
@@ -1940,11 +2173,12 @@ int sceKernelCreateThread(const char *threadName, u32 entry, u32 prio, int stack
 	PSPThread *cur = __GetCurrentThread();
 	SceUID module = __KernelGetCurThreadModuleId();
 	bool allowKernel = KernelModuleIsKernelMode(module) || hleIsKernelMode() || (cur ? (cur->nt.attr & PSP_THREAD_ATTR_KERNEL) != 0 : false);
-	int retval = __KernelCreateThread(threadName, module, entry, prio, stacksize, attr, optionAddr, allowKernel);
+	int busyCycles = 0;
+	int retval = __KernelCreateThread(threadName, module, entry, prio, stacksize, attr, optionAddr, allowKernel, &busyCycles);
 	if (retval < 0) {
 		return hleLogError(Log::sceKernel, retval);
 	} else {
-		return hleLogInfo(Log::sceKernel, retval);
+		return __KernelBusyDelayResult(hleLogInfo(Log::sceKernel, retval), busyCycles, "thread stack filled");
 	}
 }
 
@@ -1997,6 +2231,9 @@ int __KernelStartThread(SceUID threadToStartID, int argSize, u32 argBlockPtr, bo
 		KernelValidateThreadTarget(startThread->context.pc);
 		__KernelChangeReadyState(cur, currentThread, true);
 		if (__InterruptsEnabled()) {
+			// Handing over costs more: about 30us from the call to the new thread's entry on
+			// hardware, where starting a worse one takes 10-25us.
+			hleEatCycles(2000);
 			g_startThreadHandoff = threadToStartID;
 			hleReSchedule("thread started");
 		}
@@ -2076,6 +2313,9 @@ int sceKernelGetThreadStackFreeSize(SceUID threadID) {
 	return hleLogDebug(Log::sceKernel, sz & ~3);
 }
 
+// What a thread ending costs, besides the switch away from it.
+static const int THREAD_EXIT_CYCLES = 3300;
+
 void __KernelReturnFromThread()
 {
 	hleSkipDeadbeef();
@@ -2085,6 +2325,8 @@ void __KernelReturnFromThread()
 	_dbg_assert_msg_(thread != NULL, "Returned from a NULL thread.");
 
 	DEBUG_LOG(Log::sceKernel, "__KernelReturnFromThread: %d", exitStatus);
+	// About 20us from a thread ending to a thread waiting on it running, on hardware.
+	hleEatCycles(THREAD_EXIT_CYCLES);
 	__KernelStopThread(currentThread, exitStatus, "thread returned");
 
 	hleReSchedule("thread returned");
@@ -2106,6 +2348,7 @@ int sceKernelExitThread(int exitStatus) {
 	if (exitStatus < 0) {
 		exitStatus = SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
 	}
+	hleEatCycles(THREAD_EXIT_CYCLES);
 	__KernelStopThread(currentThread, exitStatus, "thread exited");
 
 	hleReSchedule("thread exited");
@@ -2141,6 +2384,7 @@ int sceKernelExitDeleteThread(int exitStatus) {
 		INFO_LOG(Log::sceKernel,"sceKernelExitDeleteThread(%d)", exitStatus);
 		uint32_t thread_attr = thread->nt.attr;
 		uint32_t uid = thread->GetUID();
+		hleEatCycles(THREAD_EXIT_CYCLES);
 		__KernelDeleteThread(currentThread, exitStatus, "thread exited with delete");
 
 		hleReSchedule("thread exited with delete");
@@ -2461,10 +2705,23 @@ static s64 __KernelDelayThreadUs(u64 usec) {
 	return usec + 10;
 }
 
+// A delay's deadline is now + usec, and the clock is read again when the alarm is set. If the
+// deadline has passed by then, the call returns 0 at once without giving up the CPU. The two reads
+// are about 0.6us apart, so a delay of 0 returns at once about 60% of the time, and 1 almost never.
+// On a thread's first wait after it starts, when the code is presumably out of the cache, they're
+// about 1.65us apart: a delay of 1 returns at once about two times in three, and 2 never
+// (pspautotests threads/scheduling/delayzero).
+static bool __KernelDelayReturnsAtOnce(u32 usec) {
+	const PSPThread *thread = __GetCurrentThread();
+	const int gapPercent = thread && !thread->hasWaited ? 165 : 60;
+	return __KernelChance(gapPercent - (int)std::min(usec, 2U) * 100);
+}
+
 int sceKernelDelayThreadCB(u32 usec) {
 	hleEatCycles(2000);
-	// Note: Sometimes (0) won't delay, potentially based on how much the thread is doing.
-	// But a loop with just 0 often does delay, and games depend on this.  So we err on that side.
+	if (__KernelDelayReturnsAtOnce(usec) && !__KernelCurHasReadyCallbacks()) {
+		return hleLogDebug(Log::sceKernel, 0, "deadline already passed");
+	}
 	SceUID curThread = __KernelGetCurThread();
 	s64 delayUs = __KernelDelayThreadUs(usec);
 	__KernelScheduleWakeup(curThread, delayUs);
@@ -2474,8 +2731,9 @@ int sceKernelDelayThreadCB(u32 usec) {
 
 int sceKernelDelayThread(u32 usec) {
 	hleEatCycles(2000);
-	// Note: Sometimes (0) won't delay, potentially based on how much the thread is doing.
-	// But a loop with just 0 often does delay, and games depend on this.  So we err on that side.
+	if (__KernelDelayReturnsAtOnce(usec)) {
+		return hleLogDebug(Log::sceKernel, 0, "deadline already passed");
+	}
 	SceUID curThread = __KernelGetCurThread();
 	s64 delayUs = __KernelDelayThreadUs(usec);
 	__KernelScheduleWakeup(curThread, delayUs);
@@ -2623,8 +2881,9 @@ int sceKernelWaitThreadEnd(SceUID threadID, u32 timeoutPtr) {
 	} else {
 		if (t->nt.status != THREADSTATUS_DORMANT)
 		{
-			if (Memory::IsValidAddress(timeoutPtr))
-				__KernelScheduleThreadEndTimeout(currentThread, threadID, Memory::ReadUnchecked_U32(timeoutPtr));
+			if (__KernelWaitTimesOutAtOnce(timeoutPtr))
+				return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
+			__KernelScheduleWaitTimeout(currentThread, Memory::IsValidAddress(timeoutPtr) ? timeoutPtr : 0);
 			if (std::find(t->waitingThreads.begin(), t->waitingThreads.end(), currentThread) == t->waitingThreads.end())
 				t->waitingThreads.push_back(currentThread);
 			__KernelWaitCurThread(WAITTYPE_THREADEND, threadID, 0, timeoutPtr, false, "thread wait end");
@@ -2650,8 +2909,9 @@ int sceKernelWaitThreadEndCB(SceUID threadID, u32 timeoutPtr) {
 	} else {
 		if (t->nt.status != THREADSTATUS_DORMANT)
 		{
-			if (Memory::IsValidAddress(timeoutPtr))
-				__KernelScheduleThreadEndTimeout(currentThread, threadID, Memory::ReadUnchecked_U32(timeoutPtr));
+			if (__KernelWaitTimesOutAtOnce(timeoutPtr))
+				return hleLogDebug(Log::sceKernel, SCE_KERNEL_ERROR_WAIT_TIMEOUT, "timed out at once");
+			__KernelScheduleWaitTimeout(currentThread, Memory::IsValidAddress(timeoutPtr) ? timeoutPtr : 0);
 			if (std::find(t->waitingThreads.begin(), t->waitingThreads.end(), currentThread) == t->waitingThreads.end())
 				t->waitingThreads.push_back(currentThread);
 			__KernelWaitCurThread(WAITTYPE_THREADEND, threadID, 0, timeoutPtr, true, "thread wait end");
@@ -2961,6 +3221,7 @@ void PSPThread::setReturnValue(u64 retval) {
 
 void PSPThread::resumeFromWait() {
 	nt.status &= ~THREADSTATUS_WAIT;
+	waitPausedForCallback = false;
 	if (!(nt.status & (THREADSTATUS_WAITSUSPEND | THREADSTATUS_DORMANT | THREADSTATUS_DEAD)))
 		__KernelChangeReadyState(this, GetUID(), true);
 
@@ -3044,14 +3305,18 @@ void __KernelSwitchContext(PSPThread *target, const char *reason) {
 	}
 #endif
 
-	// Switching threads eats some cycles.  This is a low approximation.
+	// Switching threads eats some cycles. Between two threads it's about 5us: rotating the ready
+	// queue to an equal thread, or waking a better one and having it block again, each take
+	// 7-10us on hardware including the calls themselves (pspautotests threads/scheduling/handoff).
 	if (fromIdle && toIdle) {
 		// Don't eat any cycles going between idle.
 	} else if (fromIdle || toIdle) {
 		currentMIPS->downcount -= 1200;
 	} else {
-		currentMIPS->downcount -= 2700;
+		currentMIPS->downcount -= 1150;
 	}
+
+	__KernelUpdateBusySyscalls(target);
 
 	if (target)
 	{
@@ -3164,7 +3429,10 @@ void __KernelCallAddress(PSPThread *thread, u32 entryPoint, PSPAction *afterActi
 		if (thread->nt.waitType != WAITTYPE_NONE) {
 			// If it's a callback, tell the wait to stop.  A thread that already returned from its
 			// wait keeps a stale waitType until it's switched out, so check that it's waiting.
-			if (cbId > 0 && (thread->nt.status & THREADSTATUS_WAIT) != 0) {
+			if (cbId > 0 && (thread->nt.status & THREADSTATUS_WAIT) != 0 && thread->waitPausedForCallback) {
+				// Already paused when the callback was notified.
+				thread->waitPausedForCallback = false;
+			} else if (cbId > 0 && (thread->nt.status & THREADSTATUS_WAIT) != 0) {
 				if (waitTypeFuncs[thread->nt.waitType].beginFunc != NULL) {
 					waitTypeFuncs[thread->nt.waitType].beginFunc(after->threadID, thread->currentCallbackId);
 				} else {
@@ -3395,6 +3663,10 @@ static void __KernelRunCallbackOnThread(SceUID cbId, PSPThread *thread, bool res
 	cb->nc.notifyCount = 0;
 	cb->nc.notifyArg = 0;
 
+	// Setting up the call costs about 8us on top of the switch: 14us from a notify to a better
+	// thread's callback running on hardware (pspautotests threads/callbacks/combos).
+	currentMIPS->downcount -= 1800;
+
 	ActionAfterCallback *action = (ActionAfterCallback *) __KernelCreateAction(actionAfterCallback);
 	if (action != NULL)
 		action->setCallback(cbId);
@@ -3501,6 +3773,12 @@ bool __KernelCheckCallbacks() {
 			continue;
 		if (__KernelCheckThreadCallbacks(thread, false)) {
 			processed = true;
+		} else if (thread->waitPausedForCallback) {
+			// Its turn came, but the callbacks were canceled meanwhile: back to the wait, which
+			// may well be satisfied by now.
+			thread->waitPausedForCallback = false;
+			if (waitTypeFuncs[thread->nt.waitType].endFunc != NULL)
+				waitTypeFuncs[thread->nt.waitType].endFunc(thread->GetUID(), thread->currentCallbackId);
 		}
 	}
 
@@ -3581,12 +3859,25 @@ void __KernelNotifyCallback(SceUID cbId, int notifyArg)
 	}
 	cb->nc.notifyCount++;
 	cb->nc.notifyArg = notifyArg;
+
+	// A thread in a CB wait is taken out of the wait as soon as one of its callbacks is notified,
+	// even though the callback only runs when the thread would get to run. Whatever happens to the
+	// object in between is seen when the wait resumes after the callbacks: releasing it doesn't
+	// end the wait, and doesn't stop the callbacks running (pspautotests threads/callbacks/combos).
+	PSPThread *t = kernelObjects.Get<PSPThread>(cb->nc.threadId, error);
+	if (t && t->isWaiting() && t->isProcessingCallbacks && !t->waitPausedForCallback && t->nt.waitType != WAITTYPE_NONE) {
+		if (waitTypeFuncs[t->nt.waitType].beginFunc != NULL) {
+			waitTypeFuncs[t->nt.waitType].beginFunc(t->GetUID(), t->currentCallbackId);
+			t->waitPausedForCallback = true;
+		}
+	}
 }
 
-void __KernelRegisterWaitTypeFuncs(WaitType type, WaitBeginCallbackFunc beginFunc, WaitEndCallbackFunc endFunc)
+void __KernelRegisterWaitTypeFuncs(WaitType type, WaitBeginCallbackFunc beginFunc, WaitEndCallbackFunc endFunc, WaitTimeoutFunc timeoutFunc)
 {
 	waitTypeFuncs[type].beginFunc = beginFunc;
 	waitTypeFuncs[type].endFunc = endFunc;
+	waitTypeFuncs[type].timeoutFunc = timeoutFunc;
 }
 
 std::vector<DebugThreadInfo> GetThreadsInfo() {

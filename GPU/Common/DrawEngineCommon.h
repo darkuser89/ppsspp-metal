@@ -50,9 +50,6 @@ enum {
 	TEX_SLOT_SHADERBLEND_SRC = 1,
 	TEX_SLOT_ALPHATEST = 2,
 	TEX_SLOT_CLUT = 3,
-	TEX_SLOT_SPLINE_POINTS = 4,
-	TEX_SLOT_SPLINE_WEIGHTS_U = 5,
-	TEX_SLOT_SPLINE_WEIGHTS_V = 6,
 };
 
 enum FBOTexState {
@@ -223,6 +220,7 @@ protected:
 		numDrawVerts_ = 0;
 		numDrawInds_ = 0;
 		vertexCountInDrawCalls_ = 0;
+		expandedVertsInDrawCalls_ = 0;
 		numVertsToDecode_ = 0;
 		decodeIndsCounter_ = 0;
 		decodeVertsCounter_ = 0;
@@ -283,6 +281,10 @@ protected:
 	bool everUsedEqualDepth_ = false;
 	bool everUsedExactEqualDepth_ = false;
 
+	// The draw context's invalidation callback is installed from BeginFrame, on the emu thread. The draw
+	// engine is created on the loader thread, while the UI thread may already be rendering and calling it.
+	bool invalidationCallbackInstalled_ = false;
+
 	// Vertex collector buffers
 	u8 *decoded_ = nullptr;
 	u16 *decIndex_ = nullptr;
@@ -327,6 +329,9 @@ protected:
 	int numDrawVerts_ = 0;
 	int numDrawInds_ = 0;
 	int vertexCountInDrawCalls_ = 0;
+	// How many vertices software transform expands the queued points, lines and rectangles to (4 per
+	// point, line or rectangle). Must stay <= VERTEX_BUFFER_MAX, or the expansion drops the whole draw.
+	int expandedVertsInDrawCalls_ = 0;
 	// How many vertices DecodeVerts will produce for the queued draws. Must stay <= VERTEX_BUFFER_MAX.
 	int numVertsToDecode_ = 0;
 

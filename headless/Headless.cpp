@@ -534,6 +534,13 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
 		gpu->EndHostFrame();
 	}
 
+	// Before EndDrawFrame: Vulkan can only read back a framebuffer inside a frame.
+	if (!g_screenshotSavePath.empty() && !g_screenshotSaved) {
+		// SendDebugScreenshot ignores the descriptor and reads the display framebuffer from the GPU
+		// itself, so there's nothing to fill in here.
+		SendDebugScreenshot(DebugScreenshotDesc{});
+	}
+
 	if (draw) {
 		// Vulkan may get angry if we don't do a final present.
 		if (gpu) {
@@ -544,12 +551,6 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
 		}
 
 		EndDrawFrame(draw);
-	}
-
-	if (!g_screenshotSavePath.empty() && !g_screenshotSaved) {
-		// SendDebugScreenshot ignores the descriptor and reads the display framebuffer from the GPU
-		// itself, so there's nothing to fill in here.
-		SendDebugScreenshot(DebugScreenshotDesc{});
 	}
 
 	PSP_Shutdown(true);
@@ -922,6 +923,8 @@ int main(int argc, const char* argv[]) {
 	g_Config.bMemStickInserted = true;
 	g_Config.iMemStickSizeGB = 16;
 	g_Config.bEnableWlan = true;
+	// The net tests want WLAN on, but a test run shouldn't depend on reaching a real adhoc server.
+	g_Config.sProAdhocServer = "localhost";
 	g_Config.sMACAddress = "12:34:56:78:9A:BC";
 	g_Config.iFirmwareVersion = PSP_DEFAULT_FIRMWARE;
 	g_Config.iPSPModel = PSP_MODEL_SLIM;

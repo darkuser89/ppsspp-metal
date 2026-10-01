@@ -32,8 +32,11 @@
 
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceUtility.h"
+#include "Core/HLE/sceVideocodec.h"
 #include "Core/HLE/sceKernelMemory.h"
+#include "Core/HLE/scePower.h"
 #include "Core/HLE/sceAtrac.h"
+#include "Core/HLE/sceAudiocodec.h"
 #include "Core/HLE/AtracCtx.h"
 #include "Core/HLE/AtracCtx2.h"
 #include "Core/System.h"
@@ -81,7 +84,32 @@
 
 // TODO: We should add checks that the utility module is loaded.
 
-static const int atracDecodeDelay = 2300;
+// The Media Engine does the decoding while the caller waits. Setting data decodes the frames before
+// the first sample (thrown away), which on hardware makes it cost a decoder setup plus a frame
+// decode: ~900us for mono Atrac3, ~3.5ms for stereo Atrac3+ (pspautotests threads/scheduling/callcosts).
+static int AtracFrameUs(const AtracBase *atrac) {
+	return AudioCodecDecodeUs(atrac->CodecType(), atrac->Channels(), atrac->BytesPerFrame());
+}
+
+static int AtracSetDataDelay(const AtracBase *atrac) {
+	const int us = AudioCodecInitUs(atrac->CodecType(), atrac->Channels() == 1) + atrac->SkippedFramesOnSetData() * AtracFrameUs(atrac);
+	return MEScheduleJob(PowerScaleFromDefaultClock(us));
+}
+
+// SetData fails with API_FAIL when the first frame (decoded and thrown away during setup) doesn't
+// decode. Unlike the other errors, that comes after setting up the codec and trying the frame on
+// the ME, so the thread waits for both (audio/atrac/c0mono).
+static int AtracSetDataError(int ret, const Track &track) {
+	if (ret != SCE_ERROR_ATRAC_API_FAIL) {
+		return hleLogError(Log::Atrac, ret);
+	}
+	const int us = AudioCodecInitUs(track.codecType, track.channels == 1) + (track.codecType == PSP_CODEC_AT3PLUS ? 214 : 169);
+	return hleDelayResult(hleLogError(Log::Atrac, ret, "first frame didn't decode"), "atrac set data", MEScheduleJob(PowerScaleFromDefaultClock(us)));
+}
+
+static int AtracDecodeDelay(const AtracBase *atrac) {
+	return MEScheduleJob(PowerScaleFromDefaultClock(AtracFrameUs(atrac)));
+}
 
 static bool atracInited = true;
 static AtracBase *atracContexts[PSP_MAX_ATRAC_IDS];
@@ -94,7 +122,7 @@ static int g_atracBSS = 0;
 static bool g_muteFlag[PSP_MAX_ATRAC_IDS]{};  // Not saved, just for debugging.
 
 // On a PSP, the Media Engine does the decoding, and the samples land in the output buffer when
-// sceAtracDecodeData returns, about atracDecodeDelay later. A game can still be playing out of that
+// sceAtracDecodeData returns, a frame decode later. A game can still be playing out of that
 // memory in the meantime: Fired Up decodes into a buffer that overlaps the first 16 samples of the
 // one it has just handed to sceAudio, and relies on the mixer having read them first. So the
 // samples are written just before the thread wakes rather than when the call is made.
@@ -423,6 +451,7 @@ static u32 sceAtracDecodeData(int atracID, u32 outAddr, u32 numSamplesAddr, u32 
 	}
 
 	if (ret == 0 || ret == SCE_ERROR_ATRAC_API_FAIL) {
+		const int delay = AtracDecodeDelay(atrac);
 		const u32 written = std::min((u32)(atrac->GetOutputChannels() * 2 * numSamplesWritten), (u32)previous.size());
 		if (outPtr && written != 0) {
 			AtracPendingOutput pending{ ++g_pendingOutputId, outAddr };
@@ -430,10 +459,10 @@ static u32 sceAtracDecodeData(int atracID, u32 outAddr, u32 numSamplesAddr, u32 
 			memcpy(outPtr, previous.data(), previous.size());
 			g_pendingOutput.push_back(std::move(pending));
 			// Just ahead of the thread waking up.
-			CoreTiming::ScheduleEvent(usToCycles(atracDecodeDelay) - 1, g_atracOutputEvent, g_pendingOutputId);
+			CoreTiming::ScheduleEvent(usToCycles(delay) - 1, g_atracOutputEvent, g_pendingOutputId);
 		}
 		// Decoded or at least attempted to decode data, delay thread
-		return hleDelayResult(hleNoLog(ret), "atrac decode data", atracDecodeDelay);
+		return hleDelayResult(hleNoLog(ret), "atrac decode data", delay);
 	}
 
 	return hleNoLog(ret);
@@ -748,12 +777,11 @@ static u32 sceAtracSetHalfwayBuffer(int atracID, u32 buffer, u32 readSize, u32 b
 
 	ret = atrac->SetData(track, buffer, readSize, bufferSize, 0, 2, false);
 	if (ret < 0) {
-		// Must not delay.
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 
 	// not sure the real delay time
-	return hleDelayResult(hleLogDebug(Log::Atrac, ret), "atrac set data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, ret), "atrac set data", AtracSetDataDelay(atrac));
 }
 
 static u32 sceAtracSetSecondBuffer(int atracID, u32 secondBuffer, u32 secondBufferSize) {
@@ -784,11 +812,10 @@ static u32 sceAtracSetData(int atracID, u32 buffer, u32 bufferSize) {
 
 	ret = atrac->SetData(track, buffer, bufferSize, bufferSize, 0, 2, false);
 	if (ret < 0) {
-		// Must not delay.
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 
-	return hleDelayResult(hleLogDebug(Log::Atrac, ret), "atrac set data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, ret), "atrac set data", AtracSetDataDelay(atrac));
 }
 
 static int sceAtracSetDataAndGetID(u32 buffer, int bufferSize) {
@@ -816,10 +843,10 @@ static int sceAtracSetDataAndGetID(u32 buffer, int bufferSize) {
 	ret = atracContexts[atracID]->SetData(track, buffer, bufferSize, bufferSize, 0, 2, false);
 	if (ret < 0) {
 		UnregisterAndDeleteAtrac(atracID);
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 
-	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", AtracSetDataDelay(atracContexts[atracID]));
 }
 
 static int sceAtracSetHalfwayBufferAndGetID(u32 buffer, u32 readSize, u32 bufferSize) {
@@ -842,10 +869,10 @@ static int sceAtracSetHalfwayBufferAndGetID(u32 buffer, u32 readSize, u32 buffer
 	ret = atracContexts[atracID]->SetData(track, buffer, readSize, bufferSize, 0, 2, false);
 	if (ret < 0) {
 		UnregisterAndDeleteAtrac(atracID);
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 
-	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", AtracSetDataDelay(atracContexts[atracID]));
 }
 
 static u32 sceAtracStartEntry() {
@@ -956,10 +983,9 @@ static int sceAtracSetMOutHalfwayBuffer(int atracID, u32 buffer, u32 readSize, u
 
 	ret = atrac->SetData(track, buffer, readSize, bufferSize, 0, 1, false);
 	if (ret < 0 && ret != SCE_ERROR_ATRAC_NOT_MONO) {
-		// Must not delay.
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
-	return hleDelayResult(hleLogDebugOrError(Log::Atrac, ret), "atrac set data mono", 100);
+	return hleDelayResult(hleLogDebugOrError(Log::Atrac, ret), "atrac set data mono", AtracSetDataDelay(atrac));
 }
 
 // Note: This doesn't seem to be part of any available libatrac3plus library.
@@ -981,11 +1007,10 @@ static u32 sceAtracSetMOutData(int atracID, u32 buffer, u32 bufferSize) {
 
 	ret = atrac->SetData(track, buffer, bufferSize, bufferSize, 0, 1, false);
 	if (ret < 0 && ret != SCE_ERROR_ATRAC_NOT_MONO) {
-		// Must not delay.
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 	// It's OK if this fails, at least with NO_MONO...
-	return hleDelayResult(hleLogDebugOrError(Log::Atrac, ret), "atrac set data mono", 100);
+	return hleDelayResult(hleLogDebugOrError(Log::Atrac, ret), "atrac set data mono", AtracSetDataDelay(atrac));
 }
 
 // Note: This doesn't seem to be part of any available libatrac3plus library.
@@ -1010,9 +1035,9 @@ static int sceAtracSetMOutDataAndGetID(u32 buffer, u32 bufferSize) {
 	ret = atracContexts[atracID]->SetData(track, buffer, bufferSize, bufferSize, 0, 1, false);
 	if (ret < 0 && ret != SCE_ERROR_ATRAC_NOT_MONO) {
 		UnregisterAndDeleteAtrac(atracID);
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
-	return hleDelayResult(hleLogDebugOrError(Log::Atrac, atracID), "atrac set data", 100);
+	return hleDelayResult(hleLogDebugOrError(Log::Atrac, atracID), "atrac set data", AtracSetDataDelay(atracContexts[atracID]));
 }
 
 static int sceAtracSetMOutHalfwayBufferAndGetID(u32 buffer, u32 readSize, u32 bufferSize) {
@@ -1039,9 +1064,9 @@ static int sceAtracSetMOutHalfwayBufferAndGetID(u32 buffer, u32 readSize, u32 bu
 	ret = atracContexts[atracID]->SetData(track, buffer, readSize, bufferSize, 0, 1, false);
 	if (ret < 0 && ret != SCE_ERROR_ATRAC_NOT_MONO) {
 		UnregisterAndDeleteAtrac(atracID);
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
-	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", AtracSetDataDelay(atracContexts[atracID]));
 }
 
 static int sceAtracSetAA3DataAndGetID(u32 buffer, u32 bufferSize, u32 fileSize, u32 metadataSizeAddr) {
@@ -1060,10 +1085,10 @@ static int sceAtracSetAA3DataAndGetID(u32 buffer, u32 bufferSize, u32 fileSize, 
 	ret = atracContexts[atracID]->SetData(track, buffer, bufferSize, bufferSize, fileSize, 2, true);
 	if (ret < 0) {
 		UnregisterAndDeleteAtrac(atracID);
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 
-	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set aa3 data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set aa3 data", AtracSetDataDelay(atracContexts[atracID]));
 }
 
 static int sceAtracSetAA3HalfwayBufferAndGetID(u32 buffer, u32 readSize, u32 bufferSize, u32 fileSize) {
@@ -1086,10 +1111,10 @@ static int sceAtracSetAA3HalfwayBufferAndGetID(u32 buffer, u32 readSize, u32 buf
 	ret = atracContexts[atracID]->SetData(track, buffer, readSize, bufferSize, fileSize, 2, true);
 	if (ret < 0) {
 		UnregisterAndDeleteAtrac(atracID);
-		return hleLogError(Log::Atrac, ret);
+		return AtracSetDataError(ret, track);
 	}
 
-	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", 100);
+	return hleDelayResult(hleLogDebug(Log::Atrac, atracID), "atrac set data", AtracSetDataDelay(atracContexts[atracID]));
 }
 
 // TODO: Should see if these are stored contiguously in memory somewhere, or if there really are
@@ -1155,7 +1180,7 @@ static int sceAtracLowLevelDecode(int atracID, u32 sourceAddr, u32 sourceBytesCo
 	}
 
 	NotifyMemInfo(MemBlockFlags::WRITE, samplesAddr, bytesWritten, "AtracLowLevelDecode");
-	return hleDelayResult(hleLogDebug(Log::Atrac, retval), "low level atrac decode data", atracDecodeDelay);
+	return hleDelayResult(hleLogDebug(Log::Atrac, retval), "low level atrac decode data", AtracDecodeDelay(atrac));
 }
 
 // These three are the external interface used by sceSas' AT3 integration.
