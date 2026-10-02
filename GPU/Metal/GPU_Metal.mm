@@ -59,23 +59,6 @@ public:
 
 	u32 CheckGPUFeatures() const override {
 		u32 features = GPUCommonHW::CheckGPUFeatures();
-		// On macOS Apple GPUs, multisample fetch reads the current color for each
-		// sample. Keep the copy path for layered targets and for iOS MSAA.
-#if PPSSPP_PLATFORM(MAC)
-		const bool multisampleFetchSupported = true;
-#else
-		const bool multisampleFetchSupported = false;
-#endif
-		if ((msaaLevel_ != 0 && !multisampleFetchSupported) || g_Config.bStereoRendering) {
-			features &= ~GPU_USE_FRAMEBUFFER_FETCH;
-			// Unbuffered draws can still read the single-sample backbuffer through
-			// SnapshotBackbufferColor() when shader blending requires it.
-		}
-		if ((draw_->GetDataFormatSupport(Draw::DataFormat::R5G6B5_UNORM_PACK16) & Draw::FMT_TEXTURE) &&
-			(draw_->GetDataFormatSupport(Draw::DataFormat::R5G5B5A1_UNORM_PACK16) & Draw::FMT_TEXTURE) &&
-			(draw_->GetDataFormatSupport(Draw::DataFormat::R4G4B4A4_UNORM_PACK16) & Draw::FMT_TEXTURE)) {
-			features |= GPU_USE_16BIT_FORMATS;
-		}
 		features |= GPU_USE_FRAMEBUFFER_ARRAYS;
 		id<MTLDevice> device = (__bridge id<MTLDevice>)(void *)draw_->GetNativeObject(Draw::NativeObject::DEVICE);
 		bool layeredMSAA = msaaLevel_ == 0;
@@ -85,6 +68,25 @@ public:
 		if (g_Config.bStereoRendering && draw_->GetDeviceCaps().multiViewSupported && layeredMSAA) {
 			features |= GPU_USE_SINGLE_PASS_STEREO;
 			features |= GPU_USE_SIMPLE_STEREO_PERSPECTIVE;
+		}
+		// On macOS Apple GPUs, multisample fetch reads the current color for each
+		// sample. Layered fetch requires buffered single-pass stereo.
+#if PPSSPP_PLATFORM(MAC)
+		const bool multisampleFetchSupported = true;
+		const bool stereoFetchSupported = (features & GPU_USE_SINGLE_PASS_STEREO) != 0 && !g_Config.bSkipBufferEffects;
+#else
+		const bool multisampleFetchSupported = false;
+		const bool stereoFetchSupported = false;
+#endif
+		if ((msaaLevel_ != 0 && !multisampleFetchSupported) || (g_Config.bStereoRendering && !stereoFetchSupported)) {
+			features &= ~GPU_USE_FRAMEBUFFER_FETCH;
+			// Unbuffered draws can still read the single-sample backbuffer through
+			// SnapshotBackbufferColor() when shader blending requires it.
+		}
+		if ((draw_->GetDataFormatSupport(Draw::DataFormat::R5G6B5_UNORM_PACK16) & Draw::FMT_TEXTURE) &&
+			(draw_->GetDataFormatSupport(Draw::DataFormat::R5G5B5A1_UNORM_PACK16) & Draw::FMT_TEXTURE) &&
+			(draw_->GetDataFormatSupport(Draw::DataFormat::R4G4B4A4_UNORM_PACK16) & Draw::FMT_TEXTURE)) {
+			features |= GPU_USE_16BIT_FORMATS;
 		}
 		return CheckGPUFeaturesLate(features);
 	}
