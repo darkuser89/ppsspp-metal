@@ -109,14 +109,15 @@ bool TextureScalerMetal::Configure(Metal::RenderContext &context, const TextureS
 	return true;
 }
 
-Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, const uint32_t *pixels, int width, int height, int mipLevels, std::string *error) {
+Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::UploadSlice input, int width, int height, int mipLevels, std::string *error) {
 	error->clear();
 	const int maxDimension = Metal::MaxTextureDimension(context.Device());
-	if (!pipelineCount_ || !pixels || width <= 0 || height <= 0 || width > maxDimension / scaleFactor_ || height > maxDimension / scaleFactor_) {
+	if (!pipelineCount_ || !input || width <= 0 || height <= 0 || width > maxDimension / scaleFactor_ || height > maxDimension / scaleFactor_) {
 		*error = "Invalid Metal texture scaling input";
 		return nullptr;
 	}
-	if (!context.Commands() && !context.BeginCommands(error)) {
+	if (!context.Commands()) {
+		*error = "Metal texture scaling requires active commands";
 		return nullptr;
 	}
 	Draw::TextureDesc desc{};
@@ -135,11 +136,6 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, const u
 	// buffer, just like ordinary texture uploads, without breaking its render pass.
 	auto commands = context.InitializationCommands(error);
 	if (!commands) {
-		texture->Release();
-		return nullptr;
-	}
-	auto input = context.Upload(pixels, (size_t)width * height * sizeof(uint32_t), error);
-	if (!input) {
 		texture->Release();
 		return nullptr;
 	}
@@ -507,13 +503,23 @@ void TextureCacheMetal::BuildTexture(TexCacheEntry *entry) {
 		decodePlan.scaleFactor = 1;
 		const int width = (entry->status & TexStatus::PSP_SIZE_CLIPPED) ? std::min(gstate.getTextureWidth(plan.baseLevelSrc), 512) : gstate.getTextureWidth(plan.baseLevelSrc);
 		const int height = (entry->status & TexStatus::PSP_SIZE_CLIPPED) ? std::min(gstate.getTextureHeight(plan.baseLevelSrc), 512) : gstate.getTextureHeight(plan.baseLevelSrc);
-		std::vector<uint32_t> pixels((size_t)width * height);
-		LoadTextureLevel(*entry, (uint8_t *)pixels.data(), pixels.size() * sizeof(uint32_t), width * 4,
-			decodePlan, plan.baseLevelSrc, Draw::DataFormat::R8G8B8A8_UNORM, TexDecodeFlags{});
 		std::string error;
 		const int levels = std::min(plan.levelsToCreate, plan.maxPossibleLevels);
 		ReleaseTexture(entry, true);
-		auto texture = textureScaler_.Scale(manager_->Context(), pixels.data(), width, height, levels, &error);
+		auto &context = manager_->Context();
+		Metal::Texture *texture = nullptr;
+		if (width > 0 && height > 0 && (context.Commands() || context.BeginCommands(&error))) {
+			const size_t uploadBytes = (size_t)width * height * sizeof(uint32_t);
+			auto input = context.ReserveUpload(uploadBytes, &error);
+			if (input) {
+				uint8_t *pixels = (uint8_t *)input.buffer.contents + input.offset;
+				LoadTextureLevel(*entry, pixels, uploadBytes, width * 4,
+					decodePlan, plan.baseLevelSrc, Draw::DataFormat::R8G8B8A8_UNORM, TexDecodeFlags{});
+				texture = textureScaler_.Scale(context, input, width, height, levels, &error);
+			}
+		} else if (error.empty()) {
+			error = "Invalid Metal texture scaling size";
+		}
 		if (texture) {
 			entry->texturePtr = texture;
 			entry->status &= ~TexStatus::IS_3D;

@@ -14,7 +14,7 @@ namespace Metal { class Texture; }
 class TextureScalerMetal {
 public:
 	bool Configure(Metal::RenderContext &context, const TextureShaderInfo &info, std::string *error);
-	Metal::Texture *Scale(Metal::RenderContext &context, const uint32_t *pixels, int width, int height, int mipLevels, std::string *error);
+	Metal::Texture *Scale(Metal::RenderContext &context, Metal::UploadSlice input, int width, int height, int mipLevels, std::string *error);
 	void Clear() { pipelines_.fill(nil); pipelineCount_ = 0; constants_ = nil; scaleFactor_ = 0; }
 	int ScaleFactor() const { return scaleFactor_; }
 
