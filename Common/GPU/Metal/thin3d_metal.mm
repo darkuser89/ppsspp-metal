@@ -78,6 +78,7 @@ struct MetalPipeline final : Pipeline {
 struct MetalDelayedReadback {
 	id<MTLTexture> source = nil;
 	id<MTLBuffer> ready = nil;
+	// Retains reusable storage when pendingCommands is nil.
 	id<MTLBuffer> pending = nil;
 	id<MTLCommandBuffer> pendingCommands = nil;
 	size_t pitch = 0;
@@ -1009,11 +1010,9 @@ bool MetalDrawContext::ReadbackDelayedColor(id<MTLTexture> source, int x, int y,
 	readback.lastUse = ++delayedReadbackUse_;
 	if (readback.pendingCommands) {
 		if (readback.pendingCommands.status == MTLCommandBufferStatusCompleted) {
-			readback.ready = readback.pending;
-			readback.pending = nil;
+			std::swap(readback.ready, readback.pending);
 			readback.pendingCommands = nil;
 		} else if (readback.pendingCommands.status == MTLCommandBufferStatusError) {
-			readback.pending = nil;
 			readback.pendingCommands = nil;
 		}
 	}
@@ -1023,7 +1022,10 @@ bool MetalDrawContext::ReadbackDelayedColor(id<MTLTexture> source, int x, int y,
 			*error = "Failed to prepare delayed Metal readback";
 			return false;
 		}
-		id<MTLBuffer> buffer = [context_.Device() newBufferWithLength:pitch * h options:MTLResourceStorageModeShared];
+		id<MTLBuffer> buffer = readback.pending;
+		if (!buffer) {
+			buffer = [context_.Device() newBufferWithLength:pitch * h options:MTLResourceStorageModeShared];
+		}
 		if (!buffer) {
 			*error = "Failed to allocate delayed Metal readback buffer";
 			return false;

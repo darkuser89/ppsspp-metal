@@ -655,6 +655,27 @@ bool TestMetalDelayedReadback() {
 		!check("New blue", 0xFFFF0000)) {
 		return false;
 	}
+	draw->Wait();
+	uint32_t previousColor = 0xFFFF0000;
+	for (uint32_t color : {0xFF123456u, 0xFFABCDEFu, 0xFF987654u, 0xFF102030u}) {
+		draw->Clear(Draw::Aspect::COLOR_BIT, color, 1.0f, 0);
+		for (int repeat = 0; repeat < 2; ++repeat) {
+			pixels.fill(untouched);
+			if (!draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::COLOR_BIT, 0, 0, 4, 2,
+				Draw::DataFormat::R8G8B8A8_UNORM, pixels.data(), 6, Draw::ReadbackMode::OLD_DATA_OK, "Pending color") ||
+				!check("Pending color", previousColor)) {
+				return false;
+			}
+		}
+		draw->Wait();
+		previousColor = color;
+	}
+	pixels.fill(untouched);
+	if (!draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::COLOR_BIT, 0, 0, 4, 2,
+		Draw::DataFormat::R8G8B8A8_UNORM, pixels.data(), 6, Draw::ReadbackMode::OLD_DATA_OK, "Final color") ||
+		!check("Final color", previousColor)) {
+		return false;
+	}
 	std::unique_ptr<Draw::DrawContext> bounded(Draw::T3DCreateMetalContext(&error));
 	if (!bounded) {
 		printf("Metal bounded readback context failed: %s\n", error.c_str());
