@@ -5,6 +5,7 @@
 
 #include <array>
 #include <map>
+#include <vector>
 
 #include "Common/GPU/Metal/MetalRenderContext.h"
 #include "Common/GPU/thin3d.h"
@@ -19,14 +20,21 @@ bool SupportsDepthStencilResolve(id<MTLDevice> device);
 
 class Buffer final : public Draw::Buffer {
 public:
-	static Buffer *Create(id<MTLDevice> device, size_t size);
-	// Rename on every write so encoded commands retain their bytes. Preserve
-	// untouched bytes only when the update does not discard old contents.
+	static Buffer *Create(id<MTLDevice> device, size_t size, uint32_t usage);
 	bool Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size, Draw::UpdateBufferFlags flags);
-	id<MTLBuffer> Native() const { return buffer_; }
+	// Each changed dynamic version gets a separate upload slice so encoded
+	// draws keep their original bytes until the command buffer completes.
+	UploadSlice Snapshot(RenderContext &context, std::string *error);
+	size_t Size() const { return dynamic_ ? data_.size() : buffer_.length; }
+	const uint8_t *Data() const { return dynamic_ ? data_.data() : (const uint8_t *)buffer_.contents; }
 
 private:
+	bool dynamic_ = false;
 	id<MTLBuffer> buffer_ = nil;
+	std::vector<uint8_t> data_;
+	UploadSlice snapshot_;
+	uint64_t snapshotGeneration_ = 0;
+	bool dirty_ = true;
 };
 
 class Texture final : public Draw::Texture {

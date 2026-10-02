@@ -150,7 +150,7 @@ bool SupportsDepthStencilResolve(id<MTLDevice> device) {
 	return [device supportsFamily:MTLGPUFamilyApple5] || [device supportsFamily:MTLGPUFamilyMac2];
 }
 
-Buffer *Buffer::Create(id<MTLDevice> device, size_t size) {
+Buffer *Buffer::Create(id<MTLDevice> device, size_t size, uint32_t usage) {
 	if (!size) {
 		return nullptr;
 	}
@@ -161,32 +161,59 @@ Buffer *Buffer::Create(id<MTLDevice> device, size_t size) {
 	} else {
 		return nullptr;
 	}
-	id<MTLBuffer> native = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
-	if (!native) {
-		return nullptr;
-	}
 	auto buffer = new Buffer();
-	buffer->buffer_ = native;
+	buffer->dynamic_ = (usage & Draw::BufferUsageFlag::DYNAMIC) != 0;
+	if (buffer->dynamic_) {
+		buffer->data_.resize(size);
+	} else {
+		buffer->buffer_ = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+		if (!buffer->buffer_) {
+			buffer->Release();
+			return nullptr;
+		}
+	}
 	return buffer;
 }
 
 bool Buffer::Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size, Draw::UpdateBufferFlags flags) {
-	if (offset > buffer_.length || size > buffer_.length - offset || (size && !data)) {
+	const size_t length = Size();
+	if (offset > length || size > length - offset || (size && !data)) {
 		return false;
 	}
 	if (!size) {
 		return true;
 	}
-	id<MTLBuffer> replacement = [device newBufferWithLength:buffer_.length options:MTLResourceStorageModeShared];
-	if (!replacement) {
-		return false;
+	if (dynamic_) {
+		memcpy(data_.data() + offset, data, size);
+		dirty_ = true;
+	} else {
+		id<MTLBuffer> replacement = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+		if (!replacement) {
+			return false;
+		}
+		if (!(flags & Draw::UPDATE_DISCARD)) {
+			memcpy(replacement.contents, buffer_.contents, length);
+		}
+		memcpy((uint8_t *)replacement.contents + offset, data, size);
+		buffer_ = replacement;
 	}
-	if (!(flags & Draw::UPDATE_DISCARD)) {
-		memcpy(replacement.contents, buffer_.contents, buffer_.length);
-	}
-	memcpy((uint8_t *)replacement.contents + offset, data, size);
-	buffer_ = replacement;
 	return true;
+}
+
+UploadSlice Buffer::Snapshot(RenderContext &context, std::string *error) {
+	if (!dynamic_) {
+		return {buffer_, 0};
+	}
+	if (!dirty_ && snapshot_ && snapshotGeneration_ == context.CommandGeneration()) {
+		return snapshot_;
+	}
+	auto upload = context.Upload(data_.data(), data_.size(), error);
+	if (upload) {
+		snapshot_ = upload;
+		snapshotGeneration_ = context.CommandGeneration();
+		dirty_ = false;
+	}
+	return upload;
 }
 
 static bool EnsureCommands(RenderContext &context, std::string *error) {

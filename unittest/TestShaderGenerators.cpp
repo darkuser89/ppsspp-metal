@@ -762,7 +762,7 @@ bool TestMetalTriangleFan() {
 	const std::array<std::array<float, 2>, 5> indexedQuad{{{2.0f, 2.0f},
 		{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.8f, 0.8f}, {-0.8f, 0.8f}}};
 	const std::array<uint16_t, 4> indices{{1, 2, 3, 4}};
-	Draw::AutoRef<Draw::Buffer> quadBuffer(draw->CreateBuffer(sizeof(quad), 0));
+	Draw::AutoRef<Draw::Buffer> quadBuffer(draw->CreateBuffer(sizeof(quad), Draw::BufferUsageFlag::DYNAMIC));
 	Draw::AutoRef<Draw::Buffer> indexedQuadBuffer(draw->CreateBuffer(sizeof(indexedQuad), 0));
 	Draw::AutoRef<Draw::Buffer> indexBuffer(draw->CreateBuffer(sizeof(indices), 0));
 	if (!quadBuffer || !indexedQuadBuffer || !indexBuffer) {
@@ -806,6 +806,26 @@ bool TestMetalTriangleFan() {
 				pixels[0], pixels[2 * 8 + 5], pixels[5 * 8 + 2]);
 			return false;
 		}
+	}
+	// Updating a bound buffer must not change a draw already encoded in this pass.
+	const std::array<std::array<float, 2>, 4> left{{{-0.8f, -0.8f}, {-0.2f, -0.8f},
+		{-0.2f, 0.8f}, {-0.8f, 0.8f}}};
+	const std::array<std::array<float, 2>, 4> right{{{0.2f, -0.8f}, {0.8f, -0.8f},
+		{0.8f, 0.8f}, {0.2f, 0.8f}}};
+	draw->BindFramebufferAsRenderTarget(framebuffer.ptr,
+		{Draw::RPAction::CLEAR, Draw::RPAction::KEEP, Draw::RPAction::KEEP, 0xFFFF0000, 1.0f, 0,
+			"Metal buffer snapshot clear"}, "Metal buffer snapshot clear");
+	draw->BindVertexBuffer(quadBuffer.ptr, 0);
+	draw->UpdateBuffer(quadBuffer.ptr, (const uint8_t *)left.data(), 0, sizeof(left), Draw::UPDATE_DISCARD);
+	draw->Draw((int)left.size(), 0);
+	draw->UpdateBuffer(quadBuffer.ptr, (const uint8_t *)right.data(), 0, sizeof(right), Draw::UPDATE_DISCARD);
+	draw->Draw((int)right.size(), 0);
+	if (!draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::COLOR_BIT, 0, 0, 8, 8,
+		Draw::DataFormat::R8G8B8A8_UNORM, pixels.data(), 8, Draw::ReadbackMode::BLOCK, "Metal buffer snapshot readback") ||
+		pixels[3 * 8 + 1] != 0xFF0000FF || pixels[3 * 8 + 6] != 0xFF0000FF || pixels[3 * 8 + 3] != 0xFFFF0000) {
+		printf("Metal buffer snapshot pixels: %08x %08x %08x\n",
+			pixels[3 * 8 + 1], pixels[3 * 8 + 6], pixels[3 * 8 + 3]);
+		return false;
 	}
 	return true;
 }

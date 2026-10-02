@@ -115,7 +115,7 @@ public:
 	InputLayout *CreateInputLayout(const InputLayoutDesc &desc) override;
 	ShaderModule *CreateShaderModule(ShaderStage stage, ShaderLanguage language, const uint8_t *data, size_t size, const char *tag) override;
 	Pipeline *CreateGraphicsPipeline(const PipelineDesc &desc, const char *tag) override;
-	Buffer *CreateBuffer(size_t size, uint32_t usage) override { return Metal::Buffer::Create(context_.Device(), size); }
+	Buffer *CreateBuffer(size_t size, uint32_t usage) override { return Metal::Buffer::Create(context_.Device(), size, usage); }
 	Texture *CreateTexture(const TextureDesc &desc) override;
 	Framebuffer *CreateFramebuffer(const FramebufferDesc &desc) override;
 	void UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) override;
@@ -1506,16 +1506,25 @@ void MetalDrawContext::Draw(int count, int offset) {
 	if (count <= 0 || offset < 0 || vertexOffset_ < 0 || !pipeline_) {
 		return;
 	}
-	id<MTLBuffer> vertices = vertex_ ? vertex_->Native() : nil;
-	if (pipeline_->stride && (!vertices || (uint64_t)vertexOffset_ + ((uint64_t)offset + count) * pipeline_->stride > vertices.length)) {
+	if (pipeline_->stride && (!vertex_ || (uint64_t)vertexOffset_ + ((uint64_t)offset + count) * pipeline_->stride > vertex_->Size())) {
 		Error("Metal draw exceeds vertex buffer");
 		return;
 	}
-	if (pipeline_->fan) {
-		DrawFan(vertices, vertexOffset_, nullptr, count, offset);
+	if (!Commands()) {
 		return;
 	}
-	if (Apply(vertices, vertexOffset_)) {
+	std::string error;
+	auto vertices = vertex_ ? vertex_->Snapshot(context_, &error) : Metal::UploadSlice{};
+	if (vertex_ && !vertices) {
+		Error(error);
+		return;
+	}
+	const size_t vertexOffset = vertices.offset + (size_t)vertexOffset_;
+	if (pipeline_->fan) {
+		DrawFan(vertices.buffer, vertexOffset, nullptr, count, offset);
+		return;
+	}
+	if (Apply(vertices.buffer, vertexOffset)) {
 		[encoder_ drawPrimitives:pipeline_->primitive vertexStart:offset vertexCount:count instanceCount:InstanceCount()];
 	}
 }
@@ -1524,22 +1533,37 @@ void MetalDrawContext::DrawIndexed(int count, int offset) {
 	if (count <= 0 || offset < 0 || indexOffset_ < 0 || vertexOffset_ < 0 || !index_ || !pipeline_) {
 		return;
 	}
-	id<MTLBuffer> indices = index_->Native();
 	const size_t start = (size_t)indexOffset_ + (size_t)offset * 2;
-	if ((start & 1) || start > indices.length || (size_t)count > (indices.length - start) / 2) {
+	if ((start & 1) || start > index_->Size() || (size_t)count > (index_->Size() - start) / 2) {
 		Error("Metal draw exceeds index buffer");
 		return;
 	}
+	if (!Commands()) {
+		return;
+	}
+	std::string error;
+	auto vertices = vertex_ ? vertex_->Snapshot(context_, &error) : Metal::UploadSlice{};
+	if (vertex_ && !vertices) {
+		Error(error);
+		return;
+	}
+	const size_t vertexOffset = vertices.offset + (size_t)vertexOffset_;
 	if (pipeline_->fan) {
-		if (!indices.contents) {
+		if (!index_->Data()) {
 			Error("Metal triangle fan indices are not CPU-readable");
 			return;
 		}
-		DrawFan(vertex_ ? vertex_->Native() : nil, vertexOffset_, (const uint16_t *)((const uint8_t *)indices.contents + start), count, 0);
+		DrawFan(vertices.buffer, vertexOffset, (const uint16_t *)(index_->Data() + start), count, 0);
 		return;
 	}
-	if (Apply(vertex_ ? vertex_->Native() : nil, vertexOffset_)) {
-		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:count indexType:MTLIndexTypeUInt16 indexBuffer:indices indexBufferOffset:start instanceCount:InstanceCount()];
+	auto indices = index_->Snapshot(context_, &error);
+	if (!indices) {
+		Error(error);
+		return;
+	}
+	if (Apply(vertices.buffer, vertexOffset)) {
+		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:count indexType:MTLIndexTypeUInt16
+			indexBuffer:indices.buffer indexBufferOffset:indices.offset + start instanceCount:InstanceCount()];
 	}
 }
 
