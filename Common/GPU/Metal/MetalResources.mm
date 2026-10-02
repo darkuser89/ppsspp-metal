@@ -256,19 +256,23 @@ Texture *Texture::Create(RenderContext &context, const Draw::TextureDesc &desc, 
 		native.label = [NSString stringWithUTF8String:desc.tag];
 	}
 	// Callbacks can generate data without an initData pointer.
-	std::vector<const uint8_t *> data = desc.initData;
-	if (data.empty() && desc.initDataCallback) {
-		data.resize(desc.generateMips ? 1 : desc.mipLevels, nullptr);
+	std::vector<const uint8_t *> generatedData;
+	const uint8_t *const *data = desc.initData.data();
+	size_t dataSize = desc.initData.size();
+	if (!dataSize && desc.initDataCallback) {
+		generatedData.resize(desc.generateMips ? 1 : desc.mipLevels, nullptr);
+		data = generatedData.data();
+		dataSize = generatedData.size();
 	}
-	if ((!data.empty() && !texture->Upload(context, data.data(), desc.initDataCallback, (int)data.size(), true, error)) ||
-		(desc.generateMips && data.empty())) {
+	if ((dataSize && !texture->Upload(context, data, desc.initDataCallback, (int)dataSize, true, error)) ||
+		(desc.generateMips && !dataSize)) {
 		if (error->empty()) {
 			*error = "Mipmap generation needs initialized base data";
 		}
 		texture->Release();
 		return nullptr;
 	}
-	if (desc.generateMips && data.size() < (size_t)desc.mipLevels) {
+	if (desc.generateMips && dataSize < (size_t)desc.mipLevels) {
 		if (!EnsureCommands(context, error)) {
 			texture->Release();
 			return nullptr;
@@ -281,8 +285,8 @@ Texture *Texture::Create(RenderContext &context, const Draw::TextureDesc &desc, 
 		// A view beginning at the last supplied mip preserves every explicit level.
 		// Mipmap generation sees that level as its base and fills only the rest.
 		id<MTLTexture> mipTarget = native;
-		if (data.size() > 1) {
-			const NSUInteger baseLevel = data.size() - 1;
+		if (dataSize > 1) {
+			const NSUInteger baseLevel = dataSize - 1;
 			mipTarget = [native newTextureViewWithPixelFormat:native.pixelFormat textureType:native.textureType
 				levels:NSMakeRange(baseLevel, desc.mipLevels - baseLevel) slices:NSMakeRange(0, 1)];
 			if (!mipTarget) {
@@ -378,7 +382,7 @@ id<MTLTexture> Texture::ArrayView() const {
 	return arrayView_;
 }
 
-bool Texture::Upload(RenderContext &context, const uint8_t **data, Draw::TextureCallback callback, int levels,
+bool Texture::Upload(RenderContext &context, const uint8_t *const *data, Draw::TextureCallback callback, int levels,
 	bool initialize, std::string *error) {
 	error->clear();
 	if (levels < 0 || (size_t)levels > texture_.mipmapLevelCount || (levels && !data)) {
@@ -393,7 +397,7 @@ bool Texture::Upload(RenderContext &context, const uint8_t **data, Draw::Texture
 	}
 	// Prepare the complete upload first, before changing the texture or opening an encoder.
 	// The submission slot retains these bytes through both initialization and render commands.
-	std::vector<UploadSlice> staging;
+	std::vector<UploadSlice> staging(levels);
 	int blockSize = 0;
 	const bool compressed = Draw::DataFormatIsBlockCompressed(format_, &blockSize);
 	for (int level = 0; level < levels; ++level) {
@@ -431,7 +435,7 @@ bool Texture::Upload(RenderContext &context, const uint8_t **data, Draw::Texture
 				}
 			}
 		}
-		staging.push_back(upload);
+		staging[level] = upload;
 	}
 	id<MTLBlitCommandEncoder> blit = initialize ? context.InitializationBlitEncoder(error) : [context.Commands() blitCommandEncoder];
 	if (!blit) {

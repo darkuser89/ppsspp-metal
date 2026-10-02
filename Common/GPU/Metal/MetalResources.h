@@ -38,7 +38,7 @@ public:
 	id<MTLTexture> ArrayView() const;
 
 private:
-	bool Upload(RenderContext &context, const uint8_t **data, Draw::TextureCallback callback, int levels,
+	bool Upload(RenderContext &context, const uint8_t *const *data, Draw::TextureCallback callback, int levels,
 		bool initialize, std::string *error);
 	id<MTLTexture> texture_ = nil;
 	mutable id<MTLTexture> arrayView_ = nil;
