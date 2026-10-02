@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+
+#include "Common/Log.h"
 
 namespace Metal {
 
@@ -43,6 +46,14 @@ bool RenderContext::Init(std::string *error, size_t inflightFrames) {
 		device_ = device;
 		queue_ = queue;
 		inflightFrames_ = inflightFrames;
+		if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+			for (id<MTLCounterSet> set in device.counterSets) {
+				if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+					timestampCounterSet_ = set;
+					break;
+				}
+			}
+		}
 		return true;
 	}
 	*error = "Metal 3 requires macOS 13 or iOS 16 or later";
@@ -93,10 +104,68 @@ bool RenderContext::WaitForSubmission(size_t slot, std::string *error) {
 		}
 		lastCompletedSerial_ = submittedSerial_[slot];
 	}
+	if (success && !submittedProfilePasses_[slot].empty()) {
+		const size_t count = submittedProfilePasses_[slot].size() * 4;
+		NSData *data = [profileBuffers_[slot] resolveCounterRange:NSMakeRange(0, count)];
+		if (data.length >= count * sizeof(MTLCounterResultTimestamp)) {
+			const auto *results = (const MTLCounterResultTimestamp *)data.bytes;
+			std::string summary = "Metal render passes (last completed submission)\n";
+			char line[192];
+			for (size_t i = 0; i < submittedProfilePasses_[slot].size(); ++i) {
+				const uint64_t vertexStart = results[i * 4].timestamp;
+				const uint64_t vertexEnd = results[i * 4 + 1].timestamp;
+				const uint64_t fragmentStart = results[i * 4 + 2].timestamp;
+				const uint64_t fragmentEnd = results[i * 4 + 3].timestamp;
+				if (vertexStart == MTLCounterErrorValue || vertexEnd == MTLCounterErrorValue ||
+					fragmentStart == MTLCounterErrorValue || fragmentEnd == MTLCounterErrorValue ||
+					vertexEnd < vertexStart || fragmentEnd < fragmentStart || fragmentEnd < vertexStart) {
+					continue;
+				}
+				snprintf(line, sizeof(line), "%s: %.3f ms (vertex %.3f, fragment %.3f)\n",
+					submittedProfilePasses_[slot][i].tag.c_str(), (fragmentEnd - vertexStart) * 1e-6,
+					(vertexEnd - vertexStart) * 1e-6, (fragmentEnd - fragmentStart) * 1e-6);
+				summary += line;
+			}
+			gpuProfileString_ = std::move(summary);
+			if (submittedProfileLog_[slot]) {
+				INFO_LOG(Log::G3D, "%s", gpuProfileString_.c_str());
+			}
+		} else {
+			gpuProfileString_ = "Metal GPU counter results unavailable";
+		}
+	}
 	submitted_[slot] = nil;
 	submittedInitializations_[slot] = nil;
 	submittedSerial_[slot] = 0;
+	submittedProfilePasses_[slot].clear();
+	submittedProfileLog_[slot] = false;
 	return success;
+}
+
+void RenderContext::ProfileRenderPass(MTLRenderPassDescriptor *pass, const char *tag) {
+	if (!profilingEnabled_ || !timestampCounterSet_ || !commands_ || profilePasses_.size() >= MAX_PROFILE_PASSES) {
+		return;
+	}
+	const size_t slot = nextSubmission_;
+	if (!profileBuffers_[slot]) {
+		MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+		desc.counterSet = timestampCounterSet_;
+		desc.storageMode = MTLStorageModeShared;
+		desc.sampleCount = MAX_PROFILE_PASSES * 4;
+		profileBuffers_[slot] = [device_ newCounterSampleBufferWithDescriptor:desc error:nil];
+		if (!profileBuffers_[slot]) {
+			gpuProfileString_ = "Metal GPU timestamp counters unavailable";
+			return;
+		}
+	}
+	const size_t index = profilePasses_.size() * 4;
+	auto attachment = pass.sampleBufferAttachments[0];
+	attachment.sampleBuffer = profileBuffers_[slot];
+	attachment.startOfVertexSampleIndex = index;
+	attachment.endOfVertexSampleIndex = index + 1;
+	attachment.startOfFragmentSampleIndex = index + 2;
+	attachment.endOfFragmentSampleIndex = index + 3;
+	profilePasses_.push_back({tag ? tag : "Render pass"});
 }
 
 id<MTLCommandBuffer> RenderContext::InitializationCommands(std::string *error) {
@@ -255,6 +324,9 @@ bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 	submitted_[slot] = submitted;
 	submittedInitializations_[slot] = initializationCommands_;
 	submittedSerial_[slot] = ++nextSubmissionSerial_;
+	submittedProfilePasses_[slot] = std::move(profilePasses_);
+	submittedProfileLog_[slot] = profileLogEnabled_;
+	profilePasses_.clear();
 	initializationCommands_ = nil;
 	nextSubmission_ = (nextSubmission_ + 1) % inflightFrames_;
 	return !wait || WaitForSubmission(slot, error);

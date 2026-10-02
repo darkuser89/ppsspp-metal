@@ -35,6 +35,9 @@ public:
 	bool Init(std::string *error, size_t inflightFrames);
 	bool BeginCommands(std::string *error);
 	void SetBeginCommandsCallback(std::function<void()> callback) { beginCommandsCallback_ = std::move(callback); }
+	void SetProfilingEnabled(bool enabled, bool log) { profilingEnabled_ = enabled; profileLogEnabled_ = log; }
+	void ProfileRenderPass(MTLRenderPassDescriptor *pass, const char *tag);
+	const std::string &GPUProfileString() const { return gpuProfileString_; }
 	// All encoders must have ended before submission. BLOCK readbacks submit with
 	// wait=true and start a fresh command buffer before resuming rendering.
 	bool SubmitCommands(bool wait, std::string *error);
@@ -77,6 +80,18 @@ private:
 	std::array<id<MTLCommandBuffer>, 3> submitted_{};
 	std::array<id<MTLCommandBuffer>, 3> submittedInitializations_{};
 	std::array<uint64_t, 3> submittedSerial_{};
+	struct ProfilePass {
+		std::string tag;
+	};
+	static constexpr size_t MAX_PROFILE_PASSES = 128;
+	id<MTLCounterSet> timestampCounterSet_ = nil;
+	std::array<id<MTLCounterSampleBuffer>, 3> profileBuffers_{};
+	std::array<std::vector<ProfilePass>, 3> submittedProfilePasses_;
+	std::array<bool, 3> submittedProfileLog_{};
+	std::vector<ProfilePass> profilePasses_;
+	std::string gpuProfileString_;
+	bool profilingEnabled_ = false;
+	bool profileLogEnabled_ = false;
 	struct UploadBlock {
 		id<MTLBuffer> buffer = nil;
 		size_t used = 0;

@@ -148,6 +148,7 @@ public:
 	void DrawIndexedUP(const void *data, int count, const void *indices, int indexCount) override;
 	void DrawIndexedClippedBatchUP(const void *data, int count, const void *indices, int indexCount, Slice<ClippedDraw> draws, const void *uniforms, size_t size) override;
 	void BeginFrame(DebugFlags flags) override;
+	std::string GetGpuProfileString() const override { return context_.GPUProfileString(); }
 	void EndFrame() override { EndPass(); Invalidate(InvalidationFlags::CACHED_RENDER_STATE); }
 	void Present(PresentMode mode) override;
 	PresentMode GetCurrentPresentMode() const override { return presentMode_; }
@@ -820,6 +821,7 @@ void MetalDrawContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const Ren
 	EndPass();
 	BindRef(target_, Resolve(fbo));
 	pass_ = rp;
+	pass_.tag = tag;
 	discardStoreAspects_ = Aspect::NO_BIT;
 	RequestPipeline();
 	// Execute a clear even when this pass has no draws or is immediately rebound.
@@ -855,6 +857,7 @@ bool MetalDrawContext::BeginPass() {
 		rp.stencilAttachment.loadAction = actions[(size_t)pass_.stencil];
 		rp.stencilAttachment.clearStencil = pass_.clearStencil;
 	}
+	context_.ProfileRenderPass(rp, pass_.tag);
 	encoder_ = [context_.Commands() renderCommandEncoderWithDescriptor:rp];
 	if (!encoder_) {
 		Error("Failed to begin Metal render pass");
@@ -1639,6 +1642,8 @@ void MetalDrawContext::DrawIndexedClippedBatchUP(const void *data, int count, co
 
 void MetalDrawContext::BeginFrame(DebugFlags flags) {
 	Present(presentMode_);
+	const bool profileLog = flags & DebugFlags::PROFILE_SCOPES;
+	context_.SetProfilingEnabled(profileLog || (flags & DebugFlags::PROFILE_TIMESTAMPS), profileLog);
 	attemptedDrawable_ = false;
 	passCount_ = 0;
 	++frameCount_;
