@@ -65,7 +65,7 @@ void DrawEngineMetal::Invalidate(InvalidationCallbackFlags flags) {
 	gstate_c.Dirty(DIRTY_ALL_RENDER_STATE | DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
 }
 
-bool DrawEngineMetal::ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state, ViewportAndScissor *viewport, std::string *error) {
+bool DrawEngineMetal::ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state, std::string *error) {
 	pipelineState_ = {};
 	if (!gstate.isModeClear()) {
 		pipelineState_.Convert(draw_->GetShaderLanguageDesc().bitwiseOps, gstate_c.Use(GPU_USE_SHADER_BLENDING));
@@ -113,9 +113,6 @@ bool DrawEngineMetal::ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state
 	if (!gstate.isModeClear() && !IsDepthTestEffectivelyDisabled()) {
 		UpdateEverUsedEqualDepth(gstate.getDepthTestFunction());
 	}
-	ConvertViewportAndScissor(framebufferManager_->GetDisplayLayoutConfigCopy(), framebufferManager_->UseBufferedRendering(),
-		framebufferManager_->GetRenderWidth(), framebufferManager_->GetRenderHeight(),
-		framebufferManager_->GetTargetBufferWidth(), framebufferManager_->GetTargetBufferHeight(), *viewport);
 	return true;
 }
 
@@ -225,17 +222,20 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	if (count <= 0 || vertexCount <= 0) {
 		return true;
 	}
-	MetalDrawState state;
 	ViewportAndScissor viewport;
-	if (!ApplyDrawState(prim, &state, &viewport, error)) {
-		return false;
-	}
+	ConvertViewportAndScissor(framebufferManager_->GetDisplayLayoutConfigCopy(), framebufferManager_->UseBufferedRendering(),
+		framebufferManager_->GetRenderWidth(), framebufferManager_->GetRenderHeight(),
+		framebufferManager_->GetTargetBufferWidth(), framebufferManager_->GetTargetBufferHeight(), viewport);
 	int x = std::max(0, viewport.scissorX);
 	int y = std::max(0, viewport.scissorY);
 	int w = std::min(framebufferManager_->GetRenderWidth(), viewport.scissorX + std::max(0, viewport.scissorW)) - x;
 	int h = std::min(framebufferManager_->GetRenderHeight(), viewport.scissorY + std::max(0, viewport.scissorH)) - y;
 	if (w <= 0 || h <= 0 || viewport.viewportW <= 0 || viewport.viewportH <= 0) {
 		return true;
+	}
+	MetalDrawState state;
+	if (!ApplyDrawState(prim, &state, error)) {
+		return false;
 	}
 	const MetalGEVertexShader *vs;
 	const MetalGEFragmentShader *fs;

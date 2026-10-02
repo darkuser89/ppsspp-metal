@@ -44,7 +44,7 @@ private:
 		uint32_t blendColor = 0;
 	};
 	bool FlushDraw(std::string *error);
-	bool ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state, ViewportAndScissor *viewport, std::string *error);
+	bool ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state, std::string *error);
 	void Invalidate(InvalidationCallbackFlags flags);
 	Draw::DrawContext *draw_ = nullptr;
 	Metal::RenderManager *manager_ = nullptr;
