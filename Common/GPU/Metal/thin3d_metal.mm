@@ -724,7 +724,7 @@ Framebuffer *MetalDrawContext::CreateFramebuffer(const FramebufferDesc &desc) {
 }
 
 void MetalDrawContext::UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) {
-	if (!buffer || !static_cast<Metal::Buffer *>(buffer)->Update(context_.Device(), data, offset, size)) {
+	if (!buffer || !static_cast<Metal::Buffer *>(buffer)->Update(context_.Device(), data, offset, size, flags)) {
 		Error("Metal buffer update failed or exceeded allocation");
 	}
 }

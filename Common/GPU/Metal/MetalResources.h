@@ -20,9 +20,9 @@ bool SupportsDepthStencilResolve(id<MTLDevice> device);
 class Buffer final : public Draw::Buffer {
 public:
 	static Buffer *Create(id<MTLDevice> device, size_t size);
-	// Rename on every write so commands already encoded against the old buffer
-	// continue to see their original bytes, including partial updates.
-	bool Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size);
+	// Rename on every write so encoded commands retain their bytes. Preserve
+	// untouched bytes only when the update does not discard old contents.
+	bool Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size, Draw::UpdateBufferFlags flags);
 	id<MTLBuffer> Native() const { return buffer_; }
 
 private:

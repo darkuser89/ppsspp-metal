@@ -170,7 +170,7 @@ Buffer *Buffer::Create(id<MTLDevice> device, size_t size) {
 	return buffer;
 }
 
-bool Buffer::Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size) {
+bool Buffer::Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size, Draw::UpdateBufferFlags flags) {
 	if (offset > buffer_.length || size > buffer_.length - offset || (size && !data)) {
 		return false;
 	}
@@ -181,7 +181,9 @@ bool Buffer::Update(id<MTLDevice> device, const uint8_t *data, size_t offset, si
 	if (!replacement) {
 		return false;
 	}
-	memcpy(replacement.contents, buffer_.contents, buffer_.length);
+	if (!(flags & Draw::UPDATE_DISCARD)) {
+		memcpy(replacement.contents, buffer_.contents, buffer_.length);
+	}
 	memcpy((uint8_t *)replacement.contents + offset, data, size);
 	buffer_ = replacement;
 	return true;
