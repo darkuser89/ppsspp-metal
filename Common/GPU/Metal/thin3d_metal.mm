@@ -1624,9 +1624,12 @@ void MetalDrawContext::BeginFrame(DebugFlags flags) {
 void MetalDrawContext::Present(PresentMode mode) {
 	EndPass();
 #if PPSSPP_PLATFORM(MAC)
-	presentMode_ = mode == PresentMode::IMMEDIATE ? PresentMode::IMMEDIATE : PresentMode::FIFO;
-	if (layer_) {
-		layer_.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
+	const PresentMode nextMode = mode == PresentMode::IMMEDIATE ? PresentMode::IMMEDIATE : PresentMode::FIFO;
+	if (presentMode_ != nextMode) {
+		presentMode_ = nextMode;
+		if (layer_) {
+			layer_.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
+		}
 	}
 #endif
 	std::string error;
