@@ -324,7 +324,7 @@ Texture *Texture::Create(RenderContext &context, const Draw::TextureDesc &desc, 
 				return nullptr;
 			}
 		}
-		id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+		id<MTLBlitCommandEncoder> blit = context.BlitEncoder(commands, "Mipmap generation");
 		if (!blit) {
 			*error = "Failed to encode Metal mipmap generation";
 			texture->Release();
@@ -384,7 +384,7 @@ bool Texture::UpdateRegions(RenderContext &context, int level, const Draw::Textu
 		}
 		pending.push_back({upload, pitch});
 	}
-	id<MTLBlitCommandEncoder> blit = [context.Commands() blitCommandEncoder];
+	id<MTLBlitCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Texture region update");
 	if (!blit) {
 		*error = "Failed to start Metal texture update";
 		return false;
@@ -466,7 +466,7 @@ bool Texture::Upload(RenderContext &context, const uint8_t *const *data, Draw::T
 		}
 		staging[level] = upload;
 	}
-	id<MTLBlitCommandEncoder> blit = initialize ? context.InitializationBlitEncoder(error) : [context.Commands() blitCommandEncoder];
+	id<MTLBlitCommandEncoder> blit = initialize ? context.InitializationBlitEncoder(error) : context.BlitEncoder(context.Commands(), "Texture upload");
 	if (!blit) {
 		if (error->empty()) {
 			*error = "Failed to encode Metal texture upload";
@@ -722,7 +722,7 @@ bool CopyImage(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
 			return false;
 		}
 	}
-	id<MTLBlitCommandEncoder> blit = [context.Commands() blitCommandEncoder];
+	id<MTLBlitCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Image copy");
 	if (!blit) {
 		*error = "Failed to encode Metal image copy";
 		return false;
@@ -770,7 +770,7 @@ bool CopyDepthStencil(RenderContext &context, id<MTLTexture> src, int srcX, int 
 		}
 		return false;
 	}
-	id<MTLBlitCommandEncoder> blit = [context.Commands() blitCommandEncoder];
+	id<MTLBlitCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Depth/stencil copy");
 	if (!blit) {
 		*error = "Failed to encode Metal depth/stencil copy";
 		return false;
@@ -1038,7 +1038,7 @@ bool Readback(RenderContext &context, id<MTLTexture> texture, Draw::Aspect aspec
 		}
 		return false;
 	}
-	id<MTLBlitCommandEncoder> blit = [context.Commands() blitCommandEncoder];
+	id<MTLBlitCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Framebuffer readback");
 	if (!blit) {
 		*error = "Failed to encode Metal readback";
 		return false;

@@ -1033,7 +1033,7 @@ bool MetalDrawContext::ReadbackDelayedColor(id<MTLTexture> source, int x, int y,
 			*error = "Failed to allocate delayed Metal readback buffer";
 			return false;
 		}
-		id<MTLBlitCommandEncoder> blit = [context_.Commands() blitCommandEncoder];
+		id<MTLBlitCommandEncoder> blit = context_.BlitEncoder(context_.Commands(), "Delayed framebuffer readback");
 		if (!blit) {
 			*error = "Failed to encode delayed Metal readback";
 			return false;

@@ -105,24 +105,35 @@ bool RenderContext::WaitForSubmission(size_t slot, std::string *error) {
 		lastCompletedSerial_ = submittedSerial_[slot];
 	}
 	if (success && !submittedProfilePasses_[slot].empty()) {
-		const size_t count = submittedProfilePasses_[slot].size() * 4;
+		const size_t count = submittedProfileSamplesUsed_[slot];
 		NSData *data = [profileBuffers_[slot] resolveCounterRange:NSMakeRange(0, count)];
 		if (data.length >= count * sizeof(MTLCounterResultTimestamp)) {
 			const auto *results = (const MTLCounterResultTimestamp *)data.bytes;
-			std::string summary = "Metal render passes (last completed submission)\n";
+			std::string summary = "Metal GPU passes (last completed submission)\n";
 			char line[192];
-			for (size_t i = 0; i < submittedProfilePasses_[slot].size(); ++i) {
-				const uint64_t vertexStart = results[i * 4].timestamp;
-				const uint64_t vertexEnd = results[i * 4 + 1].timestamp;
-				const uint64_t fragmentStart = results[i * 4 + 2].timestamp;
-				const uint64_t fragmentEnd = results[i * 4 + 3].timestamp;
+			for (const auto &pass : submittedProfilePasses_[slot]) {
+				const size_t index = pass.firstSample;
+				const uint64_t start = results[index].timestamp;
+				const uint64_t end = results[index + (pass.kind == ProfileKind::RENDER ? 3 : 1)].timestamp;
+				if (start == MTLCounterErrorValue || end == MTLCounterErrorValue || end < start) {
+					continue;
+				}
+				if (pass.kind != ProfileKind::RENDER) {
+					snprintf(line, sizeof(line), "%s: %.3f ms\n", pass.tag.c_str(), (end - start) * 1e-6);
+					summary += line;
+					continue;
+				}
+				const uint64_t vertexStart = start;
+				const uint64_t vertexEnd = results[index + 1].timestamp;
+				const uint64_t fragmentStart = results[index + 2].timestamp;
+				const uint64_t fragmentEnd = end;
 				if (vertexStart == MTLCounterErrorValue || vertexEnd == MTLCounterErrorValue ||
 					fragmentStart == MTLCounterErrorValue || fragmentEnd == MTLCounterErrorValue ||
 					vertexEnd < vertexStart || fragmentEnd < fragmentStart || fragmentEnd < vertexStart) {
 					continue;
 				}
 				snprintf(line, sizeof(line), "%s: %.3f ms (vertex %.3f, fragment %.3f)\n",
-					submittedProfilePasses_[slot][i].tag.c_str(), (fragmentEnd - vertexStart) * 1e-6,
+					pass.tag.c_str(), (fragmentEnd - vertexStart) * 1e-6,
 					(vertexEnd - vertexStart) * 1e-6, (fragmentEnd - fragmentStart) * 1e-6);
 				summary += line;
 			}
@@ -138,34 +149,70 @@ bool RenderContext::WaitForSubmission(size_t slot, std::string *error) {
 	submittedInitializations_[slot] = nil;
 	submittedSerial_[slot] = 0;
 	submittedProfilePasses_[slot].clear();
+	submittedProfileSamplesUsed_[slot] = 0;
 	submittedProfileLog_[slot] = false;
 	return success;
 }
 
-void RenderContext::ProfileRenderPass(MTLRenderPassDescriptor *pass, const char *tag) {
-	if (!profilingEnabled_ || !timestampCounterSet_ || !commands_ || profilePasses_.size() >= MAX_PROFILE_PASSES) {
-		return;
+NSUInteger RenderContext::ReserveProfileSamples(size_t count, const char *tag, ProfileKind kind) {
+	if (!profilingEnabled_ || !timestampCounterSet_ || !commands_ || profileSamplesUsed_ + count > MAX_PROFILE_SAMPLES) {
+		return NSNotFound;
 	}
 	const size_t slot = nextSubmission_;
 	if (!profileBuffers_[slot]) {
 		MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
 		desc.counterSet = timestampCounterSet_;
 		desc.storageMode = MTLStorageModeShared;
-		desc.sampleCount = MAX_PROFILE_PASSES * 4;
+		desc.sampleCount = MAX_PROFILE_SAMPLES;
 		profileBuffers_[slot] = [device_ newCounterSampleBufferWithDescriptor:desc error:nil];
 		if (!profileBuffers_[slot]) {
 			gpuProfileString_ = "Metal GPU timestamp counters unavailable";
-			return;
+			return NSNotFound;
 		}
 	}
-	const size_t index = profilePasses_.size() * 4;
+	const NSUInteger index = profileSamplesUsed_;
+	profileSamplesUsed_ += count;
+	profilePasses_.push_back({tag ? tag : "GPU pass", index, kind});
+	return index;
+}
+
+void RenderContext::ProfileRenderPass(MTLRenderPassDescriptor *pass, const char *tag) {
+	const NSUInteger index = ReserveProfileSamples(4, tag, ProfileKind::RENDER);
+	if (index == NSNotFound) {
+		return;
+	}
 	auto attachment = pass.sampleBufferAttachments[0];
-	attachment.sampleBuffer = profileBuffers_[slot];
+	attachment.sampleBuffer = profileBuffers_[nextSubmission_];
 	attachment.startOfVertexSampleIndex = index;
 	attachment.endOfVertexSampleIndex = index + 1;
 	attachment.startOfFragmentSampleIndex = index + 2;
 	attachment.endOfFragmentSampleIndex = index + 3;
-	profilePasses_.push_back({tag ? tag : "Render pass"});
+}
+
+id<MTLBlitCommandEncoder> RenderContext::BlitEncoder(id<MTLCommandBuffer> commands, const char *tag) {
+	const NSUInteger index = ReserveProfileSamples(2, tag, ProfileKind::BLIT);
+	if (index == NSNotFound) {
+		return [commands blitCommandEncoder];
+	}
+	MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];
+	auto attachment = pass.sampleBufferAttachments[0];
+	attachment.sampleBuffer = profileBuffers_[nextSubmission_];
+	attachment.startOfEncoderSampleIndex = index;
+	attachment.endOfEncoderSampleIndex = index + 1;
+	return [commands blitCommandEncoderWithDescriptor:pass];
+}
+
+id<MTLComputeCommandEncoder> RenderContext::ComputeEncoder(id<MTLCommandBuffer> commands, const char *tag) {
+	const NSUInteger index = ReserveProfileSamples(2, tag, ProfileKind::COMPUTE);
+	if (index == NSNotFound) {
+		return [commands computeCommandEncoder];
+	}
+	MTLComputePassDescriptor *pass = [MTLComputePassDescriptor computePassDescriptor];
+	auto attachment = pass.sampleBufferAttachments[0];
+	attachment.sampleBuffer = profileBuffers_[nextSubmission_];
+	attachment.startOfEncoderSampleIndex = index;
+	attachment.endOfEncoderSampleIndex = index + 1;
+	return [commands computeCommandEncoderWithDescriptor:pass];
 }
 
 id<MTLCommandBuffer> RenderContext::InitializationCommands(std::string *error) {
@@ -199,7 +246,7 @@ id<MTLBlitCommandEncoder> RenderContext::InitializationBlitEncoder(std::string *
 		if (!commands) {
 			return nil;
 		}
-		initializationBlitEncoder_ = [commands blitCommandEncoder];
+		initializationBlitEncoder_ = BlitEncoder(commands, "Texture initialization blit");
 		if (!initializationBlitEncoder_) {
 			*error = "Failed to encode Metal texture initialization";
 		}
@@ -325,8 +372,10 @@ bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 	submittedInitializations_[slot] = initializationCommands_;
 	submittedSerial_[slot] = ++nextSubmissionSerial_;
 	submittedProfilePasses_[slot] = std::move(profilePasses_);
+	submittedProfileSamplesUsed_[slot] = profileSamplesUsed_;
 	submittedProfileLog_[slot] = profileLogEnabled_;
 	profilePasses_.clear();
+	profileSamplesUsed_ = 0;
 	initializationCommands_ = nil;
 	nextSubmission_ = (nextSubmission_ + 1) % inflightFrames_;
 	return !wait || WaitForSubmission(slot, error);

@@ -140,7 +140,7 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		return nullptr;
 	}
 	if (pipelineCount_ == 1) {
-		auto encoder = [commands computeCommandEncoder];
+		auto encoder = context.ComputeEncoder(commands, "Texture scaling");
 		if (!encoder) {
 			*error = "Failed to create Metal texture scaling encoder";
 			texture->Release();
@@ -199,7 +199,7 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		}
 		// A serial compute encoder orders these dispatches and makes each
 		// scratch texture available to the following stage.
-		auto pass = [commands computeCommandEncoder];
+		auto pass = context.ComputeEncoder(commands, "Multistage texture scaling");
 		if (!pass) {
 			*error = "Failed to create Metal texture scaling pass";
 			texture->Release();
@@ -231,7 +231,7 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		[pass endEncoding];
 	}
 	if (mipLevels > 1) {
-		auto blit = [commands blitCommandEncoder];
+		auto blit = context.BlitEncoder(commands, "Scaled texture mipmaps");
 		if (!blit) {
 			*error = "Failed to encode Metal texture scaling mipmaps";
 			texture->Release();

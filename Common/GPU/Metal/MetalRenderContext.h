@@ -37,6 +37,8 @@ public:
 	void SetBeginCommandsCallback(std::function<void()> callback) { beginCommandsCallback_ = std::move(callback); }
 	void SetProfilingEnabled(bool enabled, bool log) { profilingEnabled_ = enabled; profileLogEnabled_ = log; }
 	void ProfileRenderPass(MTLRenderPassDescriptor *pass, const char *tag);
+	id<MTLBlitCommandEncoder> BlitEncoder(id<MTLCommandBuffer> commands, const char *tag);
+	id<MTLComputeCommandEncoder> ComputeEncoder(id<MTLCommandBuffer> commands, const char *tag);
 	const std::string &GPUProfileString() const { return gpuProfileString_; }
 	// All encoders must have ended before submission. BLOCK readbacks submit with
 	// wait=true and start a fresh command buffer before resuming rendering.
@@ -71,6 +73,8 @@ private:
 	static bool WaitForCommands(id<MTLCommandBuffer> commands, std::string *error);
 	bool WaitForSubmission(size_t slot, std::string *error);
 	void EndInitializationBlit();
+	enum class ProfileKind { RENDER, BLIT, COMPUTE };
+	NSUInteger ReserveProfileSamples(size_t count, const char *tag, ProfileKind kind);
 
 	id<MTLDevice> device_ = nil;
 	id<MTLCommandQueue> queue_ = nil;
@@ -82,13 +86,17 @@ private:
 	std::array<uint64_t, 3> submittedSerial_{};
 	struct ProfilePass {
 		std::string tag;
+		NSUInteger firstSample = 0;
+		ProfileKind kind = ProfileKind::RENDER;
 	};
-	static constexpr size_t MAX_PROFILE_PASSES = 128;
+	static constexpr size_t MAX_PROFILE_SAMPLES = 512;
 	id<MTLCounterSet> timestampCounterSet_ = nil;
 	std::array<id<MTLCounterSampleBuffer>, 3> profileBuffers_{};
 	std::array<std::vector<ProfilePass>, 3> submittedProfilePasses_;
+	std::array<size_t, 3> submittedProfileSamplesUsed_{};
 	std::array<bool, 3> submittedProfileLog_{};
 	std::vector<ProfilePass> profilePasses_;
+	size_t profileSamplesUsed_ = 0;
 	std::string gpuProfileString_;
 	bool profilingEnabled_ = false;
 	bool profileLogEnabled_ = false;
