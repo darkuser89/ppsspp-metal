@@ -360,31 +360,43 @@ bool ShaderManagerMetal::UpdateUniforms(bool useBufferedRendering, bool pixelMap
 	if (!uniformOptionsValid_ || buffered_ != useBufferedRendering || pixelMapped_ != pixelMapped) {
 		dirty |= DIRTY_FRAMEBUFFER_DIM | DIRTY_PROJMATRIX | DIRTY_DEPAL;
 	}
-	UB_VS_FS_Base base = base_;
-	UB_VS_Lights lights = lights_;
+	const bool updateBase = (dirty & METAL_BASE_UNIFORMS) || samplerLodBiasDirty_;
+	const bool updateLights = (dirty & DIRTY_LIGHT_UNIFORMS) != 0;
+	UB_VS_FS_Base updatedBase;
+	UB_VS_Lights updatedLights;
+	const UB_VS_FS_Base *base = &base_;
+	const UB_VS_Lights *lights = &lights_;
 	MetalGEUniformBuffers next = buffers_;
-	if ((dirty & METAL_BASE_UNIFORMS) || samplerLodBiasDirty_) {
-		BaseUpdateUniforms(&base, dirty, useBufferedRendering, pixelMapped);
-		base.samplerLodBias = samplerLodBias_;
+	if (updateBase) {
+		updatedBase = base_;
+		BaseUpdateUniforms(&updatedBase, dirty, useBufferedRendering, pixelMapped);
+		updatedBase.samplerLodBias = samplerLodBias_;
+		base = &updatedBase;
 	}
-	if (newCommands || (dirty & METAL_BASE_UNIFORMS) || samplerLodBiasDirty_) {
-		next.base = context.Upload(&base, sizeof(base), error);
+	if (newCommands || updateBase) {
+		next.base = context.Upload(base, sizeof(*base), error);
 		if (!next.base) {
 			return false;
 		}
 	}
-	if (dirty & DIRTY_LIGHT_UNIFORMS) {
-		LightUpdateUniforms(&lights, dirty);
+	if (updateLights) {
+		updatedLights = lights_;
+		LightUpdateUniforms(&updatedLights, dirty);
+		lights = &updatedLights;
 	}
-	if (newCommands || (dirty & DIRTY_LIGHT_UNIFORMS)) {
-		next.lights = context.Upload(&lights, sizeof(lights), error);
+	if (newCommands || updateLights) {
+		next.lights = context.Upload(lights, sizeof(*lights), error);
 		if (!next.lights) {
 			return false;
 		}
 	}
 	next.commandGeneration = context.CommandGeneration();
-	base_ = base;
-	lights_ = lights;
+	if (updateBase) {
+		base_ = updatedBase;
+	}
+	if (updateLights) {
+		lights_ = updatedLights;
+	}
 	buffers_ = next;
 	buffered_ = useBufferedRendering;
 	pixelMapped_ = pixelMapped;
