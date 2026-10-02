@@ -1642,7 +1642,7 @@ void MetalDrawContext::DrawIndexedClippedBatchUP(const void *data, int count, co
 
 void MetalDrawContext::BeginFrame(DebugFlags flags) {
 	Present(presentMode_);
-	const bool profileLog = flags & DebugFlags::PROFILE_SCOPES;
+	const bool profileLog = (flags & DebugFlags::PROFILE_SCOPES) || g_Config.bGpuLogProfiler;
 	context_.SetProfilingEnabled(profileLog || (flags & DebugFlags::PROFILE_TIMESTAMPS), profileLog);
 	attemptedDrawable_ = false;
 	passCount_ = 0;
