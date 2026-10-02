@@ -131,10 +131,12 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		lastClipInfoFlags_ = clipInfoFlags_;
 		lastUseHwTransform_ = hardware;
 	}
-	DecodeVerts(dec_, decoded_);
-	int count, maxIndex;
-	bool indexed;
-	DecodeIndsAndGetData(&prim, &count, &maxIndex, &indexed, !hardware);
+	// Skinning may have partially decoded vertices already. The software and
+	// depth-raster paths also need the decoded vertices on the CPU.
+	const bool directDecode = hardware && !dec_->skinInDecode && !useDepthRaster_ && ComputeNumVertsToDecode() > 0;
+	if (!directDecode) {
+		DecodeVerts(dec_, decoded_);
+	}
 	const bool hasColor = (lastVType_ & GE_VTYPE_COL_MASK) != GE_VTYPE_COL_NONE;
 	if (gstate.isModeThrough()) {
 		gstate_c.vertexFullAlpha &= hasColor || gstate.getMaterialAmbientA() == 255;
@@ -154,8 +156,43 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		// A framebuffer clear may have changed texture memory without changing the texture registers.
 		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE);
 	}
+	Metal::UploadSlice decodedUpload;
+	uint64_t decodedUploadGeneration = 0;
+	size_t decodedIndexOffset = 0;
+	int count, maxIndex;
+	bool indexed;
+	if (directDecode) {
+		// The index generator needs vertex offsets, not the decoded bytes. Work
+		// them out first so vertices and indices fit in a single upload slice.
+		int decodedCount = 0;
+		for (int i = 0; i < numDrawVerts_; ++i) {
+			const DeferredVerts &draw = drawVerts_[i];
+			drawVertexOffsets_[i] = decodedCount - draw.indexLowerBound;
+			decodedCount += draw.indexUpperBound - draw.indexLowerBound + 1;
+		}
+		numDecodedVerts_ = decodedCount;
+		DecodeIndsAndGetData(&prim, &count, &maxIndex, &indexed, false);
+		numDecodedVerts_ = 0;
+		auto &context = manager_->Context();
+		const size_t vertexBytes = (size_t)decodedCount * dec_->GetDecVtxFmt().stride;
+		decodedIndexOffset = (vertexBytes + sizeof(uint16_t) - 1) & ~(sizeof(uint16_t) - 1);
+		const size_t uploadBytes = indexed ? decodedIndexOffset + (size_t)count * sizeof(uint16_t) : vertexBytes;
+		decodedUpload = context.ReserveUpload(uploadBytes, error);
+		if (!decodedUpload) {
+			return false;
+		}
+		DecodeVerts(dec_, (uint8_t *)decodedUpload.buffer.contents + decodedUpload.offset);
+		_dbg_assert_(numDecodedVerts_ == decodedCount);
+		if (indexed) {
+			memcpy((uint8_t *)decodedUpload.buffer.contents + decodedUpload.offset + decodedIndexOffset,
+				decIndex_, (size_t)count * sizeof(uint16_t));
+		}
+		decodedUploadGeneration = context.CommandGeneration();
+	} else {
+		DecodeIndsAndGetData(&prim, &count, &maxIndex, &indexed, !hardware);
+	}
 	uint16_t *indices = decIndex_;
-	const void *vertices = decoded_;
+	const void *vertices = directDecode ? (const uint8_t *)decodedUpload.buffer.contents + decodedUpload.offset : decoded_;
 	int vertexCount = numDecodedVerts_;
 	SoftwareTransformResult transformed{};
 	SoftwareTransformAction action = SW_DRAW_INDEXED;
@@ -268,7 +305,34 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	const size_t vertexBytes = (size_t)vertexCount * stride;
 	Metal::UploadSlice vb;
 	Metal::UploadSlice ib;
-	if (indexed) {
+	if (directDecode) {
+		vb = decodedUpload;
+		if (indexed) {
+			ib = {vb.buffer, vb.offset + decodedIndexOffset};
+		}
+		if (decodedUploadGeneration != context.CommandGeneration()) {
+			// An intervening readback can recycle the old ring slot. Decode again
+			// from the queued PSP vertices instead of reading that old slot.
+			const size_t uploadBytes = indexed ? decodedIndexOffset + (size_t)count * sizeof(uint16_t) : vertexBytes;
+			vb = context.ReserveUpload(uploadBytes, error);
+			if (vb) {
+				auto *dest = (uint8_t *)vb.buffer.contents + vb.offset;
+				int decodedCount = 0;
+				for (int i = 0; i < numDrawVerts_; ++i) {
+					const DeferredVerts &draw = drawVerts_[i];
+					const int numVerts = draw.indexUpperBound - draw.indexLowerBound + 1;
+					const auto *source = (const uint8_t *)draw.verts + draw.indexLowerBound * dec_->VertexSize();
+					dec_->DecodeVerts(dest + decodedCount * stride, source, &draw.uvScale, numVerts);
+					decodedCount += numVerts;
+				}
+				_dbg_assert_(decodedCount == vertexCount);
+				if (indexed) {
+					memcpy(dest + decodedIndexOffset, indices, (size_t)count * sizeof(uint16_t));
+					ib = {vb.buffer, vb.offset + decodedIndexOffset};
+				}
+			}
+		}
+	} else if (indexed) {
 		const size_t indexOffset = (vertexBytes + sizeof(uint16_t) - 1) & ~(sizeof(uint16_t) - 1);
 		vb = context.ReserveUpload(indexOffset + (size_t)count * sizeof(uint16_t), error);
 		if (vb) {
@@ -279,7 +343,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	} else {
 		vb = context.Upload(vertices, vertexBytes, error);
 	}
-	if (!vb) {
+	if (!vb || (indexed && !ib)) {
 		return false;
 	}
 	if (!pipeline || shaderGeneration != shaderManager_->CacheGeneration()) {
