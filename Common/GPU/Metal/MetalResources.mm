@@ -672,10 +672,12 @@ bool CopyImage(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
 	if (!EnsureCommands(context, error)) {
 		return false;
 	}
-	// Metal does not permit overlapping copies within one texture. Snapshot the
-	// region first; this also makes framebuffer feedback copies deterministic.
+	// Metal permits disjoint copies within one texture. Overlapping regions
+	// need a snapshot so the source stays unchanged throughout the copy.
 	id<MTLTexture> temporary = nil;
-	if (RootTexture(src) == RootTexture(dst)) {
+	const bool overlap = srcX < dstX + width && dstX < srcX + width &&
+		srcY < dstY + height && dstY < srcY + height;
+	if (overlap && RootTexture(src) == RootTexture(dst)) {
 		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:width height:height mipmapped:NO];
 		td.textureType = src.textureType;
 		td.arrayLength = src.arrayLength;
