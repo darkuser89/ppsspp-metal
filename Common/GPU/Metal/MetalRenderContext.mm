@@ -11,6 +11,7 @@ namespace Metal {
 RenderContext::~RenderContext() {
 	// An unsubmitted buffer has no GPU work to drain. The owner must end its
 	// encoders before destroying the context, even on initialization failure.
+	EndInitializationBlit();
 	commands_ = nil;
 	initializationCommands_ = nil;
 	std::string error;
@@ -112,7 +113,29 @@ id<MTLCommandBuffer> RenderContext::InitializationCommands(std::string *error) {
 		}
 		initializationCommands_.label = @"PPSSPP resource initialization";
 	}
+	EndInitializationBlit();
 	return initializationCommands_;
+}
+
+void RenderContext::EndInitializationBlit() {
+	if (initializationBlitEncoder_) {
+		[initializationBlitEncoder_ endEncoding];
+		initializationBlitEncoder_ = nil;
+	}
+}
+
+id<MTLBlitCommandEncoder> RenderContext::InitializationBlitEncoder(std::string *error) {
+	if (!initializationBlitEncoder_) {
+		auto commands = InitializationCommands(error);
+		if (!commands) {
+			return nil;
+		}
+		initializationBlitEncoder_ = [commands blitCommandEncoder];
+		if (!initializationBlitEncoder_) {
+			*error = "Failed to encode Metal texture initialization";
+		}
+	}
+	return initializationBlitEncoder_;
 }
 
 bool RenderContext::BeginCommands(std::string *error) {
@@ -199,6 +222,7 @@ bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 		*error = "No active Metal command buffer to submit";
 		return false;
 	}
+	EndInitializationBlit();
 	id<MTLCommandBuffer> submitted = commands_;
 	commands_ = nil;
 	// The same queue preserves commit order. Initializations target only new

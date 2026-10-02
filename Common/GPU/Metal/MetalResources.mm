@@ -433,13 +433,11 @@ bool Texture::Upload(RenderContext &context, const uint8_t **data, Draw::Texture
 		}
 		staging.push_back(upload);
 	}
-	auto commands = initialize ? context.InitializationCommands(error) : context.Commands();
-	if (!commands) {
-		return false;
-	}
-	id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+	id<MTLBlitCommandEncoder> blit = initialize ? context.InitializationBlitEncoder(error) : [context.Commands() blitCommandEncoder];
 	if (!blit) {
-		*error = "Failed to encode Metal texture upload";
+		if (error->empty()) {
+			*error = "Failed to encode Metal texture upload";
+		}
 		return false;
 	}
 	for (int level = 0; level < levels; ++level) {
@@ -451,7 +449,9 @@ bool Texture::Upload(RenderContext &context, const uint8_t **data, Draw::Texture
 		[blit copyFromBuffer:staging[level].buffer sourceOffset:staging[level].offset sourceBytesPerRow:pitch sourceBytesPerImage:pitch * rows
 			sourceSize:MTLSizeMake(w, h, std::max(1, depth_ >> level)) toTexture:texture_ destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(0, 0, 0)];
 	}
-	[blit endEncoding];
+	if (!initialize) {
+		[blit endEncoding];
+	}
 	return true;
 }
 

@@ -41,8 +41,11 @@ public:
 	bool WaitUntilIdle(std::string *error);
 	// Only initialize newly allocated resources here. These commands run before
 	// the active render buffer, allowing uploads without interrupting its pass.
+	// Ends a pending texture-upload blit before another initialization encoder.
 	// Updates to resources already referenced by a draw must use Commands().
 	id<MTLCommandBuffer> InitializationCommands(std::string *error);
+	// Consecutive texture uploads share one initialization encoder.
+	id<MTLBlitCommandEncoder> InitializationBlitEncoder(std::string *error);
 	// Transient data for the current command buffer. Encode its consumers before
 	// submitting; cached slices are valid only for the same CommandGeneration().
 	UploadSlice ReserveUpload(size_t size, std::string *error);
@@ -60,11 +63,13 @@ public:
 private:
 	static bool WaitForCommands(id<MTLCommandBuffer> commands, std::string *error);
 	bool WaitForSubmission(size_t slot, std::string *error);
+	void EndInitializationBlit();
 
 	id<MTLDevice> device_ = nil;
 	id<MTLCommandQueue> queue_ = nil;
 	id<MTLCommandBuffer> commands_ = nil;
 	id<MTLCommandBuffer> initializationCommands_ = nil;
+	id<MTLBlitCommandEncoder> initializationBlitEncoder_ = nil;
 	std::array<id<MTLCommandBuffer>, 3> submitted_{};
 	std::array<id<MTLCommandBuffer>, 3> submittedInitializations_{};
 	std::array<uint64_t, 3> submittedSerial_{};
