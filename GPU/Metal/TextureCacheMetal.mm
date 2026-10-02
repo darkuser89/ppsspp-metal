@@ -201,6 +201,14 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, const u
 				return nullptr;
 			}
 		}
+		// A serial compute encoder orders these dispatches and makes each
+		// scratch texture available to the following stage.
+		auto pass = [commands computeCommandEncoder];
+		if (!pass) {
+			*error = "Failed to create Metal texture scaling pass";
+			texture->Release();
+			return nullptr;
+		}
 		for (int i = 0; i < stageCount; ++i) {
 			const StageDesc &stage = stages[i];
 			id<MTLTexture> output = stage.outputScratch < 0 ? texture->Native() : scratch[stage.outputScratch]->Native();
@@ -211,13 +219,6 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, const u
 				stage.useFinalOutputSize ? desc.width : width * stage.dstWidthScale,
 				stage.useFinalOutputSize ? desc.height : height * stage.dstHeightScale,
 			};
-			// Each encoder completes before the next reads its tracked scratch texture.
-			auto pass = [commands computeCommandEncoder];
-			if (!pass) {
-				*error = "Failed to create Metal texture scaling pass";
-				texture->Release();
-				return nullptr;
-			}
 			[pass setComputePipelineState:pipelines_[stage.shaderIndex]];
 			[pass setTexture:output atIndex:0];
 			if (stage.inputScratch < 0) {
@@ -230,8 +231,8 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, const u
 				[pass setBuffer:constants_ offset:0 atIndex:4];
 			}
 			[pass dispatchThreadgroups:MTLSizeMake((params[2] + 7) / 8, (params[3] + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-			[pass endEncoding];
 		}
+		[pass endEncoding];
 	}
 	if (mipLevels > 1) {
 		auto blit = [commands blitCommandEncoder];
