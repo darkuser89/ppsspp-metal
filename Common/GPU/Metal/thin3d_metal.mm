@@ -1482,19 +1482,19 @@ void MetalDrawContext::DrawFan(id<MTLBuffer> vertices, size_t vertexOffset, cons
 		Error("Metal triangle fan exceeds the index buffer limit");
 		return;
 	}
-	std::vector<uint32_t> fan(indexCount);
+	std::string error;
+	auto uploaded = context_.ReserveUpload(indexCount * sizeof(uint32_t), &error);
+	if (!uploaded) {
+		Error(error);
+		return;
+	}
+	uint32_t *fan = (uint32_t *)((uint8_t *)uploaded.buffer.contents + uploaded.offset);
 	const uint32_t center = indices ? indices[0] : (uint32_t)firstVertex;
 	for (int i = 1; i < count - 1; ++i) {
 		const size_t out = (size_t)(i - 1) * 3;
 		fan[out] = center;
 		fan[out + 1] = indices ? indices[i] : (uint32_t)firstVertex + (uint32_t)i;
 		fan[out + 2] = indices ? indices[i + 1] : (uint32_t)firstVertex + (uint32_t)i + 1;
-	}
-	std::string error;
-	auto uploaded = context_.Upload(fan.data(), fan.size() * sizeof(uint32_t), &error);
-	if (!uploaded) {
-		Error(error);
-		return;
 	}
 	if (Apply(vertices, vertexOffset)) {
 		[encoder_ drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt32
