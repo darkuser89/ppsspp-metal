@@ -1031,7 +1031,7 @@ bool Readback(RenderContext &context, id<MTLTexture> texture, Draw::Aspect aspec
 		return false;
 	}
 	const size_t pitch = (width * bytesPerPixel + 255) & ~size_t(255);
-	id<MTLBuffer> readback = [context.Device() newBufferWithLength:pitch * height options:MTLResourceStorageModeShared];
+	id<MTLBuffer> readback = context.AcquireReadbackBuffer(pitch * height);
 	if (!readback || !EnsureCommands(context, error)) {
 		if (error->empty()) {
 			*error = "Failed to allocate Metal readback buffer";
@@ -1081,6 +1081,7 @@ bool Readback(RenderContext &context, id<MTLTexture> texture, Draw::Aspect aspec
 			memcpy((uint8_t *)pixels + row * pixelStride * bytesPerPixel, (uint8_t *)readback.contents + row * pitch, width * bytesPerPixel);
 		}
 	}
+	context.RecycleReadbackBuffer(readback);
 	return true;
 }
 

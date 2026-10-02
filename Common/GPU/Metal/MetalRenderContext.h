@@ -50,6 +50,10 @@ public:
 	// submitting; cached slices are valid only for the same CommandGeneration().
 	UploadSlice ReserveUpload(size_t size, std::string *error);
 	UploadSlice Upload(const void *data, size_t size, std::string *error);
+	// Only recycle after a blocking readback has completed and its contents
+	// have been copied. A failed submission must not return its buffer here.
+	id<MTLBuffer> AcquireReadbackBuffer(size_t size);
+	void RecycleReadbackBuffer(id<MTLBuffer> buffer);
 
 	id<MTLDevice> Device() const { return device_; }
 	id<MTLCommandBuffer> Commands() const { return commands_; }
@@ -78,6 +82,7 @@ private:
 		size_t used = 0;
 	};
 	std::array<std::vector<UploadBlock>, 3> uploadBlocks_;
+	id<MTLBuffer> readbackBuffer_ = nil;
 	size_t currentUploadBlock_ = 0;
 	size_t nextSubmission_ = 0;
 	size_t inflightFrames_ = 2;

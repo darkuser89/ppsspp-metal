@@ -216,6 +216,26 @@ UploadSlice RenderContext::Upload(const void *data, size_t size, std::string *er
 	return slice;
 }
 
+id<MTLBuffer> RenderContext::AcquireReadbackBuffer(size_t size) {
+	if (!device_ || !size || size > device_.maxBufferLength) {
+		return nil;
+	}
+	if (readbackBuffer_ && readbackBuffer_.length >= size) {
+		id<MTLBuffer> buffer = readbackBuffer_;
+		readbackBuffer_ = nil;
+		return buffer;
+	}
+	return [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
+}
+
+void RenderContext::RecycleReadbackBuffer(id<MTLBuffer> buffer) {
+	constexpr size_t MAX_CACHED_READBACK = 1024 * 1024;
+	if (buffer && buffer.length <= MAX_CACHED_READBACK &&
+		(!readbackBuffer_ || readbackBuffer_.length < buffer.length)) {
+		readbackBuffer_ = buffer;
+	}
+}
+
 bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 	error->clear();
 	if (!commands_) {
