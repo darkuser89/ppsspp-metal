@@ -459,11 +459,19 @@ void MetalDrawContext::EndPass() {
 		[encoder_ setColorStoreAction:(discardStoreAspects_ & Aspect::COLOR_BIT) ? MTLStoreActionDontCare :
 			multisample ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore atIndex:0];
 		if (target_ && target_->DepthStencil()) {
+#if PPSSPP_PLATFORM(MAC)
+			// Resolve before a single-sample use instead of after every pass split.
+			const bool resolveDepthStencil = false;
+#else
 			const bool resolveDepthStencil = multisample;
+#endif
 			[encoder_ setDepthStoreAction:(discardStoreAspects_ & Aspect::DEPTH_BIT) ? MTLStoreActionDontCare :
 				resolveDepthStencil ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore];
 			[encoder_ setStencilStoreAction:(discardStoreAspects_ & Aspect::STENCIL_BIT) ? MTLStoreActionDontCare :
 				resolveDepthStencil ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore];
+			if (multisample && !resolveDepthStencil) {
+				target_->MarkDepthStencilUnresolved();
+			}
 		}
 		[encoder_ endEncoding];
 		encoder_ = nil;
@@ -894,6 +902,16 @@ void MetalDrawContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, A
 		Error("Metal framebuffer texture binding requires color or depth");
 		return;
 	}
+	if (aspect == Aspect::DEPTH_BIT && source->MultiSampleLevel() > 0 &&
+		(source->NeedsDepthStencilResolve() || (source == target_.ptr && encoder_))) {
+		EndPass();
+		std::string error;
+		if (!source->ResolveDepthStencil(context_, &error)) {
+			textures_[binding] = nil;
+			Error(error);
+			return;
+		}
+	}
 	if (layer == ALL_LAYERS) {
 		textures_[binding] = aspect == Aspect::DEPTH_BIT ?
 			(shaderLanguageDesc_.framebufferArrayTextures ? source->DepthStencilArray() : source->DepthStencil()) :
@@ -919,11 +937,18 @@ bool MetalDrawContext::Copy(Framebuffer *src, int sx, int sy, Framebuffer *dst, 
 		return false;
 	}
 	std::string error;
+	const bool depthStencil = aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT);
+	const bool copySamples = dest->MultiSampleLevel() > 0 && source->SampleCount() == dest->SampleCount();
+	if (depthStencil && !copySamples && !source->ResolveDepthStencil(context_, &error)) {
+		Error(error);
+		return false;
+	}
 	if (dest->MultiSampleLevel() > 0) {
 		if (!framebufferCopy_.Copy(context_, source, sx, sy, dest, dx, dy, w, h, aspects, &error)) {
 			Error(error);
 			return false;
 		}
+		dest->MarkDepthStencilResolved();
 		return true;
 	}
 	const bool depth = aspects & Aspect::DEPTH_BIT;
@@ -967,10 +992,19 @@ bool MetalDrawContext::BlitFramebuffer(Framebuffer *src, int sx1, int sy1, int s
 		return false;
 	}
 	std::string error;
+	const bool copySamples = dest->MultiSampleLevel() > 0 && source->SampleCount() == dest->SampleCount();
+	if (!copySamples && (aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT)) &&
+		!source->ResolveDepthStencil(context_, &error)) {
+		Error(error);
+		return false;
+	}
 	if (!framebufferCopy_.Blit(context_, source, sx1, sy1, sx2 - sx1, sy2 - sy1,
 		dest, dx1, dy1, dx2 - dx1, dy2 - dy1, aspects, filter, &error)) {
 		Error(error);
 		return false;
+	}
+	if (dest->MultiSampleLevel() > 0) {
+		dest->MarkDepthStencilResolved();
 	}
 	return true;
 }
@@ -1070,6 +1104,10 @@ bool MetalDrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, 
 		return false;
 	}
 	std::string error;
+	if (aspect != Aspect::COLOR_BIT && !fbo->ResolveDepthStencil(context_, &error)) {
+		Error(error);
+		return false;
+	}
 	const bool success = mode == ReadbackMode::OLD_DATA_OK && aspect == Aspect::COLOR_BIT ?
 		ReadbackDelayedColor(fbo->Color(), x, y, w, h, format, pixels, stride, &error) :
 		Metal::Readback(context_, aspect == Aspect::COLOR_BIT ? fbo->Color() : fbo->DepthStencil(), aspect, x, y, w, h, format, pixels, stride, &error);

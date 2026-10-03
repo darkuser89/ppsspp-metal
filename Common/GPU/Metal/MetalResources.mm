@@ -682,6 +682,36 @@ void Framebuffer::SetRenderAttachments(MTLRenderPassDescriptor *pass, int layer)
 	}
 }
 
+bool Framebuffer::ResolveDepthStencil(RenderContext &context, std::string *error) {
+	if (!depthStencilResolveDirty_) {
+		return true;
+	}
+	if (!EnsureCommands(context, error)) {
+		return false;
+	}
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.renderTargetArrayLength = layers_;
+	pass.depthAttachment.texture = multisampleDepthStencil_;
+	pass.depthAttachment.resolveTexture = depthStencil_;
+	pass.depthAttachment.loadAction = MTLLoadActionLoad;
+	pass.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+	pass.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+	pass.stencilAttachment.texture = multisampleDepthStencil_;
+	pass.stencilAttachment.resolveTexture = depthStencil_;
+	pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+	pass.stencilAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+	pass.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
+	context.ProfileRenderPass(pass, "Depth/stencil resolve");
+	id<MTLRenderCommandEncoder> encoder = [context.Commands() renderCommandEncoderWithDescriptor:pass];
+	if (!encoder) {
+		*error = "Failed to resolve Metal depth/stencil";
+		return false;
+	}
+	[encoder endEncoding];
+	depthStencilResolveDirty_ = false;
+	return true;
+}
+
 static bool ValidRect(id<MTLTexture> texture, int x, int y, int w, int h) {
 	bool supportedType = texture.textureType == MTLTextureType2D || texture.textureType == MTLTextureType2DArray ||
 		texture.textureType == MTLTextureType2DMultisample;

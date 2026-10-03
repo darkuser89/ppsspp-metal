@@ -70,9 +70,13 @@ public:
 	id<MTLTexture> DepthStencilAttachmentLayer(int layer) const { return multisampleDepthStencil_ ? multisampleDepthStencil_ : DepthStencilLayer(layer); }
 	bool OwnsTexture(id<MTLTexture> texture) const;
 	int SampleCount() const { return 1 << multiSampleLevel_; }
-	// Resolve at the end of each pass while retaining the individual samples
-	// for subsequent draws. Color()/DepthStencil() expose the resolved images.
+	// Keep multisample attachments for subsequent draws. The depth/stencil
+	// texture is resolved when a transfer, readback, or shader needs it.
 	void SetRenderAttachments(MTLRenderPassDescriptor *pass, int layer = -1) const;
+	void MarkDepthStencilUnresolved() { if (multisampleDepthStencil_) depthStencilResolveDirty_ = true; }
+	void MarkDepthStencilResolved() { depthStencilResolveDirty_ = false; }
+	bool NeedsDepthStencilResolve() const { return depthStencilResolveDirty_; }
+	bool ResolveDepthStencil(RenderContext &context, std::string *error);
 
 private:
 	id<MTLTexture> color_ = nil;
@@ -81,6 +85,7 @@ private:
 	mutable id<MTLTexture> depthStencilArray_ = nil;
 	id<MTLTexture> multisampleColor_ = nil;
 	id<MTLTexture> multisampleDepthStencil_ = nil;
+	bool depthStencilResolveDirty_ = false;
 	std::array<id<MTLTexture>, 2> colorLayers_{};
 	std::array<id<MTLTexture>, 2> depthStencilLayers_{};
 	std::string tag_;
