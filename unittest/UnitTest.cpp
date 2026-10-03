@@ -2940,6 +2940,7 @@ bool TestMetalDelayedReadback();
 bool TestMetalTriangleFan();
 bool TestMetalCullPointsLines();
 bool TestMetalMSAAResolve();
+bool TestMetalDualSourceBlend();
 bool TestMetalLoadDiscardBlit();
 #endif
 bool TestSoftwareGPUJit();
@@ -3148,6 +3149,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(MetalTriangleFan),
 	TEST_ITEM(MetalCullPointsLines),
 	TEST_ITEM(MetalMSAAResolve),
+	TEST_ITEM(MetalDualSourceBlend),
 	TEST_ITEM(MetalLoadDiscardBlit),
 #endif
 	TEST_ITEM(SoftwareGPUJit),

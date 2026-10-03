@@ -912,6 +912,112 @@ bool TestMetalCullPointsLines() {
 	return true;
 }
 
+bool TestMetalDualSourceBlend() {
+	init_glslang();
+	std::string error;
+	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
+	if (!draw) {
+		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+			printf("Metal dual-source blend skipped: %s\n", error.c_str());
+			return true;
+		}
+		printf("Metal context failed: %s\n", error.c_str());
+		return false;
+	}
+	if (!draw->GetDeviceCaps().dualSourceBlend) {
+		printf("Metal dual-source blend skipped: device does not support it\n");
+		return true;
+	}
+	draw->SetErrorCallback([](const char *shortDesc, const char *details, void *) {
+		printf("Metal dual-source error: %s: %s\n", shortDesc, details);
+	}, nullptr);
+	FShaderID geShaderID;
+	geShaderID.SetBits(FS_BIT_STENCIL_TO_ALPHA, 2, REPLACE_ALPHA_DUALSOURCE);
+	std::array<char, 65536> geSource{};
+	if (!GenerateFShader(geShaderID, geSource.data(), GLSL_VULKAN, draw->GetBugs(), &error)) {
+		printf("Metal GE dual-source shader generation failed: %s\n", error.c_str());
+		return false;
+	}
+	Metal::ShaderCompileOptions geOptions;
+	geOptions.textureBindingBase = 0;
+	Metal::CompiledShader geShader;
+	if (!Metal::CompileShader(geSource.data(), ShaderStage::Fragment, geOptions, &geShader, &error) ||
+		geShader.source.find("[[color(0), index(1)]]") == std::string::npos) {
+		printf("Metal GE dual-source shader translation failed: %s\n", error.c_str());
+		return false;
+	}
+	const char *vsSource = "#version 450\n"
+		"layout(location = 0) in vec2 a_position;\n"
+		"void main() { gl_Position = vec4(a_position, 0.0, 1.0); }\n";
+	const char *fsSource = "#version 450\n"
+		"layout(location = 0, index = 0) out vec4 o_color;\n"
+		"layout(location = 0, index = 1) out vec4 o_blend;\n"
+		"void main() { o_color = vec4(1.0, 0.0, 0.0, 1.0); o_blend = vec4(0.0, 0.0, 0.0, 0.5); }\n";
+	const auto language = draw->GetShaderLanguageDesc().shaderLanguage;
+	Draw::AutoRef<Draw::ShaderModule> vs(draw->CreateShaderModule(ShaderStage::Vertex, language,
+		(const uint8_t *)vsSource, strlen(vsSource), "Metal dual-source VS"));
+	Draw::AutoRef<Draw::ShaderModule> fs(draw->CreateShaderModule(ShaderStage::Fragment, language,
+		(const uint8_t *)fsSource, strlen(fsSource), "Metal dual-source FS"));
+	Draw::AutoRef<Draw::InputLayout> input(draw->CreateInputLayout({sizeof(float) * 2,
+		{{Draw::SEM_POSITION, Draw::DataFormat::R32G32_FLOAT, 0}}}));
+	Draw::AutoRef<Draw::DepthStencilState> depth(draw->CreateDepthStencilState({}));
+	Draw::AutoRef<Draw::BlendState> blend(draw->CreateBlendState({true, 0xF,
+		Draw::BlendFactor::SRC1_ALPHA, Draw::BlendFactor::ONE_MINUS_SRC1_ALPHA, Draw::BlendOp::ADD,
+		Draw::BlendFactor::ONE, Draw::BlendFactor::ZERO, Draw::BlendOp::ADD}));
+	Draw::AutoRef<Draw::RasterState> raster(draw->CreateRasterState({Draw::CullMode::NONE, Draw::Facing::CCW}));
+	if (!vs || !fs || !input || !depth || !blend || !raster) {
+		printf("Metal dual-source blend resources failed\n");
+		return false;
+	}
+	Draw::PipelineDesc desc{Draw::Primitive::TRIANGLE_LIST, {vs.ptr, fs.ptr},
+		input.ptr, depth.ptr, blend.ptr, raster.ptr, nullptr};
+	Draw::AutoRef<Draw::Pipeline> pipeline(draw->CreateGraphicsPipeline(desc, "Metal dual-source blend"));
+	if (!pipeline) {
+		printf("Metal dual-source blend pipeline failed\n");
+		return false;
+	}
+	const std::array<std::array<float, 2>, 3> vertices{{{-1.0f, -1.0f}, {3.0f, -1.0f}, {-1.0f, 3.0f}}};
+	std::array<uint32_t, 16> pixels{};
+	draw->BeginFrame(Draw::DebugFlags::NONE);
+	for (int sampleLevel : {0, 2}) {
+		if (sampleLevel && !(draw->GetDeviceCaps().multiSampleLevelsMask & (1u << sampleLevel))) {
+			continue;
+		}
+		Draw::AutoRef<Draw::Framebuffer> framebuffer(draw->CreateFramebuffer({4, 4, 1, 1,
+			sampleLevel, false, "Metal dual-source blend"}));
+		if (!framebuffer) {
+			printf("Metal dual-source blend framebuffer failed at level %d\n", sampleLevel);
+			return false;
+		}
+		draw->BindFramebufferAsRenderTarget(framebuffer.ptr,
+			{Draw::RPAction::CLEAR, Draw::RPAction::DONT_CARE, Draw::RPAction::DONT_CARE,
+				0xFFFF0000, 1.0f, 0, "Metal dual-source clear"}, "Metal dual-source clear");
+		draw->BindPipeline(pipeline.ptr);
+		draw->SetViewport({0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f});
+		draw->SetScissorRect(0, 0, 4, 4);
+		draw->DrawUP(vertices.data(), 3);
+		const bool read = draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::COLOR_BIT, 0, 0, 4, 4,
+			Draw::DataFormat::R8G8B8A8_UNORM, pixels.data(), 4, Draw::ReadbackMode::BLOCK, "Metal dual-source readback");
+		if (!read) {
+			printf("Metal dual-source blend readback failed at level %d\n", sampleLevel);
+			return false;
+		}
+		for (uint32_t pixel : pixels) {
+			const int r = pixel & 255;
+			const int g = (pixel >> 8) & 255;
+			const int b = (pixel >> 16) & 255;
+			const int a = pixel >> 24;
+			if (r < 127 || r > 128 || g != 0 || b < 127 || b > 128 || a != 255) {
+				printf("Metal dual-source blend level %d pixel %08x, expected purple\n", sampleLevel, pixel);
+				return false;
+			}
+		}
+		printf("Metal dual-source blend %dx MSAA: 16 pixels passed\n", 1 << sampleLevel);
+	}
+	draw->EndFrame();
+	return true;
+}
+
 bool TestMetalMSAAResolve() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
