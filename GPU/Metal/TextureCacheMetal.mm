@@ -619,13 +619,7 @@ void TextureCacheMetal::BuildTexture(TexCacheEntry *entry) {
 			return false;
 		}
 		if (compressedReplacement) {
-			const size_t rows = (h + 3) / 4;
-			const size_t rowBytes = ((w + 3) / 4) * replacementBlockSize;
-			std::vector<uint8_t> tight(rowBytes * rows);
-			LoadTextureLevel(*entry, tight.data(), tight.size(), (int)rowBytes, plan, srcLevel, desc.format, TexDecodeFlags{});
-			for (size_t y = 0; y < rows; ++y) {
-				memcpy(data + pitch * y, tight.data() + rowBytes * y, rowBytes);
-			}
+			LoadTextureLevel(*entry, data, slicePitch, (int)pitch, plan, srcLevel, desc.format, TexDecodeFlags{}, true);
 			++level;
 			return true;
 		}

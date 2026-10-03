@@ -429,7 +429,7 @@ protected:
 	void PollReplacement(TexCacheEntry *entry, int *w, int *h, int *d);
 
 	// Return value is mapData normally, but could be another buffer allocated with AllocateAlignedMemory.
-	void LoadTextureLevel(TexCacheEntry &entry, uint8_t *mapData, size_t dataSize, int mapRowPitch, BuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags);
+	void LoadTextureLevel(TexCacheEntry &entry, uint8_t *mapData, size_t dataSize, int mapRowPitch, BuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags, bool compressedPitched = false);
 
 	// This needs to be a member functions just for IsVideo and Replacer.
 	SamplerCacheKey GetSamplingParams(int maxLevel, const TexCacheEntry *entry, bool flatZ, bool pixelMapped);

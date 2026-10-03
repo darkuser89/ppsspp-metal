@@ -207,7 +207,7 @@ public:
 	}
 
 	bool Poll(double budget);
-	bool CopyLevelTo(int level, uint8_t *out, size_t outDataSize, int rowPitch);
+	bool CopyLevelTo(int level, uint8_t *out, size_t outDataSize, int rowPitch, bool compressedPitched = false);
 
 	std::string logId_;
 

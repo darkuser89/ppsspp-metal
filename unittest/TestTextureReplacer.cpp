@@ -41,12 +41,12 @@ static bool CreateTestPNG(const Path &filename, int w, int h, u32 color) {
 	return pngSave(filename, buf.data(), w, h, 4);
 }
 
-static bool CreateTestDDS(const Path &filename, u32 dxgiFormat, const u8 *block, size_t blockSize) {
+static bool CreateTestDDS(const Path &filename, u32 dxgiFormat, const u8 *block, size_t blockSize, int height = 4) {
 	DDSHeader header{};
 	header.dwMagic = 0x20534444;  // DDS magic
 	header.dwSize = 124;
 	header.dwFlags = 0x81007;  // Required dimensions, pixel format, caps and linear size
-	header.dwHeight = 4;
+	header.dwHeight = height;
 	header.dwWidth = 4;
 	header.dwPitchOrLinearSize = (u32)blockSize;
 	header.dwMipMapCount = 1;
@@ -118,6 +118,8 @@ static bool CreateTestPack(const Path &packDir) {
 	const u8 bc5Block[16] = { 173, 173, 0, 0, 0, 0, 0, 0, 89, 89, 0, 0, 0, 0, 0, 0 };
 	if (!CreateTestDDS(packDir / "bc4.dds", 80, bc4Block, sizeof(bc4Block))) return false;
 	if (!CreateTestDDS(packDir / "bc5.dds", 83, bc5Block, sizeof(bc5Block))) return false;
+	const u8 bc4Rows[16] = { 173, 173, 0, 0, 0, 0, 0, 0, 89, 89, 0, 0, 0, 0, 0, 0 };
+	if (!CreateTestDDS(packDir / "bc4_rows.dds", 80, bc4Rows, sizeof(bc4Rows), 8)) return false;
 
 	return true;
 }
@@ -222,6 +224,22 @@ static bool TestLookups(TextureReplacer *replacer, const Path &packDir) {
 		EXPECT_TRUE(unsupported.Poll(1.0));
 		EXPECT_TRUE(unsupported.State() == ReplacementState::NOT_FOUND);
 	}
+	ReplacementDesc paddedDesc{};
+	paddedDesc.newW = paddedDesc.w = 4;
+	paddedDesc.newH = paddedDesc.h = 8;
+	paddedDesc.filenames.push_back("bc4_rows.dds");
+	paddedDesc.formatSupport.bc4 = true;
+	ReplacedTexture paddedTexture(&reader, paddedDesc);
+	EXPECT_TRUE(paddedTexture.Poll(1.0));
+	EXPECT_TRUE(paddedTexture.State() == ReplacementState::ACTIVE);
+	u8 padded[512];
+	memset(padded, 0xCD, sizeof(padded));
+	EXPECT_TRUE(paddedTexture.CopyLevelTo(0, padded, sizeof(padded), 256, true));
+	EXPECT_TRUE(memcmp(padded, "\xAD\xAD\0\0\0\0\0\0", 8) == 0);
+	EXPECT_TRUE(memcmp(padded + 256, "\x59\x59\0\0\0\0\0\0", 8) == 0);
+	EXPECT_EQ_INT(padded[8], 0xCD);
+	EXPECT_EQ_INT(padded[255], 0xCD);
+	EXPECT_EQ_INT(padded[264], 0xCD);
 
 	g_threadManager.Teardown();
 	return true;

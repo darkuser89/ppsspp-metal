@@ -792,7 +792,7 @@ ReplacedTexture::LoadLevelResult ReplacedTexture::LoadLevelData(VFSFileReference
 	return LoadLevelResult::LOAD_ERROR;
 }
 
-bool ReplacedTexture::CopyLevelTo(int level, uint8_t *out, size_t outDataSize, int rowPitch) {
+bool ReplacedTexture::CopyLevelTo(int level, uint8_t *out, size_t outDataSize, int rowPitch, bool compressedPitched) {
 	_assert_msg_((size_t)level < levels_.size(), "Invalid miplevel");
 	_assert_msg_(out != nullptr && rowPitch > 0, "Invalid out/pitch");
 
@@ -866,33 +866,37 @@ bool ReplacedTexture::CopyLevelTo(int level, uint8_t *out, size_t outDataSize, i
 			}
 		}
 	} else {
+		int inBlocksW = (info.w + 3) / 4;
+		int inBlocksH = (info.h + 3) / 4;
+		int outBlocksW = (info.fullW + 3) / 4;
+		int outBlocksH = (info.fullH + 3) / 4;
+		int copyPitch = compressedPitched ? rowPitch : outBlocksW * blockSize;
+		if (compressedPitched && (rowPitch < outBlocksW * blockSize || outDataSize < (size_t)copyPitch * outBlocksH)) {
+			ERROR_LOG(Log::TexReplacement, "Replacement compressed row pitch or buffer too small");
+			return false;
+		}
 #ifdef PARALLEL_COPY
 		// Only parallel copy in the simple case for now.
-		if (info.w == outW && info.h == outH) {
+		if (info.w == outW && info.h == outH && copyPitch == inBlocksW * blockSize) {
 			// TODO: Add sanity checks here for other formats?
 			ParallelMemcpy(&g_threadManager, out, data.data(), data.size());
 			return true;
 		}
 #endif
 		// Alright, so careful copying of blocks it is, padding with zero-blocks as needed.
-		int inBlocksW = (info.w + 3) / 4;
-		int inBlocksH = (info.h + 3) / 4;
-		int outBlocksW = (info.fullW + 3) / 4;
-		int outBlocksH = (info.fullH + 3) / 4;
-
 		int paddingBlocksX = outBlocksW - inBlocksW;
 
 		// Copy all the known blocks, and zero-fill out the lines.
 		for (int y = 0; y < inBlocksH; y++) {
 			const uint8_t *input = data.data() + y * inBlocksW * blockSize;
-			uint8_t *output = (uint8_t *)out + y * outBlocksW * blockSize;
+			uint8_t *output = (uint8_t *)out + y * copyPitch;
 			memcpy(output, input, inBlocksW * blockSize);
 			memset(output + inBlocksW * blockSize, 0, paddingBlocksX * blockSize);
 		}
 
 		// Vertical zero-padding.
 		for (int y = inBlocksH; y < outBlocksH; y++) {
-			uint8_t *output = (uint8_t *)out + y * outBlocksW * blockSize;
+			uint8_t *output = (uint8_t *)out + y * copyPitch;
 			memset(output, 0, outBlocksW * blockSize);
 		}
 	}

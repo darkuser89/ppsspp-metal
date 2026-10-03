@@ -3062,7 +3062,7 @@ bool TextureCacheCommon::PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEnt
 }
 
 // Passing 0 into dataSize will disable checking.
-void TextureCacheCommon::LoadTextureLevel(TexCacheEntry &entry, uint8_t *data, size_t dataSize, int stride, BuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags) {
+void TextureCacheCommon::LoadTextureLevel(TexCacheEntry &entry, uint8_t *data, size_t dataSize, int stride, BuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags, bool compressedPitched) {
 	int w = gstate.getTextureWidth(srcLevel);
 	int h = gstate.getTextureHeight(srcLevel);
 	if (entry.status & TexStatus::PSP_SIZE_CLIPPED) {
@@ -3075,7 +3075,7 @@ void TextureCacheCommon::LoadTextureLevel(TexCacheEntry &entry, uint8_t *data, s
 	if (plan.doReplace) {
 		plan.replaced->GetSize(srcLevel, &w, &h);
 		double replaceStart = time_now_d();
-		plan.replaced->CopyLevelTo(srcLevel, data, dataSize, stride);
+		plan.replaced->CopyLevelTo(srcLevel, data, dataSize, stride, compressedPitched);
 		replacementTimeThisFrame_ += time_now_d() - replaceStart;
 	} else {
 		GETextureFormat tfmt = (GETextureFormat)entry.format;
