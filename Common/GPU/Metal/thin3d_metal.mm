@@ -948,7 +948,9 @@ bool MetalDrawContext::Copy(Framebuffer *src, int sx, int sy, Framebuffer *dst, 
 			Error(error);
 			return false;
 		}
-		dest->MarkDepthStencilResolved();
+		if (depthStencil) {
+			dest->MarkDepthStencilResolved();
+		}
 		return true;
 	}
 	const bool depth = aspects & Aspect::DEPTH_BIT;
@@ -1003,7 +1005,7 @@ bool MetalDrawContext::BlitFramebuffer(Framebuffer *src, int sx1, int sy1, int s
 		Error(error);
 		return false;
 	}
-	if (dest->MultiSampleLevel() > 0) {
+	if (dest->MultiSampleLevel() > 0 && (aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT))) {
 		dest->MarkDepthStencilResolved();
 	}
 	return true;

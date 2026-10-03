@@ -954,6 +954,33 @@ bool TestMetalMSAAResolve() {
 			return false;
 		}
 	}
+	Draw::AutoRef<Draw::Framebuffer> colorSource(draw->CreateFramebuffer({4, 2, 1, 1, 0, false, "Metal color-only blit source"}));
+	if (!colorSource) {
+		printf("Metal color-only blit source creation failed\n");
+		return false;
+	}
+	draw->BindFramebufferAsRenderTarget(colorSource.ptr,
+		{Draw::RPAction::CLEAR, Draw::RPAction::DONT_CARE, Draw::RPAction::DONT_CARE, 0xFF00FF00, 1.0f, 0, "Color-only source"}, "Color-only source");
+	draw->BindFramebufferAsRenderTarget(framebuffer.ptr,
+		{Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, 0xFF0000FF, 0.375f, 0x7C, "Color-only target"}, "Color-only target");
+	if (!draw->BlitFramebuffer(colorSource.ptr, 0, 0, 4, 2, framebuffer.ptr, 0, 0, 4, 2,
+		Draw::Aspect::COLOR_BIT, Draw::FB_BLIT_NEAREST, "MSAA color-only blit") ||
+		!draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::COLOR_BIT, 0, 0, 4, 2,
+			Draw::DataFormat::R8G8B8A8_UNORM, color.data(), 4, Draw::ReadbackMode::BLOCK, "Color-only color") ||
+		!draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::DEPTH_BIT, 0, 0, 4, 2,
+			Draw::DataFormat::D32F, depth.data(), 4, Draw::ReadbackMode::BLOCK, "Color-only depth") ||
+		!draw->CopyFramebufferToMemory(framebuffer.ptr, Draw::Aspect::STENCIL_BIT, 0, 0, 4, 2,
+			Draw::DataFormat::S8, stencil.data(), 4, Draw::ReadbackMode::BLOCK, "Color-only stencil")) {
+		printf("Metal MSAA color-only blit or readback failed\n");
+		return false;
+	}
+	for (size_t i = 0; i < color.size(); ++i) {
+		if (color[i] != 0xFF00FF00 || depth[i] != 0.375f || stencil[i] != 0x7C) {
+			printf("Metal MSAA color-only blit pixel %zu: color %08x, depth %f, stencil %02x\n",
+				i, color[i], depth[i], stencil[i]);
+			return false;
+		}
+	}
 	draw->BindFramebufferAsRenderTarget(framebuffer.ptr,
 		{Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, Draw::RPAction::CLEAR, 0xFF00FF00, 0.5f, 0xA5, "MSAA discard"}, "MSAA discard");
 	draw->InvalidateFramebuffer(Draw::FB_INVALIDATION_STORE, Draw::Aspect::DEPTH_BIT | Draw::Aspect::STENCIL_BIT);

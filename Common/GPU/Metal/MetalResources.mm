@@ -969,6 +969,13 @@ vertex float4 copyVertex(uint id [[vertex_id]]) {
 		}
 		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 		dst->SetRenderAttachments(rp, layer);
+#if PPSSPP_PLATFORM(MAC)
+		if (!depth && !stencil && dst->MultiSampleLevel() > 0 && dst->DepthStencil()) {
+			// Preserve an outstanding depth/stencil resolve during a color-only transfer.
+			rp.depthAttachment.storeAction = MTLStoreActionStore;
+			rp.stencilAttachment.storeAction = MTLStoreActionStore;
+		}
+#endif
 		rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
 		rp.depthAttachment.loadAction = MTLLoadActionLoad;
 		rp.stencilAttachment.loadAction = MTLLoadActionLoad;
