@@ -2903,8 +2903,11 @@ bool MetalTextureCacheCommon::PrepareBuildTexture(MetalBuildTexturePlan &plan, M
 	// TODO: We should move the PPGE texture entirely out from the PSP's memory space, so we don't save it in every save state.
 	const bool isPPGETexture = entry->addr >= PSP_GetKernelMemoryBase() && entry->addr < PSP_GetKernelMemoryEnd();
 
-	// Don't scale the PPGe texture.
-	if (isPPGETexture) {
+	// Single-row/column textures can carry lookup values. Interpolating their
+	// channels changes the values consumed by later GE passes.
+	const bool preserveLookupValues = PPSSPP_PLATFORM(MAC) && (plan.w == 1 || plan.h == 1);
+	// Don't scale the PPGe texture or lookup data.
+	if (isPPGETexture || preserveLookupValues) {
 		plan.scaleFactor = 1;
 	} else if (!metalTexturePolicy_ && !g_DoubleTextureCoordinates) {
 		if (plan.w > 2048 || plan.h > 2048) {

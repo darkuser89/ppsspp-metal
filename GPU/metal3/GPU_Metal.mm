@@ -59,6 +59,11 @@ public:
 
 	u32 CheckGPUFeatures() const override {
 		u32 features = GPUCommonHWMetal::CheckGPUFeatures();
+#if PPSSPP_PLATFORM(MAC)
+		// GE depth is 16-bit (gpu/exact/planes). Quantize before D32F storage
+		// so coplanar passes do not compare the rasterizer's extra precision.
+		features |= GPU_ROUND_FRAGMENT_DEPTH_TO_16BIT;
+#endif
 		features |= GPU_USE_FRAMEBUFFER_ARRAYS;
 		id<MTLDevice> device = (__bridge id<MTLDevice>)(void *)draw_->GetNativeObject(Draw::NativeObject::DEVICE);
 		bool layeredMSAA = msaaLevel_ == 0;
@@ -88,7 +93,14 @@ public:
 			(draw_->GetDataFormatSupport(Draw::DataFormat::R4G4B4A4_UNORM_PACK16) & Draw::FMT_TEXTURE)) {
 			features |= GPU_USE_16BIT_FORMATS;
 		}
-		return CheckGPUFeaturesLate(features);
+		features = CheckGPUFeaturesLate(features);
+#if PPSSPP_PLATFORM(MAC)
+		// Preserve explicit vertex-rounding overrides without rounding twice.
+		if (features & GPU_ROUND_DEPTH_TO_16BIT) {
+			features &= ~GPU_ROUND_FRAGMENT_DEPTH_TO_16BIT;
+		}
+#endif
+		return features;
 	}
 
 	void GetStats(StringWriter &writer) override {

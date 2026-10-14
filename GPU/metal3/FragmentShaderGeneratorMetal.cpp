@@ -826,6 +826,10 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 				}
 				// The texture size in PSP pixels (u counts bytes), not the scaled framebuffer's.
 				p.F("  %s vec2 tsize = 0.5 / u_texclamp.zw;\n", prec);
+#if PPSSPP_PLATFORM(MAC)
+				p.F("  %s vec4 t;\n", prec);
+				p.C("  if ((u_depal_mask_shift_off_fmt & 0x80000000u) == 0u) {\n");
+#endif
 				// The GE samples at the pixel center, and all the render pixels of a PSP pixel must read what its one
 				// sample does, so move to the PSP pixel's center along x (which picks the byte). scale is render pixels
 				// per PSP pixel.
@@ -844,7 +848,11 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 				}
 				p.C("  uv_round = (uv_round + 0.5) / tsize;\n");
 				// The byte decodes below are exact in fp32, but the product rounding in fp16 makes 16 of 256 bytes come out one low.
+#if PPSSPP_PLATFORM(MAC)
+				p.C("  t = ").SampleTexture2D("tex", "uv_round").C(";\n");
+#else
 				p.F("  %s vec4 t = ", prec).SampleTexture2D("tex", "uv_round").C(";\n");
+#endif
 				p.C("  int index;\n");
 				switch (shaderDepalFmt) {
 				case GE_FORMAT_8888:
@@ -873,6 +881,55 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 				}
 				p.C("  index = int(((uint(index) >> ((u_depal_mask_shift_off_fmt >> 0x8u) & 0xFFu)) & (u_depal_mask_shift_off_fmt & 0xFFu)) | (((u_depal_mask_shift_off_fmt >> 0x10u) & 0xFFu) << 0x4u));\n");
 				p.C("  t = ").LoadTexture2D("pal", "ivec2(index, 0)", 0).C(";\n");
+#if PPSSPP_PLATFORM(MAC)
+				p.C("  } else {\n");
+				// Filter palette colors, not the packed framebuffer bytes (gpu/probe exp52).
+				p.F("    vec2 linearUV = %s.xy;\n", texcoord);
+				if (doTextureProjection) {
+					p.F("    linearUV /= %s.z;\n", texcoord);
+				}
+				p.C("    vec2 texelPos = floor(linearUV * tsize * 16.0) * 0.0625 - vec2(0.5);\n");
+				p.C("    vec2 baseTexel = floor(texelPos);\n");
+				p.C("    vec2 weight = floor(fract(texelPos) * 16.0);\n");
+				p.C("    vec4 colors[4];\n");
+				p.C("    for (int tap = 0; tap < 4; ++tap) {\n");
+				p.C("      vec2 tapUV = (baseTexel + vec2(tap & 1, tap >> 1) + vec2(0.5)) / tsize - u_texclampoff;\n");
+				for (const char axis : {'x', 'y'}) {
+					bool clamp = id.Bit(axis == 'x' ? FS_BIT_CLAMP_S : FS_BIT_CLAMP_T);
+					if (clamp) {
+						p.F("      tapUV.%c = clamp(tapUV.%c, u_texclamp.%c, u_texclamp.%c - u_texclamp.%c);\n", axis, axis, axis == 'x' ? 'z' : 'w', axis, axis == 'x' ? 'z' : 'w');
+					} else {
+						p.F("      tapUV.%c = mod(tapUV.%c, u_texclamp.%c);\n", axis, axis, axis);
+					}
+				}
+				p.C("      vec2 byteCoord = floor((tapUV + u_texclampoff) * tsize);\n");
+				p.F("      int byteComponent = int(byteCoord.x) & %d;\n", shaderDepalFmt == GE_FORMAT_8888 ? 3 : 1);
+				p.F("      byteCoord.x = floor(byteCoord.x * %s);\n", shaderDepalFmt == GE_FORMAT_8888 ? "0.25" : "0.5");
+				p.C("      vec4 packedColor = ").SampleTexture2D("tex", "(byteCoord + vec2(0.5)) / tsize").C(";\n");
+				if (shaderDepalFmt == GE_FORMAT_8888) {
+					p.C("      int byteIndex = int(packedColor[byteComponent] * 255.99);\n");
+				} else {
+					switch (shaderDepalFmt) {
+					case GE_FORMAT_565:
+						p.C("      int packedPixel = int(packedColor.r * 31.99) | (int(packedColor.g * 63.99) << 5) | (int(packedColor.b * 31.99) << 11);\n");
+						break;
+					case GE_FORMAT_5551:
+						p.C("      int packedPixel = int(packedColor.r * 31.99) | (int(packedColor.g * 31.99) << 5) | (int(packedColor.b * 31.99) << 10) | (int(packedColor.a) << 15);\n");
+						break;
+					default:
+						p.C("      int packedPixel = int(packedColor.r * 15.99) | (int(packedColor.g * 15.99) << 4) | (int(packedColor.b * 15.99) << 8) | (int(packedColor.a * 15.99) << 12);\n");
+						break;
+					}
+					p.C("      int byteIndex = (packedPixel >> (byteComponent * 8)) & 0xFF;\n");
+				}
+				p.C("      byteIndex = int(((uint(byteIndex) >> ((u_depal_mask_shift_off_fmt >> 8u) & 0xFFu)) & (u_depal_mask_shift_off_fmt & 0xFFu)) | (((u_depal_mask_shift_off_fmt >> 16u) & 0xFFu) << 4u));\n");
+				p.C("      colors[tap] = floor(").LoadTexture2D("pal", "ivec2(byteIndex, 0)", 0).C(" * 255.0 + 0.5);\n");
+				p.C("    }\n");
+				p.C("    vec4 upper = floor((colors[0] * (16.0 - weight.x) + colors[1] * weight.x) * 0.0625);\n");
+				p.C("    vec4 lower = floor((colors[2] * (16.0 - weight.x) + colors[3] * weight.x) * 0.0625);\n");
+				p.C("    t = floor((upper * (16.0 - weight.y) + lower * weight.y) * 0.0625) / 255.0;\n");
+				p.C("  }\n");
+#endif
 				break;
 			}
 			}
