@@ -413,3 +413,32 @@ endif()
 # was only linked to the old combined "core" target, which happened to always be linked after
 # Common everywhere it mattered).
 target_link_libraries(Common ${GlslangLibs})
+
+# Native Metal uses CAMetalLayer surfaces on macOS and iOS.
+if(APPLE AND NOT IOS AND NOT LIBRETRO)
+	target_compile_definitions(Common PUBLIC PPSSPP_HAS_METAL=1)
+	target_sources(Common PRIVATE
+		GPU/metal3/ShaderWriterMetal.cpp
+		GPU/metal3/MetalBackend.h
+		GPU/metal3/MetalShaderCompiler.h
+		GPU/metal3/MetalShaderCompiler.cpp
+		GPU/metal3/MetalRenderContext.h
+		GPU/metal3/MetalRenderContext.mm
+		GPU/metal3/MetalResources.h
+		GPU/metal3/MetalResources.mm
+		GPU/metal3/thin3d_metal.h
+		GPU/metal3/thin3d_metal.mm
+		GPU/metal3/MetalRenderManager.h
+		GPU/metal3/MetalGraphicsContext.h
+		GPU/metal3/MetalGraphicsContext.mm
+	)
+	set_source_files_properties(GPU/metal3/MetalShaderCompiler.cpp PROPERTIES COMPILE_FLAGS -fexceptions)
+	set_source_files_properties(GPU/metal3/MetalRenderContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal3/MetalResources.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal3/thin3d_metal.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal3/MetalGraphicsContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	target_link_libraries(Common spirv-cross-metal "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+	if(NOT CMAKE_OSX_SYSROOT OR EXISTS "${CMAKE_OSX_SYSROOT}/System/Library/Frameworks/MetalFX.framework")
+		target_link_libraries(Common "-weak_framework MetalFX")
+	endif()
+endif()

@@ -3093,6 +3093,14 @@ bool TestX64Emitter();
 bool TestRiscVEmitter();
 bool TestLoongArch64Emitter();
 bool TestShaderGenerators();
+#if PPSSPP_PLATFORM(MAC) && defined(PPSSPP_HAS_METAL)
+bool TestMetalDelayedReadback();
+bool TestMetalTriangleFan();
+bool TestMetalCullPointsLines();
+bool TestMetalMSAAResolve();
+bool TestMetalDualSourceBlend();
+bool TestMetalLoadDiscardBlit();
+#endif
 bool TestIRPassSimplify();
 bool TestThreadManager();
 bool TestVFS();
@@ -3362,6 +3370,14 @@ TestItem availableTests[] = {
 	TEST_ITEM(MemMap),
 	TEST_ITEM(BlockShadow),
 	TEST_ITEM(ShaderGenerators),
+#if PPSSPP_PLATFORM(MAC) && defined(PPSSPP_HAS_METAL)
+	TEST_ITEM(MetalDelayedReadback),
+	TEST_ITEM(MetalTriangleFan),
+	TEST_ITEM(MetalCullPointsLines),
+	TEST_ITEM(MetalMSAAResolve),
+	TEST_ITEM(MetalDualSourceBlend),
+	TEST_ITEM(MetalLoadDiscardBlit),
+#endif
 	TEST_ITEM(Path),
 	TEST_ITEM(AndroidContentURI),
 	TEST_ITEM(ThreadManager),

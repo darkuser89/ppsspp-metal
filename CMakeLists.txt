@@ -153,6 +153,9 @@ if(USE_IAP)
 endif()
 
 if(IOS)
+	if(PPSSPP_IOS_DEFAULT_METAL)
+		add_compile_definitions(PPSSPP_IOS_DEFAULT_METAL)
+	endif()
 	# Set a global default to not generate schemes for each target.
 	# Makes using XCode sligthly more sane.
 	set(CMAKE_XCODE_GENERATE_SCHEME NO)
@@ -316,7 +319,7 @@ elseif(NOT OPENGL_LIBRARIES AND USING_GLES2)
 	set(OPENGL_LIBRARIES GLESv2 EGL)
 endif()
 
-# The iOS app is Vulkan (MoltenVK) only. Must match PPSSPP_API_ANY_GL in ppsspp_config.h.
+# The iOS app uses Vulkan (MoltenVK) or Metal. Must match PPSSPP_API_ANY_GL in ppsspp_config.h.
 if(IOS AND NOT LIBRETRO)
 	set(NO_OPENGL ON)
 endif()
@@ -1595,6 +1598,12 @@ if(IOS AND NOT LIBRETRO)
 		set(ICON_NAME "AppIcon")
 		set(DISPLAY_NAME "PPSSPP")
 	endif()
+	if(PPSSPP_IOS_BUNDLE_IDENTIFIER)
+		set(BUNDLE_IDENTIFIER "${PPSSPP_IOS_BUNDLE_IDENTIFIER}")
+	endif()
+	if(PPSSPP_IOS_DISPLAY_NAME)
+		set(DISPLAY_NAME "${PPSSPP_IOS_DISPLAY_NAME}")
+	endif()
 	if(IOS_APP_STORE)
 		message(STATUS "DevTeam: ${DEVELOPMENT_TEAM_ID} Icon: ${ICON_NAME} Target: ${TargetBin} Gold: ${GOLD} IAP: ${USE_IAP}")
 	endif()
@@ -1641,7 +1650,11 @@ if(IOS AND NOT LIBRETRO)
 	if(IOS_APP_STORE)
 		# https://stackoverflow.com/questions/40664125/cmake-and-code-signing-in-xcode-8-for-ios-projects
 		set_target_properties(${TargetBin} PROPERTIES
-			XCODE_ATTRIBUTE_DEVELOPMENT_TEAM ${DEVELOPMENT_TEAM_ID}
+			BUILD_WITH_INSTALL_RPATH YES
+			XCODE_ATTRIBUTE_INFOPLIST_KEY_UIFileSharingEnabled YES
+			XCODE_EMBED_FRAMEWORKS_REMOVE_HEADERS_ON_COPY YES
+			XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY YES
+			XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${DEVELOPMENT_TEAM_ID}"
 			XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development"
 			XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
 		)

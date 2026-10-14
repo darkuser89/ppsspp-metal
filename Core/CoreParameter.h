@@ -28,6 +28,7 @@ enum GPUCore : int {
 	GPUCORE_SOFTWARE = 1,
 	GPUCORE_DIRECTX11 = 3,
 	GPUCORE_VULKAN = 4,
+	GPUCORE_METAL = 5,
 };
 
 enum class FPSLimit {

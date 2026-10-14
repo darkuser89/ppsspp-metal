@@ -45,6 +45,13 @@
 #include "Common/File/FileUtil.h"
 #include "GPU/Debugger/Playback.h"
 #include "Common/GPU/GraphicsContext.h"
+#include "Common/GPU/ShaderTranslation.h"
+#if PPSSPP_PLATFORM(MAC) && defined(SDL)
+#include "SDL/SDLCocoaMetalLayer.h"
+#endif
+#ifdef PPSSPP_HAS_METAL
+#include "Common/GPU/metal3/MetalGraphicsContext.h"
+#endif
 #include "Common/Net/Resolve.h"
 #include "Common/TimeUtil.h"
 #include "Common/StringUtils.h"
@@ -340,6 +347,12 @@ static GraphicsContext *CreateGraphicsContext(GPUCore gpuCore, std::string **dev
 #ifdef SDL
 	*deviceSetting = nullptr;
 	switch (gpuCore) {
+	case GPUCORE_METAL:
+#ifdef PPSSPP_HAS_METAL
+		return new MetalGraphicsContext();
+#else
+		return nullptr;
+#endif
 	case GPUCORE_GLES:
 		return new SDLHeadlessGLGraphicsContext();
 	default:
@@ -546,7 +559,17 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
 		}
 
 		int blockTicks = (int)usToCycles(1000000 / 10);
+#if PPSSPP_PLATFORM(MAC) && defined(SDL)
+		if (coreParameter.gpuCore == GPUCORE_METAL) {
+			runWithCocoaAutoreleasePool([](void *ticks) {
+				PSP_RunLoopFor(*static_cast<int *>(ticks));
+			}, &blockTicks);
+		} else {
+			PSP_RunLoopFor(blockTicks);
+		}
+#else
 		PSP_RunLoopFor(blockTicks);
+#endif
 
 		// If we were rendering, this might be a nice time to do something about it.
 		if (coreState == CORE_NEXTFRAME) {
@@ -1017,6 +1040,15 @@ int main(int argc, const char* argv[]) {
 	g_Config.bUseOldAtrac = oldAtrac;
 	g_Config.bSkipDeadbeefFilling = false;
 
+	if (cmdLineOptions.appendConfig.has_value() && cmdLineOptions.gpuBackend == GPUBackend::METAL &&
+		!cmdLineOptions.softwareRendering.value_or(false)) {
+		g_Config.SetAppendedConfigIni(Path(cmdLineOptions.appendConfig.value()), false);
+		if (!g_Config.LoadAppendedConfig()) {
+			fprintf(stderr, "Failed to load appended config: %s\n", cmdLineOptions.appendConfig.value().c_str());
+			return 1;
+		}
+	}
+
 	// ApplyToConfig() has the final say, applied after RestoreDefaults() and the headless
 	// overrides above, so a matching command line flag always wins.
 	cmdLineOptions.ApplyToConfig();
@@ -1048,6 +1080,9 @@ int main(int argc, const char* argv[]) {
 			break;
 		case GPUBackend::VULKAN:
 			gpuCore = GPUCORE_VULKAN;
+			break;
+		case GPUBackend::METAL:
+			gpuCore = GPUCORE_METAL;
 			break;
 		}
 	}
@@ -1318,6 +1353,21 @@ int main(int argc, const char* argv[]) {
 	}
 
 	std::string errorMessage;
+	// The normal app initializes shader translation in NativeInit. Headless has
+	// no NativeInit, so own the Metal compiler lifetime across surface creation.
+	struct ShaderTranslationScope {
+		bool active;
+		explicit ShaderTranslationScope(bool enable) : active(enable) {
+			if (active) {
+				ShaderTranslationInit();
+			}
+		}
+		~ShaderTranslationScope() {
+			if (active) {
+				ShaderTranslationShutdown();
+			}
+		}
+	} shaderTranslationScope(gpuCore == GPUCORE_METAL);
 	if (!graphicsContext->InitAPI(windowDesc.data2, deviceSetting, &errorMessage)) {
 		// No fallbacks in headless - if we can't run it, we can't. Let's not get confusing.
 		fprintf(stderr, "Failed to initialize graphics API: %s\n", errorMessage.c_str());

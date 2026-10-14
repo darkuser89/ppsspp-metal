@@ -1,3 +1,6 @@
+#ifdef PPSSPP_HAS_METAL
+#include "GPU/metal3/TextureCachePolicyMetal.h"
+#endif
 #include "ext/imgui/imgui.h"
 #include "ext/imgui/imgui_internal.h"
 #include "ext/imgui/imgui_extras.h"
@@ -22,6 +25,19 @@
 #include "GPU/Debugger/Stepping.h"
 #include "GPU/Debugger/Debugger.h"
 #include "GPU/GPUState.h"
+
+template <typename Cache>
+static void DrawTexturesWindowImpl(ImConfig &cfg, Cache *textureCache);
+
+void DrawTexturesWindow(ImConfig &cfg, TextureCacheCommon *textureCache) {
+#ifdef PPSSPP_HAS_METAL
+	if (auto *metal = dynamic_cast<MetalTextureCacheCommon *>(textureCache)) {
+		DrawTexturesWindowImpl(cfg, metal);
+		return;
+	}
+#endif
+	DrawTexturesWindowImpl(cfg, textureCache);
+}
 
 void DrawFramebuffersWindow(ImConfig &cfg, FramebufferManagerCommon *framebufferManager) {
 	ImGui::SetNextWindowSize(ImVec2(520, 600), ImGuiCond_FirstUseEver);
@@ -109,7 +125,8 @@ void DrawFramebuffersWindow(ImConfig &cfg, FramebufferManagerCommon *framebuffer
 	ImGui::End();
 }
 
-void DrawTexturesWindow(ImConfig &cfg, TextureCacheCommon *textureCache) {
+template <typename Cache>
+static void DrawTexturesWindowImpl(ImConfig &cfg, Cache *textureCache) {
 	ImGui::SetNextWindowSize(ImVec2(520, 600), ImGuiCond_FirstUseEver);
 	if (!ImGui::Begin("Textures", &cfg.texturesOpen)) {
 		ImGui::End();
@@ -133,11 +150,11 @@ void DrawTexturesWindow(ImConfig &cfg, TextureCacheCommon *textureCache) {
 		ImGui::Text("Primary Cache");
 	}
 
-	auto listTextureCache = [&cfg, &textureCache, &style, window_visible_x2, &replacementStateCounts](const TexCache &cache, bool isSecondary) {
+	auto listTextureCache = [&cfg, &textureCache, &style, window_visible_x2, &replacementStateCounts](const auto &cache, bool isSecondary) {
 		for (auto &[key, value] : cache) {
 			u64 id = key;
 			ImGui::PushID((void *)id);
-			const TexCacheEntry *entry = value.get();
+			const auto *entry = value.get();
 			void *nativeView = textureCache->GetNativeTextureView(value.get(), true);
 			int w = 128;
 			int h = 128;
@@ -184,7 +201,7 @@ void DrawTexturesWindow(ImConfig &cfg, TextureCacheCommon *textureCache) {
 			if (iter != cache.end()) {
 				void *nativeView = textureCache->GetNativeTextureView(iter->second.get(), true);
 				ImTextureID texId = ImGui_ImplThin3d_AddNativeTextureTemp(nativeView);
-				const TexCacheEntry *entry = iter->second.get();
+				const auto *entry = iter->second.get();
 				int dim = entry->dim;
 				int w = dimWidth(dim);
 				int h = dimHeight(dim);
@@ -1436,8 +1453,9 @@ void ImGeDebuggerWindow::Draw(ImConfig &cfg, ImControl &control, GPUCommon *gpuD
 			} else if (!gstate.isTextureMapEnabled()) {
 				ImGui::Text("(texturing not enabled");
 			} else if (TextureCacheCommon *texcache = gpuDebug->GetTextureCacheCommon()) {  // We don't bother with the texture if previewCmd is BOUNDING_BOX - no texturing happens there.
-				TextureApplyResult result = texcache->ApplyTexture(false);
-				if (TexCacheEntry *tex = result.texCacheEntry) {
+				auto drawTexture = [&](auto *texcache) {
+				auto result = texcache->ApplyTexture(false);
+				if (auto *tex = result.texCacheEntry) {
 					ImGui::Text("Texture: %08x", tex->addr);
 
 					void *nativeView = texcache->GetNativeTextureView(tex, true);
@@ -1470,6 +1488,16 @@ void ImGeDebuggerWindow::Draw(ImConfig &cfg, ImControl &control, GPUCommon *gpuD
 					// Will end up here in the CLUT8 texture cache for now :/
 					ImGui::Text("(no valid texture bound)");
 				}
+				};
+#ifdef PPSSPP_HAS_METAL
+				if (auto *metal = dynamic_cast<MetalTextureCacheCommon *>(texcache)) {
+					drawTexture(metal);
+				} else
+#endif
+				{
+					drawTexture(texcache);
+				}
+
 			} else {
 				// Software mode?
 				ImGui::Text("(texture cache not available)");

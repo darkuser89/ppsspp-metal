@@ -381,6 +381,7 @@ public:
 	int iSkipGPUReadbackMode;  // 0 = off, 1 = skip, 2 = to texture
 	int iSplineBezierQuality; // 0 = low , 1 = Intermediate , 2 = High
 	bool bShaderCache;  // Hidden ini-only setting, useful for debugging shader compile times.
+	bool bMetalFXSpatial;
 	bool bUberShaderVertex;
 	int iDefaultTab;
 	int iScreenshotMode;
@@ -759,7 +760,10 @@ public:
 	bool IsBackendEnabled(GPUBackend backend);
 
 	bool LoadAppendedConfig();
-	void SetAppendedConfigIni(const Path &path) { appendedConfigFileName_ = path; }
+	void SetAppendedConfigIni(const Path &path, bool saveAfterLoad = true) {
+		appendedConfigFileName_ = path;
+		saveAppendedConfigAfterLoad_ = saveAfterLoad;
+	}
 	void UpdateAfterSettingAutoFrameSkip();
 	void NotifyUpdatedCpuCore();
 
@@ -811,6 +815,7 @@ private:
 
 	Path searchPath_;
 	Path appendedConfigFileName_;
+	bool saveAppendedConfigAfterLoad_ = true;
 	// A set make more sense, but won't have many entry, and I dont want to include the whole std::set header here
 	std::vector<std::string> appendedConfigUpdatedGames_;
 	std::vector<void *> settingsNotToSave_;

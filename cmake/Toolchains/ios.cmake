@@ -10,13 +10,17 @@
 
 # PPSSPP platform flags
 set(MOBILE_DEVICE ON)
-# The compiler checks re-read this file without the cache, so pass IOS_APP_STORE on.
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES IOS_APP_STORE)
+# The compiler checks re-read this file without the cache, so pass these options on.
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES IOS_APP_STORE PPSSPP_IOS_DEPLOYMENT_TARGET)
 # The static MoltenVK in ios/MoltenVK needs 15.0.
-set(IPHONEOS_DEPLOYMENT_TARGET 15.0)
+if(DEFINED PPSSPP_IOS_DEPLOYMENT_TARGET)
+  set(IPHONEOS_DEPLOYMENT_TARGET ${PPSSPP_IOS_DEPLOYMENT_TARGET})
+else()
+  set(IPHONEOS_DEPLOYMENT_TARGET 15.0)
+endif()
 add_definitions(-U__STRICT_ANSI__)
 
-# Only the libretro core uses GL on iOS. The app is Vulkan (MoltenVK) only.
+# Only the libretro core uses GL on iOS. The app uses Vulkan (MoltenVK) or Metal.
 if(LIBRETRO)
   set(USING_GLES2 ON)
   add_definitions(-DGL_ETC1_RGB8_OES=0)
@@ -76,11 +80,13 @@ set(CMAKE_IOS_SDK_ROOT ${CMAKE_IOS_SDK_ROOT} CACHE PATH "Location of the selecte
 # Set the sysroot default to the most recent SDK
 set(CMAKE_OSX_SYSROOT ${CMAKE_IOS_SDK_ROOT} CACHE PATH "Sysroot used for iOS support")
 
-# set the architecture for iOS 
-if(IOS_PLATFORM STREQUAL "OS" OR IOS_PLATFORM STREQUAL "TVOS")
-  set(IOS_ARCH "arm64")
-else()
-  set(IOS_ARCH "i386;x86_64")
+# Set the target architecture, unless explicitly selected by the caller.
+if(NOT IOS_ARCH)
+  if(IOS_PLATFORM STREQUAL "OS" OR IOS_PLATFORM STREQUAL "TVOS" OR CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
+    set(IOS_ARCH "arm64")
+  else()
+    set(IOS_ARCH "x86_64")
+  endif()
 endif()
 
 set(CMAKE_OSX_ARCHITECTURES "${IOS_ARCH}" CACHE STRING "Build architecture for iOS")

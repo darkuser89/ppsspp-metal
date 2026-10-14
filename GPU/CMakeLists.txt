@@ -198,6 +198,35 @@ set(GPU_SOURCES
 # from an archive, which sidesteps the GNU ld single-pass archive-ordering problem a normal
 # two-way STATIC dependency would hit. Core links this PUBLICLY so consumers of Core get it.
 add_library(GPU OBJECT ${GPU_SOURCES})
+if(APPLE AND NOT IOS AND NOT LIBRETRO)
+	target_compile_definitions(GPU PUBLIC PPSSPP_HAS_METAL=1)
+	target_sources(GPU PRIVATE
+		metal3/FragmentShaderGeneratorMetal.cpp
+		metal3/TextureShaderMetal.cpp
+		metal3/GPUCommonHWMetal.cpp
+		metal3/TextureCachePolicyMetal.cpp
+		metal3/TextureReplacerMetal.cpp
+		metal3/ReplacedTextureMetal.cpp
+		metal3/PresentationMetal.cpp
+		metal3/PostShaderMetal.cpp
+		metal3/GPU_Metal.h
+		metal3/GPU_Metal.mm
+		metal3/ShaderManagerMetal.h
+		metal3/ShaderManagerMetal.mm
+		metal3/PipelineManagerMetal.h
+		metal3/PipelineManagerMetal.mm
+		metal3/TextureCacheMetal.h
+		metal3/TextureCacheMetal.mm
+		metal3/FramebufferManagerMetal.h
+		metal3/FramebufferManagerMetal.cpp
+		metal3/DrawEngineMetal.h
+		metal3/DrawEngineMetal.mm
+		metal3/StateMappingMetal.h
+		metal3/StateMappingMetal.mm
+	)
+	set_source_files_properties(metal3/ShaderManagerMetal.mm metal3/PipelineManagerMetal.mm metal3/TextureCacheMetal.mm
+		metal3/DrawEngineMetal.mm metal3/StateMappingMetal.mm metal3/GPU_Metal.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+endif()
 target_compile_features(GPU PUBLIC cxx_std_17)
 
 if(LIBRETRO)

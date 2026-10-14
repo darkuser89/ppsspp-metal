@@ -1,0 +1,124 @@
+// Copyright (c) 2026- PPSSPP Project.
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+#include "Common/GPU/metal3/MetalBackend.h"
+
+#include <array>
+#include <map>
+#include <vector>
+
+#include "Common/GPU/metal3/MetalRenderContext.h"
+#include "Common/GPU/thin3d.h"
+
+namespace Metal {
+
+MTLPixelFormat PixelFormat(Draw::DataFormat format);
+MTLVertexFormat VertexFormat(Draw::DataFormat format);
+uint32_t FormatSupport(id<MTLDevice> device, Draw::DataFormat format);
+int MaxTextureDimension(id<MTLDevice> device);
+bool SupportsDepthStencilResolve(id<MTLDevice> device);
+bool SupportsMultisampleArrays(id<MTLDevice> device);
+
+class Buffer final : public Draw::Buffer {
+public:
+	static Buffer *Create(id<MTLDevice> device, size_t size, uint32_t usage);
+	bool Update(id<MTLDevice> device, const uint8_t *data, size_t offset, size_t size, Draw::UpdateBufferFlags flags);
+	// Each changed dynamic version gets a separate upload slice so encoded
+	// draws keep their original bytes until the command buffer completes.
+	UploadSlice Snapshot(RenderContext &context, std::string *error);
+	size_t Size() const { return dynamic_ ? data_.size() : buffer_.length; }
+	const uint8_t *Data() const { return dynamic_ ? data_.data() : (const uint8_t *)buffer_.contents; }
+
+private:
+	bool dynamic_ = false;
+	id<MTLBuffer> buffer_ = nil;
+	std::vector<uint8_t> data_;
+	UploadSlice snapshot_;
+	uint64_t snapshotGeneration_ = 0;
+	bool dirty_ = true;
+};
+
+class Texture final : public Draw::Texture {
+public:
+	static Texture *Create(RenderContext &context, const Draw::TextureDesc &desc, std::string *error, bool storage = false);
+	bool Update(RenderContext &context, const uint8_t **data, Draw::TextureCallback callback, int levels, std::string *error);
+	bool UpdateRegions(RenderContext &context, int level, const Draw::TextureRegionUpdate *regions, int numRegions, std::string *error);
+	id<MTLTexture> Native() const { return texture_; }
+	id<MTLTexture> ArrayView() const;
+
+private:
+	bool Upload(RenderContext &context, const uint8_t *const *data, Draw::TextureCallback callback, int levels,
+		bool initialize, std::string *error);
+	id<MTLTexture> texture_ = nil;
+	mutable id<MTLTexture> arrayView_ = nil;
+};
+
+class Framebuffer final : public Draw::Framebuffer {
+public:
+	static Framebuffer *Create(id<MTLDevice> device, const Draw::FramebufferDesc &desc, std::string *error);
+	static Framebuffer *Wrap(id<MTLTexture> color, id<MTLTexture> depthStencil, std::string *error);
+	void UpdateTag(const char *tag) override;
+	const char *Tag() const override { return tag_.c_str(); }
+	id<MTLTexture> Color() const { return color_; }
+	id<MTLTexture> DepthStencil() const { return depthStencil_; }
+	id<MTLTexture> ColorArray() const;
+	id<MTLTexture> DepthStencilArray() const;
+	id<MTLTexture> ColorAttachment() const { return multisampleColor_ ? multisampleColor_ : color_; }
+	id<MTLTexture> DepthStencilAttachment() const { return multisampleDepthStencil_ ? multisampleDepthStencil_ : depthStencil_; }
+	id<MTLTexture> ColorLayer(int layer) const { return layers_ == 1 ? color_ : colorLayers_[layer]; }
+	id<MTLTexture> DepthStencilLayer(int layer) const { return layers_ == 1 ? depthStencil_ : depthStencilLayers_[layer]; }
+	id<MTLTexture> ColorAttachmentLayer(int layer) const { return multisampleColor_ ? multisampleColor_ : ColorLayer(layer); }
+	id<MTLTexture> DepthStencilAttachmentLayer(int layer) const { return multisampleDepthStencil_ ? multisampleDepthStencil_ : DepthStencilLayer(layer); }
+	bool OwnsTexture(id<MTLTexture> texture) const;
+	int SampleCount() const { return 1 << multiSampleLevel_; }
+	// Keep multisample attachments for subsequent draws. The depth/stencil
+	// texture is resolved when a transfer, readback, or shader needs it.
+	void SetRenderAttachments(MTLRenderPassDescriptor *pass, int layer = -1) const;
+	void MarkDepthStencilUnresolved() { if (multisampleDepthStencil_) depthStencilResolveDirty_ = true; }
+	void MarkDepthStencilResolved() { depthStencilResolveDirty_ = false; }
+	bool NeedsDepthStencilResolve() const { return depthStencilResolveDirty_; }
+	bool ResolveDepthStencil(RenderContext &context, std::string *error);
+
+private:
+	id<MTLTexture> color_ = nil;
+	id<MTLTexture> depthStencil_ = nil;
+	mutable id<MTLTexture> colorArray_ = nil;
+	mutable id<MTLTexture> depthStencilArray_ = nil;
+	id<MTLTexture> multisampleColor_ = nil;
+	id<MTLTexture> multisampleDepthStencil_ = nil;
+	bool depthStencilResolveDirty_ = false;
+	std::array<id<MTLTexture>, 2> colorLayers_{};
+	std::array<id<MTLTexture>, 2> depthStencilLayers_{};
+	std::string tag_;
+};
+
+// Rendering-thread transfer pipelines. Copies into MSAA targets retain samples
+// when the counts match, and expand resolved pixels when the counts differ.
+class FramebufferCopy {
+public:
+	bool Copy(RenderContext &context, Framebuffer *src, int sx, int sy, Framebuffer *dst,
+		int dx, int dy, int width, int height, Draw::Aspect aspects, std::string *error);
+	bool Blit(RenderContext &context, Framebuffer *src, int sx, int sy, int srcWidth, int srcHeight,
+		Framebuffer *dst, int dx, int dy, int dstWidth, int dstHeight, Draw::Aspect aspects,
+		Draw::FBBlitFilter filter, std::string *error);
+
+private:
+	struct Pipeline {
+		id<MTLRenderPipelineState> render = nil;
+		id<MTLDepthStencilState> depthStencil = nil;
+	};
+	std::map<std::array<uint64_t, 7>, Pipeline> pipelines_;
+	id<MTLFunction> vertex_ = nil;
+};
+
+// Encoders must have ended before these operations. The caller owns render-pass
+// restart/invalidation. Readback submits and waits for prior work on this queue.
+bool CopyImage(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
+	id<MTLTexture> dst, int dstX, int dstY, int width, int height, std::string *error);
+bool CopyDepthStencil(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
+	id<MTLTexture> dst, int dstX, int dstY, int width, int height, Draw::Aspect aspects, std::string *error);
+bool Readback(RenderContext &context, id<MTLTexture> texture, Draw::Aspect aspect,
+	int x, int y, int width, int height, Draw::DataFormat format, void *pixels, int pixelStride, std::string *error, int level = 0, int z = 0);
+
+}  // namespace Metal

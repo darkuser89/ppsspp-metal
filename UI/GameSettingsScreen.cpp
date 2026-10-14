@@ -1,3 +1,7 @@
+#ifdef PPSSPP_HAS_METAL
+#include "Common/GPU/metal3/MetalBackend.h"
+#include "GPU/metal3/PostShaderMetal.h"
+#endif
 
 // Copyright (c) 2013- PPSSPP Project.
 
@@ -163,12 +167,14 @@ void GameSettingsScreen::PreCreateViews() {
 }
 
 static bool UsingHardwareTextureScaling() {
-	// For now, Vulkan only.
-	return g_Config.bTexHardwareScaling && GetGPUBackend() == GPUBackend::VULKAN && !g_Config.bSoftwareRendering;
+	return g_Config.bTexHardwareScaling && (GetGPUBackend() == GPUBackend::VULKAN || GetGPUBackend() == GPUBackend::METAL) && !g_Config.bSoftwareRendering;
 }
 
 static std::string TextureTranslateName(std::string_view value) {
 	const TextureShaderInfo *info = GetTextureShaderInfo(value);
+#ifdef PPSSPP_HAS_METAL
+	if (GetGPUBackend() == GPUBackend::METAL) { info = MetalGetTextureShaderInfo(value); }
+#endif
 	if (info) {
 		auto ts = GetI18NCategory(I18NCat::TEXTURESHADERS);
 		return std::string(ts->T(value, info->name.c_str()));
@@ -279,7 +285,7 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 	Draw::DrawContext *draw = screenManager()->getDrawContext();
 
 #if !PPSSPP_PLATFORM(UWP)
-	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan" };
+	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Metal" };
 	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), I18NCat::GRAPHICS, screenManager()));
 	renderingBackendChoice->SetPreOpenCallback([this](UI::PopupMultiChoice *choice) {
 		// Don't filter until the last possible moment, since it involves trying to initialize Vulkan, if we were
@@ -293,6 +299,9 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 			choice->HideChoice((int)GPUBackend::DIRECT3D11);
 		if (!g_Config.IsBackendEnabled(GPUBackend::VULKAN))
 			choice->HideChoice((int)GPUBackend::VULKAN);
+		if (!g_Config.IsBackendEnabled(GPUBackend::METAL)) {
+			choice->HideChoice((int)GPUBackend::METAL);
+		}
 	});
 
 	if (!IsFirstInstance()) {
@@ -415,6 +424,12 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 		});
 	}
 
+	#ifdef PPSSPP_HAS_METAL
+	if (Metal::SupportsSpatialUpscaling(draw)) {
+		graphicsSettings->Add(new CheckBox(&g_Config.bMetalFXSpatial, gr->T("MetalFX Spatial upscaling")));
+	}
+
+	#endif
 	// If only one mode is supported (like FIFO on iOS), no need to show the options.
 	if (CountSetBits((u32)draw->GetDeviceCaps().presentModesSupported) > 1) {
 		// Immediate means non-synchronized, tearing.
@@ -527,7 +542,7 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 
 	graphicsSettings->Add(new ItemHeader(gr->T("Texture upscaling")));
 
-	if (GetGPUBackend() == GPUBackend::VULKAN) {
+	if (GetGPUBackend() == GPUBackend::VULKAN || GetGPUBackend() == GPUBackend::METAL) {
 		ChoiceWithValueDisplay *textureShaderChoice = graphicsSettings->Add(new ChoiceWithValueDisplay(&g_Config.sTextureShaderName, gr->T("GPU texture upscaler (fast)"), &TextureTranslateName));
 		textureShaderChoice->OnClick.Add([this](UI::EventParams &e) {
 			auto gr = GetI18NCategory(I18NCat::GRAPHICS);

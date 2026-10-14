@@ -8,6 +8,12 @@
 
 #include "SDLCocoaMetalLayer.h"
 
+void runWithCocoaAutoreleasePool(void (*callback)(void *), void *context) {
+	@autoreleasepool {
+		callback(context);
+	}
+}
+
 void *makeWindowMetalCompatible(void *window) {
 	// https://github.com/KhronosGroup/MoltenVK/issues/78#issuecomment-371118536
 #if PPSSPP_PLATFORM(MAC)

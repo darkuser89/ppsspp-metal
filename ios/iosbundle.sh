@@ -21,7 +21,7 @@ FULL_VERSION=$(echo ${GIT_VERSION_LINE} | perl -pe "s/${LONG_VERSION_MATCH}/\$1/
 echo "Full version string: $FULL_VERSION"
 
 # Crunches to version number to something that XCode will validate.
-SHORT_VERSION=$(perl $2/../ios/version-transform.pl $FULL_VERSION)
+SHORT_VERSION=$(perl "$(dirname "$0")/version-transform.pl" "$FULL_VERSION")
 #LONG_VERSION=$FULL_VERSION
 
 # Turns out we can't have anything except numbers or dots, or XCode will crash

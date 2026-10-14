@@ -184,6 +184,7 @@ const char *g_ExceptionActionValues[] = {
 };
 
 #define POFF(member) offsetof(CommandLineOptions, member)
+
 static const CommandLineParam g_autoParams[] = {
 	{POFF(fullscreen), CmdParamType::Bool, "fullscreen", '\0', "Force full screen mode", CmdLineMode::Application},
 	{POFF(fullscreen), CmdParamType::BoolInverse, "windowed", '\0', "Force windowed mode", CmdLineMode::Application},
@@ -459,6 +460,9 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 			} else if (restOfOption == "software") {
 				gpuBackend = GPUBackend::OPENGL;
 				softwareRendering = true;
+			} else if (restOfOption == "metal") {
+				gpuBackend = GPUBackend::METAL;
+				softwareRendering = false;
 			} else if (sscanf(restOfOption.c_str(), "gles%lg", &glVersionTemp) == 1 || sscanf(restOfOption.c_str(), "opengl%lg", &glVersionTemp) == 1) {
 				gpuBackend = GPUBackend::OPENGL;
 				softwareRendering = false;
@@ -623,7 +627,6 @@ void CommandLineOptions::ApplyToConfig() const {
 		g_Config.iInternalResolution = resolutionScale.value();
 		g_Config.DoNotSaveSetting(&g_Config.iInternalResolution);
 	}
-
 	if (msaa.has_value()) {
 		g_Config.iMultiSampleLevel = msaa.value();
 		g_Config.DoNotSaveSetting(&g_Config.iMultiSampleLevel);

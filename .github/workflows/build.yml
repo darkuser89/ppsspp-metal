@@ -4,6 +4,7 @@ on:
   push:
     branches:
     - master
+    - metal3-native
     # For testing.
     - actions
     tags:

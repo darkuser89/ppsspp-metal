@@ -1,3 +1,7 @@
+#ifdef PPSSPP_HAS_METAL
+#include "Common/GPU/metal3/MetalBackend.h"
+#include "GPU/metal3/PostShaderMetal.h"
+#endif
 // Copyright (c) 2013- PPSSPP Project.
 
 // This program is free software: you can redistribute it and/or modify
@@ -242,8 +246,18 @@ void TextureShaderScreen::CreateViews() {
 	ReloadAllPostShaderInfo(screenManager()->getDrawContext());
 	
 	shaders_ = GetAllTextureShaderInfo();
+#ifdef PPSSPP_HAS_METAL
+	if (Metal::IsBackend(screenManager()->getDrawContext())) {
+		MetalReloadAllPostShaderInfo(screenManager()->getDrawContext());
+		shaders_ = MetalTextureShaderList();
+	}
+#endif
 	for (int i = 0; i < (int)shaders_.size(); ) {
-		if (shaders_[i].hidden) {
+		if (shaders_[i].hidden
+#ifdef PPSSPP_HAS_METAL
+			|| (GetGPUBackend() == GPUBackend::METAL && shaders_[i].section != "Off" && !MetalTextureShaderSupported(shaders_[i].section))
+#endif
+		) {
 			shaders_.erase(shaders_.begin() + i);
 		} else {
 			i++;

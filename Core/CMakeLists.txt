@@ -805,6 +805,16 @@ endif()
 
 setup_target_project(Core Core)
 
+# Xcode can schedule compilation before GitVersion has produced this source.
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+	execute_process(
+		COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT_DIR=${CMAKE_BINARY_DIR} -P ${CMAKE_SOURCE_DIR}/git-version.cmake
+		RESULT_VARIABLE gitVersionResult)
+	if(NOT gitVersionResult EQUAL 0)
+		message(FATAL_ERROR "Failed to prepare git-version.cpp for Xcode")
+	endif()
+endif()
+
 # Generate git-version at build time.
 add_custom_target(GitVersion DEPENDS something_that_never_exists)
 

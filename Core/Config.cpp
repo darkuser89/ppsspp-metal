@@ -26,6 +26,9 @@
 #include "ppsspp_config.h"
 
 #include "Common/GPU/OpenGL/GLFeatures.h"
+#ifdef PPSSPP_HAS_METAL
+#include "Common/GPU/metal3/MetalGraphicsContext.h"
+#endif
 #include "Common/Net/HTTPClient.h"
 #include "Common/Net/URL.h"
 
@@ -80,6 +83,8 @@ std::string GPUBackendToString(GPUBackend backend) {
 		return "DIRECT3D11";
 	case GPUBackend::VULKAN:
 		return "VULKAN";
+	case GPUBackend::METAL:
+		return "METAL";
 	}
 	// Intentionally not a default so we get a warning.
 	return "INVALID";
@@ -92,6 +97,9 @@ GPUBackend GPUBackendFromString(std::string_view backend) {
 		return GPUBackend::DIRECT3D11;
 	if (equalsNoCase(backend, "VULKAN") || backend == "3")
 		return GPUBackend::VULKAN;
+	if (equalsNoCase(backend, "METAL") || backend == "4") {
+		return GPUBackend::METAL;
+	}
 	return GPUBackend::OPENGL;
 }
 
@@ -496,6 +504,11 @@ static int DefaultGPUBackend() {
 #endif
 
 #elif PPSSPP_PLATFORM(IOS) && !defined(__LIBRETRO__)
+#if defined(PPSSPP_IOS_DEFAULT_METAL) && defined(PPSSPP_HAS_METAL)
+	if (MetalIsAvailable()) {
+		return (int)GPUBackend::METAL;
+	}
+#endif
 	return (int)GPUBackend::VULKAN;
 #endif
 
@@ -556,6 +569,15 @@ int Config::NextValidBackend() {
 }
 
 bool Config::IsBackendEnabled(GPUBackend backend) {
+#ifndef PPSSPP_HAS_METAL
+	if (backend == GPUBackend::METAL) {
+		return false;
+	}
+#else
+	if (backend == GPUBackend::METAL && !MetalIsAvailable()) {
+		return false;
+	}
+#endif
 	std::vector<std::string> split;
 
 	SplitString(sDisabledGPUBackends, ',', split);
@@ -764,6 +786,7 @@ static const ConfigSetting graphicsSettings[] = {
 	ConfigSetting("MultiThreading", SETTING(g_Config, bRenderMultiThreading), true, CfgFlag::DEFAULT),
 
 	ConfigSetting("ShaderCache", SETTING(g_Config, bShaderCache), true, CfgFlag::DEFAULT),
+	ConfigSetting("MetalFXSpatial", SETTING(g_Config, bMetalFXSpatial), false, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("GpuLogProfiler", SETTING(g_Config, bGpuLogProfiler), false, CfgFlag::DEFAULT),
 
 	ConfigSetting("UberShaderVertex", SETTING(g_Config, bUberShaderVertex), true, CfgFlag::DEFAULT),
@@ -1261,7 +1284,9 @@ bool Config::LoadAppendedConfig() {
 
 	INFO_LOG(Log::Config, "Loaded appended config '%s'.", appendedConfigFileName_.c_str());
 
-	Save("Loaded appended config"); // Let's prevent reset
+	if (saveAppendedConfigAfterLoad_) {
+		Save("Loaded appended config"); // Let's prevent reset
+	}
 	return true;
 }
 
@@ -1571,7 +1596,7 @@ void Config::PostLoadCleanup() {
 
 	if (iGPUBackend == 1) {  // d3d9, no longer supported. Fall back to D3D11.
 		iGPUBackend = (int)GPUBackend::DIRECT3D11;
-	} else if (iGPUBackend < 0 || iGPUBackend > 3) {
+	} else if (iGPUBackend < (int)GPUBackend::OPENGL || iGPUBackend > (int)GPUBackend::METAL) {
 		iGPUBackend = (int)DefaultGPUBackend();
 	}
 
