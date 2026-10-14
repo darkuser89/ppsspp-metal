@@ -99,6 +99,13 @@ public:
 	bool PresentedThisFrame() const override;
 
 private:
+	void UpdateState(GPURunState state) {
+		gpuState = state;
+		if (state != GPUSTATE_RUNNING) {
+			downcount = 0;
+		}
+	}
+
 	void CheckDepthUsage(VirtualFramebuffer *vfb) override;
 	void CheckFlushOp(int cmd, u32 diff);
 
