@@ -1870,7 +1870,7 @@ void MetalDrawContext::InvalidateFramebuffer(FBInvalidationStage stage, Aspect a
 
 std::string MetalDrawContext::GetInfoString(InfoField info) const {
 	switch (info) {
-	case InfoField::APINAME: return "Metal";
+	case InfoField::APINAME: return PPSSPP_PLATFORM(MAC) ? "Metal 3" : "Metal";
 	case InfoField::APIVERSION: return "3";
 	case InfoField::SHADELANGVERSION: return "MSL 3.0";
 	case InfoField::VENDOR: return caps_.vendor == GPUVendor::VENDOR_APPLE ? "Apple" : "Unknown";
@@ -1922,7 +1922,7 @@ DrawContext *T3DCreateMetalContext(std::string *error) {
 
 namespace Metal {
 bool IsBackend(Draw::DrawContext *draw) {
-	return draw && draw->GetInfoString(Draw::InfoField::APINAME) == "Metal";
+	return dynamic_cast<Draw::MetalDrawContext *>(draw) != nullptr;
 }
 bool SupportsSpatialUpscaling(Draw::DrawContext *draw) {
 	return IsBackend(draw) && static_cast<Draw::MetalDrawContext *>(draw)->SupportsSpatialUpscaling();

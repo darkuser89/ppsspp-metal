@@ -19,6 +19,11 @@ bool SameScissor(const MTLScissorRect &a, const MTLScissorRect &b) {
 }
 
 DrawEngineMetal::DrawEngineMetal(Draw::DrawContext *draw) {
+#if PPSSPP_PLATFORM(MAC)
+	// Later batches may decode over vertices that the tessellated surface
+	// still references. Keep its source outside the decoder output buffer.
+	curvesPredecoded_ = false;
+#endif
 	DeviceRestore(draw);
 }
 
@@ -198,6 +203,20 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	SoftwareTransformResult transformed{};
 	SoftwareTransformAction action = SW_DRAW_INDEXED;
 	if (!hardware) {
+		int transformIndexCapacity = RemainingIndices(indices);
+#if PPSSPP_PLATFORM(MAC)
+		// Tessellation can keep later batches in decIndex_. Expand and clip this
+		// batch separately so its generated indices cannot overwrite those inputs.
+		if (count > 0 && gstate_c.submitType != SubmitType::DRAW) {
+			const size_t requiredIndices = (size_t)count * (prim == GE_PRIM_POINTS ? 7 : 4);
+			if (softwareIndices_.size() < requiredIndices) {
+				softwareIndices_.resize(requiredIndices);
+			}
+			memcpy(softwareIndices_.data(), indices, (size_t)count * sizeof(uint16_t));
+			indices = softwareIndices_.data();
+			transformIndexCapacity = (int)softwareIndices_.size();
+		}
+#endif
 		if (gstate.getShadeMode() == GE_SHADE_FLAT) {
 			IndexBufferProvokingLastToFirst(prim, indices, count);
 		}
@@ -219,7 +238,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 			gstate.getScissorY2() + 1 >= framebufferManager_->GetTargetBufferHeight();
 		params.allowSeparateAlphaClear = false;
 		action = RunSoftwareTransform(params, prim, dec_->VertexType(), dec_->GetDecVtxFmt(), numDecodedVerts_,
-			VERTEX_BUFFER_MAX, count, indices, RemainingIndices(indices), &transformed);
+			VERTEX_BUFFER_MAX, count, indices, transformIndexCapacity, &transformed);
 		vertices = transformed.drawBuffer;
 		vertexCount = transformed.drawVertexCount;
 		count = transformed.drawIndexCount;
@@ -356,6 +375,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		return false;
 	}
 	if (textureEnabled) {
+		textureCache_->BindSamplingRegion(nullptr, nullptr);
 		textureCache_->RestoreGETextureBindings();
 	}
 	if (!shaderManager_->BindUniforms(encoder, error) || !manager_->BindTextures(encoder, pipeline->textureMask, error)) {
@@ -410,7 +430,53 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	[encoder setVertexBuffer:vb.buffer offset:vb.offset atIndex:Metal::VERTEX_BUFFER_SLOT];
 	MTLPrimitiveType topology = hardware && prim == GE_PRIM_TRIANGLE_STRIP ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
 	const NSUInteger instances = gstate_c.Use(GPU_USE_SINGLE_PASS_STEREO) && manager_->RenderTarget()->Layers() > 1 ? 2 : 1;
-	if (indexed) {
+	bool regionBatch = textureEnabled && textureCache_->HasScaledTexture() && !hardware && indexed &&
+		count % 6 == 0 && vertexCount == count / 6 * 4;
+	if (regionBatch) {
+		for (int i = 0; i < count / 6; ++i) {
+			unsigned used = 0;
+			for (int j = 0; j < 6; ++j) {
+				const int index = indices[i * 6 + j] - i * 4;
+				if (index < 0 || index >= 4) {
+					regionBatch = false;
+					break;
+				}
+				used |= 1u << index;
+			}
+			if (used != 15) {
+				regionBatch = false;
+				break;
+			}
+		}
+	}
+	if (regionBatch) {
+		// Keep the original batch unless at least one quad needs atlas isolation.
+		regionBatch = false;
+		std::array<TransformedVertex, 4> adjusted;
+		for (int i = 0; i < vertexCount; i += 4) {
+			if (textureCache_->BindSamplingRegion(static_cast<const TransformedVertex *>(vertices) + i, adjusted.data(), mtlViewport)) {
+				regionBatch = true;
+				break;
+			}
+		}
+	}
+	if (regionBatch) {
+		for (int i = 0; i < count / 6; ++i) {
+			std::array<TransformedVertex, 4> adjusted;
+			const bool cropped = textureCache_->BindSamplingRegion(static_cast<const TransformedVertex *>(vertices) + i * 4, adjusted.data(), mtlViewport);
+			auto vertexBuffer = cropped ? context.Upload(adjusted.data(), sizeof(adjusted), error) : vb;
+			if (!vertexBuffer) {
+				return false;
+			}
+			textureCache_->RestoreGETextureBindings();
+			if (!manager_->BindTextures(encoder, pipeline->textureMask, error)) {
+				return false;
+			}
+			[encoder setVertexBuffer:vertexBuffer.buffer offset:vertexBuffer.offset atIndex:Metal::VERTEX_BUFFER_SLOT];
+			[encoder drawIndexedPrimitives:topology indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:ib.buffer
+				indexBufferOffset:ib.offset + i * 6 * sizeof(uint16_t) instanceCount:instances baseVertex:cropped ? -i * 4 : 0 baseInstance:0];
+		}
+	} else if (indexed) {
 		[encoder drawIndexedPrimitives:topology indexCount:count indexType:MTLIndexTypeUInt16 indexBuffer:ib.buffer indexBufferOffset:ib.offset instanceCount:instances];
 	} else {
 		[encoder drawPrimitives:topology vertexStart:0 vertexCount:count instanceCount:instances];

@@ -13,7 +13,6 @@
 #include <thread>
 #include "Common/GPU/GraphicsContext.h"
 #include "Common/GPU/Vulkan/VulkanGraphicsContext.h"
-#include "Common/GPU/Metal/MetalGraphicsContext.h"
 #include "Common/System/Request.h"
 #include "Common/System/System.h"
 #include "Common/Input/InputState.h"
@@ -596,25 +595,13 @@ static int GetPickerRequestId(id picker) {
 	keyboardInputView_ = [[KeyboardInputView alloc] initWithFrame:CGRectZero];
 	[self.view addSubview:keyboardInputView_];
 
-	const bool nativeMetal = g_Config.iGPUBackend == (int)GPUBackend::METAL;
-	graphicsContext = nativeMetal ? static_cast<GraphicsContext *>(new MetalGraphicsContext()) :
-		static_cast<GraphicsContext *>(new VulkanGraphicsContext());
+	graphicsContext = new VulkanGraphicsContext();
 	std::string errorMessage;
-	if (!graphicsContext->InitAPI(nullptr, nativeMetal ? nullptr : &g_Config.sVulkanDevice, &errorMessage)) {
-		ERROR_LOG(Log::System, "Failed to initialize %s: %s", nativeMetal ? "Metal" : "Vulkan", errorMessage.c_str());
+	if (!graphicsContext->InitAPI(nullptr, &g_Config.sVulkanDevice, &errorMessage)) {
 		delete graphicsContext;
 		graphicsContext = nullptr;  // The render loop and shutdown check for this.
-		if (nativeMetal && g_Config.IsBackendEnabled(GPUBackend::VULKAN)) {
-			graphicsContext = new VulkanGraphicsContext();
-			if (graphicsContext->InitAPI(nullptr, &g_Config.sVulkanDevice, &errorMessage)) {
-				g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
-				SetGPUBackend(GPUBackend::VULKAN);
-			} else {
-				ERROR_LOG(Log::System, "Failed to initialize Vulkan fallback: %s", errorMessage.c_str());
-				delete graphicsContext;
-				graphicsContext = nullptr;
-			}
-		}
+		// There's no other backend to fall back to.
+		ERROR_LOG(Log::System, "Failed to initialize Vulkan: %s", errorMessage.c_str());
 	}
 
 	[self updateResolutionWithView:self.view];

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstring>
+#include <cmath>
 
 #include "Common/Data/Convert/ColorConv.h"
 #include "Common/GPU/metal3/MetalResources.h"
@@ -252,6 +253,9 @@ void TextureCacheMetal::UpdateScalingShader() {
 		return;
 	}
 	scalingShader_ = name;
+#if PPSSPP_PLATFORM(MAC)
+	ClearNextFrame();
+#endif
 	textureScaler_.Clear();
 	shaderScaleFactor_ = 0;
 	if (!manager_ || name.empty() || name == "Off") {
@@ -373,6 +377,8 @@ void TextureCacheMetal::ForgetLastTexture() {
 }
 
 void TextureCacheMetal::ResetGETextureBindings() {
+	temporaryRegion_.reset(nullptr);
+	geScaledTexture_ = nullptr;
 	geTexture_ = nil;
 	geSampler_ = nil;
 	geClutTexture_ = nil;
@@ -388,15 +394,187 @@ void TextureCacheMetal::RestoreGETextureBindings() {
 	manager_->SetNativeSampler(ShaderBinding::DRAW_BINDING_DEPAL_TEXTURE, geClutSampler_);
 }
 
+bool TextureCacheMetal::BindSamplingRegion(const TransformedVertex *vertices, TransformedVertex *adjusted, const MTLViewport &viewport) {
+#if PPSSPP_PLATFORM(MAC)
+	temporaryRegion_.reset(nullptr);
+	if (!geScaledTexture_) {
+		return false;
+	}
+	// A previous quad may have bound another region of this same PSP texture.
+	geTexture_ = geScaledTexture_->Native();
+	if (!vertices || geSamplerKey_.minFilt || geSamplerKey_.magFilt || geSamplerKey_.mipEnable ||
+		gstate_c.textureIsFramebuffer || gstate_c.textureIsArray || gstate_c.needShaderTexClamp || gstate_c.curTextureIs3D ||
+		viewport.width <= 0 || viewport.height <= 0 || gstate_c.curRTWidth <= 0 || gstate_c.curRTHeight <= 0) {
+		return false;
+	}
+	auto &source = scaledSources_.at(geScaledTexture_);
+	float minU = vertices[0].u, maxU = minU;
+	float minV = vertices[0].v, maxV = minV;
+	for (int i = 0; i < 4; ++i) {
+		const auto &v = vertices[i];
+		if (v.pos_w != 1.0f || v.uv_w != 1.0f || !std::isfinite(v.u) || !std::isfinite(v.v) || !std::isfinite(v.x) || !std::isfinite(v.y)) {
+			return false;
+		}
+		minU = std::min(minU, v.u);
+		maxU = std::max(maxU, v.u);
+		minV = std::min(minV, v.v);
+		maxV = std::max(maxV, v.v);
+	}
+	if (minU < 0.0f || minV < 0.0f || maxU > 1.0f || maxV > 1.0f || minU == maxU || minV == maxV) {
+		return false;
+	}
+	unsigned corners = 0;
+	for (int i = 0; i < 4; ++i) {
+		const auto &v = vertices[i];
+		if ((v.u != minU && v.u != maxU) || (v.v != minV && v.v != maxV)) {
+			return false;
+		}
+		corners |= 1u << ((v.u == maxU ? 1 : 0) | (v.v == maxV ? 2 : 0));
+	}
+	if (corners != 15) {
+		return false;
+	}
+	float minX = vertices[0].x, maxX = minX, minY = vertices[0].y, maxY = minY;
+	for (int i = 1; i < 4; ++i) {
+		minX = std::min(minX, vertices[i].x); maxX = std::max(maxX, vertices[i].x);
+		minY = std::min(minY, vertices[i].y); maxY = std::max(maxY, vertices[i].y);
+	}
+	if (minX == maxX || minY == maxY) {
+		return false;
+	}
+	const TransformedVertex *xy[4]{};
+	for (int i = 0; i < 4; ++i) {
+		if ((vertices[i].x != minX && vertices[i].x != maxX) || (vertices[i].y != minY && vertices[i].y != maxY)) {
+			return false;
+		}
+		xy[(vertices[i].x == maxX ? 1 : 0) | (vertices[i].y == maxY ? 2 : 0)] = &vertices[i];
+	}
+	if (!xy[0] || !xy[1] || !xy[2] || !xy[3] ||
+		xy[0]->u + xy[3]->u != xy[1]->u + xy[2]->u || xy[0]->v + xy[3]->v != xy[1]->v + xy[2]->v) {
+		return false;
+	}
+	const double offsetX = gstate.isModeThrough() ? 0 : gstate.getOffsetX();
+	const double offsetY = gstate.isModeThrough() ? 0 : gstate.getOffsetY();
+	const double leftX = (minX - offsetX + gstate_c.curRTOffsetX) * viewport.width / gstate_c.curRTWidth + viewport.originX;
+	const double rightX = (maxX - offsetX + gstate_c.curRTOffsetX) * viewport.width / gstate_c.curRTWidth + viewport.originX;
+	const double topY = (minY - offsetY + gstate_c.curRTOffsetY) * viewport.height / gstate_c.curRTHeight + viewport.originY;
+	const double bottomY = (maxY - offsetY + gstate_c.curRTOffsetY) * viewport.height / gstate_c.curRTHeight + viewport.originY;
+	MTLSamplePosition samples[9]{{0.5f, 0.5f}};
+	const int sampleCount = manager_->SampleCount();
+	if (sampleCount < 1 || sampleCount > 8) {
+		return false;
+	}
+	if (sampleCount > 1) {
+		[manager_->Context().Device() getDefaultSamplePositions:samples count:sampleCount];
+		// Centroid interpolation can also use the pixel center when it is inside.
+		samples[sampleCount] = {0.5f, 0.5f};
+	}
+	double firstX = rightX, lastX = leftX, firstY = bottomY, lastY = topY;
+	for (int i = 0; i < (sampleCount > 1 ? sampleCount + 1 : 1); ++i) {
+		const double x1 = std::ceil(leftX - samples[i].x) + samples[i].x;
+		const double x2 = std::ceil(rightX - samples[i].x) - 1.0 + samples[i].x;
+		const double y1 = std::ceil(topY - samples[i].y) + samples[i].y;
+		const double y2 = std::ceil(bottomY - samples[i].y) - 1.0 + samples[i].y;
+		if (x1 <= x2 && y1 <= y2) {
+			firstX = std::min(firstX, x1);
+			lastX = std::max(lastX, x2);
+			firstY = std::min(firstY, y1);
+			lastY = std::max(lastY, y2);
+		}
+	}
+	if (firstX > lastX || firstY > lastY) {
+		return false;
+	}
+	// Only point-sampled texels belong to this sprite. Bound that footprint
+	// before scaling, so a texture atlas's transparent gutters stay outside it.
+	double sampleMinU = maxU, sampleMaxU = minU, sampleMinV = maxV, sampleMaxV = minV;
+	for (double sx : {firstX, lastX}) {
+		for (double sy : {firstY, lastY}) {
+			const double tx = (sx - leftX) / (rightX - leftX), ty = (sy - topY) / (bottomY - topY);
+			const double u = xy[0]->u + (xy[1]->u - xy[0]->u) * tx + (xy[2]->u - xy[0]->u) * ty;
+			const double v = xy[0]->v + (xy[1]->v - xy[0]->v) * tx + (xy[2]->v - xy[0]->v) * ty;
+			sampleMinU = std::min(sampleMinU, u); sampleMaxU = std::max(sampleMaxU, u);
+			sampleMinV = std::min(sampleMinV, v); sampleMaxV = std::max(sampleMaxV, v);
+		}
+	}
+	const int x = std::clamp((int)std::floor(sampleMinU * source.width), 0, source.width - 1);
+	const int y = std::clamp((int)std::floor(sampleMinV * source.height), 0, source.height - 1);
+	const int right = std::clamp((int)std::floor(sampleMaxU * source.width) + 1, x + 1, source.width);
+	const int bottom = std::clamp((int)std::floor(sampleMaxV * source.height) + 1, y + 1, source.height);
+	const int width = right - x, height = bottom - y;
+	if (width <= 0 || height <= 0 || (width == source.width && height == source.height)) {
+		return false;
+	}
+	const std::array<int, 4> key{x, y, right, bottom};
+	auto region = source.regions.find(key);
+	id<MTLTexture> uncached = nil;
+	if (region == source.regions.end()) {
+		std::string error;
+		auto &context = manager_->Context();
+		auto input = context.ReserveUpload((size_t)width * height * 4, &error);
+		if (!input) {
+			return false;
+		}
+		auto *dest = (uint32_t *)((uint8_t *)input.buffer.contents + input.offset);
+		for (int row = 0; row < height; ++row) {
+			memcpy(dest + row * width, source.pixels.data() + (y + row) * source.width + x, width * 4);
+		}
+		Draw::AutoRef<Metal::Texture> texture;
+		texture.reset(textureScaler_.Scale(context, input, width, height, 1, &error));
+		if (!texture) {
+			WARN_LOG(Log::G3D, "Metal atlas region scaling failed: %s", error.c_str());
+			return false;
+		}
+		const size_t bytes = texture->Native().width * texture->Native().height * 4;
+		constexpr size_t REGION_CACHE_BYTES = 16 * 1024 * 1024;
+		// Encoded draws retain their textures until completion. Dropping cached
+		// regions here bounds retained memory without synchronizing with the GPU.
+		if (regionBytes_ + bytes > REGION_CACHE_BYTES || regionCount_ >= 256) {
+			for (auto &item : scaledSources_) {
+				item.second.regions.clear();
+			}
+			regionBytes_ = 0;
+			regionCount_ = 0;
+		}
+		if (bytes > REGION_CACHE_BYTES) {
+			temporaryRegion_ = texture;
+			uncached = texture->Native();
+		} else {
+			region = source.regions.emplace(key, texture).first;
+			regionBytes_ += bytes;
+			++regionCount_;
+		}
+	}
+	geTexture_ = uncached ? uncached : region->second->Native();
+	for (int i = 0; i < 4; ++i) {
+		adjusted[i] = vertices[i];
+		adjusted[i].u = (vertices[i].u * source.width - x) / width;
+		adjusted[i].v = (vertices[i].v * source.height - y) / height;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
 void TextureCacheMetal::BoundFramebufferTexture() {
+	geScaledTexture_ = nullptr;
 	geTexture_ = (__bridge id<MTLTexture>)(void *)draw_->GetNativeObject(Draw::NativeObject::BOUND_TEXTURE0_IMAGEVIEW);
 }
 
+const size_t TextureCacheMetal::CacheSizeEstimate() const {
+	const size_t temporaryBytes = temporaryRegion_ ? temporaryRegion_->Native().width * temporaryRegion_->Native().height * 4 : 0;
+	return MetalTextureCacheCommon::CacheSizeEstimate() + sourceBytes_ + regionBytes_ + temporaryBytes;
+}
+
 void TextureCacheMetal::BindTexture(MetalTexCacheEntry *entry) {
+	geScaledTexture_ = nullptr;
 	if (!draw_ || !manager_) {
 		return;
 	}
 	if (entry && entry->texturePtr) {
+		auto *texture = static_cast<Metal::Texture *>(entry->texturePtr);
+		geScaledTexture_ = scaledSources_.find(texture) != scaledSources_.end() ? texture : nullptr;
 		geTexture_ = (__bridge id<MTLTexture>)GetNativeTextureView(entry, false);
 		draw_->BindNativeTexture(ShaderBinding::DRAW_BINDING_TEXTURE, (__bridge void *)geTexture_);
 		return;
@@ -446,6 +624,19 @@ void TextureCacheMetal::Unbind() {
 
 void TextureCacheMetal::ReleaseTexture(MetalTexCacheEntry *entry, bool deleteThem) {
 	if (entry->texturePtr) {
+		auto *texture = static_cast<Metal::Texture *>(entry->texturePtr);
+		auto source = scaledSources_.find(texture);
+		if (source != scaledSources_.end()) {
+			sourceBytes_ -= source->second.pixels.size() * sizeof(uint32_t);
+			regionCount_ -= source->second.regions.size();
+			for (const auto &region : source->second.regions) {
+				regionBytes_ -= region.second->Native().width * region.second->Native().height * 4;
+			}
+			scaledSources_.erase(source);
+		}
+		if (geScaledTexture_ == texture) {
+			geScaledTexture_ = nullptr;
+		}
 		static_cast<Metal::Texture *>(entry->texturePtr)->Release();
 		entry->texturePtr = nullptr;
 	}
@@ -461,6 +652,7 @@ void *TextureCacheMetal::GetNativeTextureView(const MetalTexCacheEntry *entry, b
 }
 
 void TextureCacheMetal::ApplySamplerByKey(const SamplerCacheKey &key) {
+	geSamplerKey_ = key;
 	if (!manager_) {
 		return;
 	}
@@ -528,6 +720,16 @@ void TextureCacheMetal::BuildTexture(MetalTexCacheEntry *entry) {
 				LoadTextureLevel(*entry, pixels, uploadBytes, width * 4,
 					decodePlan, plan.baseLevelSrc, Draw::DataFormat::R8G8B8A8_UNORM, TexDecodeFlags{});
 				texture = textureScaler_.Scale(context, input, width, height, levels, &error);
+#if PPSSPP_PLATFORM(MAC)
+				if (texture) {
+					auto &source = scaledSources_[texture];
+					source.width = width;
+					source.height = height;
+					source.pixels.resize((size_t)width * height);
+					memcpy(source.pixels.data(), pixels, uploadBytes);
+					sourceBytes_ += uploadBytes;
+				}
+#endif
 			}
 		} else if (error.empty()) {
 			error = "Invalid Metal texture scaling size";

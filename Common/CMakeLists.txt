@@ -429,7 +429,7 @@ endif()
 # Common everywhere it mattered).
 target_link_libraries(Common ${GlslangLibs})
 
-# Native Metal uses CAMetalLayer surfaces on macOS and iOS.
+# Native Metal uses CAMetalLayer surfaces on macOS.
 if(APPLE AND NOT IOS AND NOT LIBRETRO)
 	target_compile_definitions(Common PUBLIC PPSSPP_HAS_METAL=1)
 	target_sources(Common PRIVATE

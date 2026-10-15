@@ -530,11 +530,6 @@ static int DefaultGPUBackend() {
 #endif
 
 #elif PPSSPP_PLATFORM(IOS) && !defined(__LIBRETRO__)
-#if defined(PPSSPP_IOS_DEFAULT_METAL) && defined(PPSSPP_HAS_METAL)
-	if (MetalIsAvailable()) {
-		return (int)GPUBackend::METAL;
-	}
-#endif
 	return (int)GPUBackend::VULKAN;
 #endif
 

@@ -54,5 +54,8 @@ private:
 	TextureCacheMetal *textureCache_ = nullptr;
 	FramebufferManagerMetal *framebufferManager_ = nullptr;
 	std::string lastError_;
+#if PPSSPP_PLATFORM(MAC)
+	std::vector<uint16_t> softwareIndices_;
+#endif
 	EncoderState encoderState_;
 };

@@ -7,8 +7,10 @@
 
 #include "GPU/metal3/TextureCachePolicyMetal.h"
 #include "Common/GPU/metal3/MetalRenderManager.h"
+#include "Common/GPU/metal3/MetalResources.h"
 
 struct MetalTextureShaderInfo;
+struct TransformedVertex;
 namespace Metal { class Texture; }
 
 class TextureScalerMetal {
@@ -48,6 +50,9 @@ public:
 	void *GetNativeTextureView(const MetalTexCacheEntry *entry, bool flat) const override;
 	void ResetGETextureBindings();
 	void RestoreGETextureBindings();
+	bool BindSamplingRegion(const TransformedVertex *vertices, TransformedVertex *adjusted, const MTLViewport &viewport = {});
+	bool HasScaledTexture() const { return geScaledTexture_ != nullptr; }
+	const size_t CacheSizeEstimate() const override;
 
 protected:
 	void BindTexture(MetalTexCacheEntry *entry) override;
@@ -59,6 +64,18 @@ protected:
 	void BoundFramebufferTexture() override;
 
 private:
+	struct ScaledTextureSource {
+		int width, height;
+		std::vector<uint32_t> pixels;
+		std::map<std::array<int, 4>, Draw::AutoRef<Metal::Texture>> regions;
+	};
+	std::map<Metal::Texture *, ScaledTextureSource> scaledSources_;
+	Metal::Texture *geScaledTexture_ = nullptr;
+	Draw::AutoRef<Metal::Texture> temporaryRegion_;
+	SamplerCacheKey geSamplerKey_{};
+	size_t regionBytes_ = 0;
+	size_t sourceBytes_ = 0;
+	size_t regionCount_ = 0;
 	void UpdateScalingShader();
 	bool ReadCompressedTextureDebug(id<MTLTexture> texture, int mip, int width, int height, GPUDebugBuffer &buffer, std::string *error);
 	Metal::RenderManager *manager_ = nullptr;

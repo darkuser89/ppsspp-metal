@@ -233,7 +233,7 @@ public:
 	const MetalTexCache &Cache() const { return cache_; }
 	const MetalTexCache &SecondCache() const { return secondCache_; }
 
-	const size_t CacheSizeEstimate() const;
+	virtual const size_t CacheSizeEstimate() const;
 	const size_t SecondCacheSizeEstimate() const;
 
 

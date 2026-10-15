@@ -471,7 +471,8 @@ static bool CanUseSaveStates(bool isSaveAction) {
         if (!g_Config.IsBackendEnabled(backend)) {
             continue;
         }
-        [self addItem:@(GPUBackendToString(backend).c_str()) to:backends action:^{
+        NSString *backendName = backend == GPUBackend::METAL ? @"Metal 3" : @(GPUBackendToString(backend).c_str());
+        [self addItem:backendName to:backends action:^{
             if (g_Config.iGPUBackend != (int)backend) {
                 g_Config.iGPUBackend = (int)backend;
                 // This does a clean shutdown, so the config will be saved automatically.

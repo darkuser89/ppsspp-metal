@@ -285,7 +285,11 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 	Draw::DrawContext *draw = screenManager()->getDrawContext();
 
 #if !PPSSPP_PLATFORM(UWP)
-	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Metal" };
+	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan",
+#ifdef PPSSPP_HAS_METAL
+		"Metal 3",
+#endif
+	};
 	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), I18NCat::GRAPHICS, screenManager()));
 	renderingBackendChoice->SetPreOpenCallback([this](UI::PopupMultiChoice *choice) {
 		// Don't filter until the last possible moment, since it involves trying to initialize Vulkan, if we were
@@ -299,9 +303,11 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 			choice->HideChoice((int)GPUBackend::DIRECT3D11);
 		if (!g_Config.IsBackendEnabled(GPUBackend::VULKAN))
 			choice->HideChoice((int)GPUBackend::VULKAN);
+#ifdef PPSSPP_HAS_METAL
 		if (!g_Config.IsBackendEnabled(GPUBackend::METAL)) {
 			choice->HideChoice((int)GPUBackend::METAL);
 		}
+#endif
 	});
 
 	if (!IsFirstInstance()) {

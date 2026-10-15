@@ -20,7 +20,7 @@
 #import "CameraHelper.h"
 #import "LocationHelper.h"
 
-// The one view controller. Renders with Vulkan (MoltenVK) or Metal to a CAMetalLayer.
+// The one view controller. Renders with Vulkan (MoltenVK) to a CAMetalLayer.
 @interface PPSSPPViewController : UIViewController<
 	PHPickerViewControllerDelegate,
 	CameraFrameDelegate, LocationHandlerDelegate,
