@@ -375,6 +375,15 @@ SamplerCacheKey GetMetalFramebufferSamplingParams(const GEState &gstate, u16 buf
 	return key;
 }
 
+static u32 SwizzledSourceBytes(int w, int bufw, int h, int bitsPerPixel) {
+	if (h <= 0) {
+		return 0;
+	}
+	const u32 rowBytes = bufw * bitsPerPixel / 8;
+	const u32 lastByte = (w * bitsPerPixel + 7) / 8 - 1;
+	return ((h - 1) / 8) * rowBytes * 8 + (lastByte / 16) * 128 + ((h - 1) & 7) * 16 + (lastByte & 15) + 1;
+}
+
 static u32 ComputeTextureHash(MetalTextureReplacer &replacer, u32 addr, int bufw, int w, int h, bool swizzled, const MetalTexCacheEntry *entry, bool metal) {
 	const GETextureFormat format = entry->format;
 	// Swizzled CLUT4 glyph atlases can fill below the visible UV range while remaining
@@ -399,6 +408,9 @@ static u32 ComputeTextureHash(MetalTextureReplacer &replacer, u32 addr, int bufw
 		// games are using that memory for anything else. So we'll just make sure to compute the full size to hash.
 		// To do that, we just use the same calculation but round the height upwards to the nearest multiple of 8.
 		sizeInRAM = (textureBitsPerPixel[format] * bufw * ((h + 7) & ~7)) >> 3;
+		if (PPSSPP_PLATFORM(MAC) && metal && w > bufw && format <= GE_TFMT_CLUT32) {
+			sizeInRAM = SwizzledSourceBytes(w, bufw, h, textureBitsPerPixel[format]);
+		}
 	} else {
 		sizeInRAM = (textureBitsPerPixel[format] * bufw * h) >> 3;
 	}
@@ -1953,10 +1965,23 @@ static void Expand4To8Bits(u8 *dest, const u8 *src, int srcWidth) {
 	}
 }
 
-// Unswizzles a level into tmpTexBuf32_ and hands back a pointer to it. Sized for the texels the
-// decode is going to read rather than just bufw per row - UnswizzleFromMem only fills the stride,
-// so when w reaches past it the tail is zeroed instead of left as whatever the buffer held.
-const u8 *MetalTextureCacheCommon::UnswizzleToTemp(const u8 *texptr, int w, int h, int bufw, int bytesPerPixel) {
+// Return decoded rows and their stride, including overlapping horizontal blocks on macOS.
+const u8 *MetalTextureCacheCommon::UnswizzleToTemp(const u8 *texptr, int w, int h, int &bufw, int bytesPerPixel) {
+	if (PPSSPP_PLATFORM(MAC) && w > bufw) {
+		// Horizontal blocks can alias later block rows when the GE stride is shorter than the width.
+		const u32 srcPitch = bytesPerPixel == 0 ? bufw / 2 : bufw * bytesPerPixel;
+		const u32 dstPitch = bytesPerPixel == 0 ? (w + 1) / 2 : w * bytesPerPixel;
+		tmpTexBuf32_.resize((dstPitch * h + 3) / 4);
+		u8 *dest = (u8 *)tmpTexBuf32_.data();
+		for (int y = 0; y < h; ++y) {
+			for (u32 x = 0; x < dstPitch; x += 16) {
+				const u32 offset = (y / 8) * srcPitch * 8 + (x / 16) * 128 + (y & 7) * 16;
+				memcpy(dest + y * dstPitch + x, texptr + offset, std::min(16u, dstPitch - x));
+			}
+		}
+		bufw = w;
+		return dest;
+	}
 	const int rows = (h + 7) & ~7;
 	const uint32_t texels = SourceExtent(w, bufw, rows);
 	tmpTexBuf32_.resize(texels);
@@ -2012,16 +2037,25 @@ TextureAlpha MetalTextureCacheCommon::DecodeTextureLevel(u8 *out, int outPitch, 
 	const uint32_t bytesPerRow = (bpp * bufw) / 8;
 	// Swizzled textures are read in 8-row blocks, rounding the height up.
 	const uint32_t rows = swizzled ? ((h + 7) & ~7) : h;
-	const uint32_t neededBytes = (bpp * SourceExtent(w, bufw, rows) + 7) / 8;
+	const bool overlappingSwizzle = PPSSPP_PLATFORM(MAC) && swizzled && w > bufw && format <= GE_TFMT_CLUT32;
+	const uint32_t neededBytes = overlappingSwizzle ? SwizzledSourceBytes(w, bufw, h, bpp) :
+		(bpp * SourceExtent(w, bufw, rows) + 7) / 8;
 	if (bytesPerRow > 0 && !isPPGE && !Memory::IsValidRange(texaddr, neededBytes)) {
 		ERROR_LOG_REPORT(Log::TexCache, "Texture extends beyond valid RAM: %08x + %d x %d (w=%d)", texaddr, bufw, h, w);
 		const uint32_t limited = Memory::ClampValidSizeAt(texaddr, neededBytes);
 		// Drop rows until the last one's w texels fit too, not just its bufw stride.
-		const uint32_t availableTexels = (limited * 8) / bpp;
-		const uint32_t lastRowTexels = std::max(w, bufw);
-		h = availableTexels >= lastRowTexels ? (int)((availableTexels - lastRowTexels) / bufw + 1) : 0;
-		if (swizzled)
-			h &= ~7;
+		if (overlappingSwizzle) {
+			while (h > 0 && SwizzledSourceBytes(w, bufw, h, bpp) > limited) {
+				--h;
+			}
+		} else {
+			const uint32_t availableTexels = (limited * 8) / bpp;
+			const uint32_t lastRowTexels = std::max(w, bufw);
+			h = availableTexels >= lastRowTexels ? (int)((availableTexels - lastRowTexels) / bufw + 1) : 0;
+			if (swizzled) {
+				h &= ~7;
+			}
+		}
 	}
 
 	if (!isPPGE) {

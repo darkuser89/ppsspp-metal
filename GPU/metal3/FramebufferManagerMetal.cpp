@@ -942,6 +942,7 @@ void FramebufferManagerMetal::DestroyFramebuf(VirtualFramebuffer *v) {
 	if (prevPrevDisplayFramebuf_ == v)
 		prevPrevDisplayFramebuf_ = nullptr;
 
+	readbackShadows_.erase(v);
 	delete v;
 }
 
@@ -1979,6 +1980,17 @@ void FramebufferManagerMetal::ResizeFramebufFBO(VirtualFramebuffer *vfb, int w, 
 			}
 			if (vfb->usageFlags & FB_USAGE_RENDER_DEPTH) {
 				BlitFramebuffer(vfb, 0, 0, &old, 0, 0, std::min((u16)oldWidth, std::min(vfb->bufferWidth, vfb->width)), std::min((u16)oldHeight, std::min(vfb->height, vfb->bufferHeight)), 0, RASTER_DEPTH, "BlitDepth_ResizeFramebufFBO");
+			}
+			if (!skipCopy && vfb->fb_format != GE_FORMAT_565) {
+				// Keep the stencil too (Need for Speed Shift stencil tests right after its framebuffer grows from 480 to
+				// 512 wide). D3D11 has no separate stencil copy, but copies it along with the depth above.
+				const int stencilW = std::min(old.renderWidth, vfb->renderWidth);
+				const int stencilH = std::min(old.renderHeight, vfb->renderHeight);
+				if (draw_->GetDeviceCaps().framebufferSeparateDepthCopySupported) {
+					draw_->CopyFramebufferImage(old.fbo, 0, 0, 0, 0, vfb->fbo, 0, 0, 0, 0, stencilW, stencilH, 1, Draw::Aspect::STENCIL_BIT, "CopyStencil_ResizeFramebufFBO");
+				} else if (draw_->GetDeviceCaps().framebufferStencilBlitSupported) {
+					draw_->BlitFramebuffer(old.fbo, 0, 0, stencilW, stencilH, vfb->fbo, 0, 0, stencilW, stencilH, Draw::Aspect::STENCIL_BIT, Draw::FB_BLIT_NEAREST, "BlitStencil_ResizeFramebufFBO");
+				}
 			}
 		}
 		fbosToDelete_.push_back(old.fbo);
@@ -3352,7 +3364,7 @@ bool FramebufferManagerMetal::GetOutputFramebuffer(GPUDebugBuffer &buffer) {
 // (Except using the GPU might cause problems because of various implementations'
 // dithering behavior and games that expect exact colors like Danganronpa, so we
 // can't entirely be rid of the CPU path.) -- unknown
-void FramebufferManagerMetal::ReadbackFramebuffer(VirtualFramebuffer *vfb, int x, int y, int w, int h, RasterChannel channel, Draw::ReadbackMode mode) {
+void FramebufferManagerMetal::ReadbackFramebuffer(VirtualFramebuffer *vfb, int x, int y, int w, int h, RasterChannel channel, Draw::ReadbackMode mode, u8 *shadow) {
 	if (w <= 0 || h <= 0) {
 		ERROR_LOG(Log::FrameBuf, "Bad inputs to ReadbackFramebufferSync: %d %d %d %d", x, y, w, h);
 		return;
@@ -3381,12 +3393,16 @@ void FramebufferManagerMetal::ReadbackFramebuffer(VirtualFramebuffer *vfb, int x
 	// This is only used for the NotifyMemInfo range.
 	const int dstSize = ((h - 1) * stride + w) * dstBpp;
 
-	if (!Memory::IsValidRange(fb_address + dstByteOffset, dstSize)) {
-		ERROR_LOG_REPORT(Log::G3D, "ReadbackFramebufferSync would write outside of memory, ignoring");
-		return;
+	u8 *destPtr;
+	if (shadow) {
+		destPtr = shadow + dstByteOffset;
+	} else {
+		if (!Memory::IsValidRange(fb_address + dstByteOffset, dstSize)) {
+			ERROR_LOG_REPORT(Log::G3D, "ReadbackFramebufferSync would write outside of memory, ignoring");
+			return;
+		}
+		destPtr = Memory::GetPointerWriteUnchecked(fb_address + dstByteOffset);
 	}
-
-	u8 *destPtr = Memory::GetPointerWriteUnchecked(fb_address + dstByteOffset);
 
 	// We always need to convert from the framebuffer native format.
 	// Right now that's always 8888.
@@ -3401,9 +3417,11 @@ void FramebufferManagerMetal::ReadbackFramebuffer(VirtualFramebuffer *vfb, int x
 		draw_->CopyFramebufferToMemory(vfb->fbo, channel == RASTER_COLOR ? Draw::Aspect::COLOR_BIT : Draw::Aspect::DEPTH_BIT, x, y, w, h, destFormat, destPtr, stride, mode, "ReadbackFramebufferSync");
 	}
 
-	char tag[128];
-	size_t len = snprintf(tag, sizeof(tag), "FramebufferPack/%08x_%08x_%dx%d_%s", vfb->fb_address, vfb->z_address, w, h, GeBufferFormatToString(vfb->fb_format));
-	NotifyMemInfo(MemBlockFlags::WRITE, fb_address + dstByteOffset, dstSize, tag, len);
+	if (!shadow) {
+		char tag[128];
+		size_t len = snprintf(tag, sizeof(tag), "FramebufferPack/%08x_%08x_%dx%d_%s", vfb->fb_address, vfb->z_address, w, h, GeBufferFormatToString(vfb->fb_format));
+		NotifyMemInfo(MemBlockFlags::WRITE, fb_address + dstByteOffset, dstSize, tag, len);
+	}
 
 	if (mode == Draw::ReadbackMode::BLOCK) {
 		gpuStats.perFrame.numBlockingReadbacks++;
@@ -3496,15 +3514,37 @@ void FramebufferManagerMetal::ReadFramebufferToMemory(VirtualFramebuffer *vfb, i
 	if (y + h > vfb->bufferHeight) {
 		h = vfb->bufferHeight - y;
 	}
-	if (x == 0 && y == 0 && w == vfb->width && h == vfb->height) {
+	const bool whole = x == 0 && y == 0 && w == vfb->width && h == vfb->height;
+	if (whole) {
 		// Mark it as fully downloaded until next render to it.
 		if (channel == RASTER_COLOR)
 			vfb->memoryUpdated = true;
 		vfb->usageFlags |= FB_USAGE_DOWNLOAD;
 	}
 
+	// Some games read many pieces of a buffer between renders to it (Motorstorm reads about 18 per frame),
+	// and each blocking readback waits for the GPU. With ReadbackShadow, read the whole buffer once, and
+	// copy the pieces from that. Only the pieces asked for reach PSP memory: the rest of the buffer's range
+	// can hold live data, like the texture heap right after Everybody's Golf 2's depth buffer.
+	const bool useShadow = !whole && channel == RASTER_COLOR && mode == Draw::ReadbackMode::BLOCK && PSP_CoreParameter().compat.flags().ReadbackShadow;
+	if (useShadow && vfb->readbackShadowValid && ReadFromShadow(vfb, x, y, w, h)) {
+		return;
+	}
+
 	// This handles any required stretching internally.
-	ReadbackFramebuffer(vfb, x, y, w, h, channel, mode);
+	if (useShadow) {
+		// The shadow covers all of the buffer that can be read, in its memory layout.
+		std::vector<u8> &shadow = readbackShadows_[vfb];
+		shadow.resize((size_t)vfb->fb_stride * vfb->bufferHeight * BufferFormatBytesPerPixel(vfb->fb_format));
+		ReadbackFramebuffer(vfb, 0, 0, ShadowWidth(vfb), vfb->bufferHeight, channel, mode, shadow.data());
+		vfb->readbackShadowValid = true;
+		vfb->usageFlags |= FB_USAGE_DOWNLOAD;
+		if (!ReadFromShadow(vfb, x, y, w, h)) {
+			ReadbackFramebuffer(vfb, x, y, w, h, channel, mode);
+		}
+	} else {
+		ReadbackFramebuffer(vfb, x, y, w, h, channel, mode);
+	}
 
 	draw_->Invalidate(InvalidationFlags::CACHED_RENDER_STATE);
 	textureCache_->ForgetLastTexture();

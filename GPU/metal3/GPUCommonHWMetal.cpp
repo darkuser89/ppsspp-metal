@@ -658,11 +658,13 @@ u32 GPUCommonHWMetal::CheckGPUFeatures() const {
 		features |= GPU_USE_VS_RANGE_CULLING;
 	}
 
-	// Set this to true to easily test our fallback shaders for depth clamp and min/max clipping.
-	// DO NOT check that in! This should be false normally.
-	constexpr bool simulateOldMali = false;
-	if (simulateOldMali) {
-		features &= ~(GPU_USE_CLIP_DISTANCE | GPU_USE_CULL_DISTANCE | GPU_USE_DEPTH_CLAMP);
+	// Headless --disable-gpu-features, to test the fallbacks for GPUs without them (old Mali has none of
+	// clip distance, cull distance and depth clamp).
+	features &= ~PSP_CoreParameter().disabledGPUFeatures;
+	if (!(features & GPU_USE_CLIP_DISTANCE)) {
+		// Hardware depth clamp turns off clipping at the near plane too, which the vertex shader can then only
+		// do with a clip plane. The fragment shader fallback keeps it.
+		features &= ~GPU_USE_DEPTH_CLAMP;
 	}
 
 	return features;
@@ -938,8 +940,10 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 	}
 
 	// See the documentation for gstate_c.blueToAlpha.
+	// With framebuffer fetch, the shader applies the masks and logic ops to the real bits, which gets the whole
+	// sequence right (OutRun 2006's water mask comes out like the software renderer's), so it isn't needed there.
 	bool blueToAlpha = false;
-	if (PSP_CoreParameter().compat.flags().BlueToAlpha) {
+	if (PSP_CoreParameter().compat.flags().BlueToAlpha && !gstate_c.Use(GPU_USE_FRAMEBUFFER_FETCH)) {
 		if (gstate_c.framebufFormat == GEBufferFormat::GE_FORMAT_565 && gstate.getColorMask() == 0x0FFFFF && !gstate.isLogicOpEnabled()) {
 			blueToAlpha = true;
 			gstate_c.framebufFormat = GEBufferFormat::GE_FORMAT_4444;
@@ -1041,12 +1045,10 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 		cyclesExecuted += EstimateFillCycles(prim, verts, inds, count, decoder, vertexType);
 	}
 
-#define MAX_CULL_CHECK_COUNT 2500
-
 	// For now, turn off culling on platforms where we don't have SIMD bounding box tests, like RISC-V.
 #if PPSSPP_ARCH(ARM_NEON) || PPSSPP_ARCH(SSE2)
 
-#define PASSES_CULLING ((vertexType & (GE_VTYPE_THROUGH_MASK | GE_VTYPE_MORPHCOUNT_MASK | GE_VTYPE_WEIGHT_MASK)) || count > MAX_CULL_CHECK_COUNT)
+#define PASSES_CULLING ((vertexType & (GE_VTYPE_THROUGH_MASK | GE_VTYPE_MORPHCOUNT_MASK | GE_VTYPE_WEIGHT_MASK)) != 0)
 
 #else
 
@@ -1056,6 +1058,9 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 
 	// If certain conditions are true, do frustum culling.
 	bool passCulling = PASSES_CULLING;
+	if (passCulling && !(flags & ClipInfoFlags::Valid)) {
+		flags = DrawEngineCommon::UncheckedClipInfoFlags();
+	}
 	if (!passCulling) {
 		// Do software culling.
 		if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags)) {
@@ -1145,6 +1150,9 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 
 			bool passCulling = onePassed || PASSES_CULLING;
 			ClipInfoFlags flags{};
+			if (passCulling) {
+				flags = DrawEngineCommon::UncheckedClipInfoFlags();
+			}
 			if (!passCulling) {
 				// Do software culling.
 				if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags)) {
@@ -1259,7 +1267,8 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 		{
 			// A bone matrix probably. If not we bail.
 			const u32 target = gstate_c.getRelativeAddress(data & 0x00FFFFFC);
-			if ((Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA &&
+			if (currentList->HardwareCallDepth() < 2 &&
+				(Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 11 * 4) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 12 * 4) >> 24) == GE_CMD_RET &&
 				(target > currentList->stall || target + 12 * 4 < currentList->stall) &&
@@ -2544,6 +2553,13 @@ void GPUCommonHWMetal::DoExecuteCall(u32 target) {
 	// Local variable for better codegen
 	DisplayList *currentList = this->currentList;
 
+	// Soul Calibur: Broken Destiny reaches its lighting setup for weapon trails with a third CALL, so
+	// on hardware they stay unlit and take their color from the vertices (#7395).
+	if (currentList->HardwareCallDepth() >= 2) {
+		DEBUG_LOG(Log::G3D, "CALL to %08x: skipped, already two levels deep", target);
+		return;
+	}
+
 	// Bone matrix optimization - many games will CALL a bone matrix (!).
 	// We don't optimize during recording or debugging - so the matrix data gets recorded.
 	if (useFastRunLoop_ && Memory::IsValidRange(target, 13 * 4) && (Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA) {
@@ -2566,7 +2582,8 @@ void GPUCommonHWMetal::DoExecuteCall(u32 target) {
 		auto &stackEntry = currentList->stack[currentList->stackptr++];
 		stackEntry.pc = currentList->pc + 4;
 		stackEntry.offsetAddr = gstate_c.offsetAddr;
-		// The base address is NOT saved/restored for a regular call.
+		// The base address is NOT saved/restored for a regular call, and 0 marks it as one.
+		stackEntry.baseAddr = 0;
 		UpdatePC(currentList->pc, target - 4);
 		currentList->pc = target - 4;	// pc will be increased after we return, counteract that
 	}

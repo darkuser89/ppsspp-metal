@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "GPU/metal3/PipelineManagerMetal.h"
+
+#include <algorithm>
 #include "Common/File/FileUtil.h"
 #include "Common/Log.h"
 #include "Common/TimeUtil.h"
@@ -15,7 +17,7 @@
 namespace {
 
 constexpr uint32_t METAL_PIPELINE_CACHE_MAGIC = 0x4D50534F;
-constexpr uint32_t METAL_PIPELINE_CACHE_VERSION = 1;
+constexpr uint32_t METAL_PIPELINE_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 3 : 1;
 constexpr uint32_t MAX_CACHED_PIPELINES = 8192;
 
 struct MetalPipelineCacheHeader {

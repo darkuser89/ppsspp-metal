@@ -130,6 +130,11 @@ struct CommandLineOptions {
 	std::optional<std::string> reDecrypt;
 	// Where the plaintext goes. Defaults to "decrypted.bin".
 	std::optional<std::string> reDecryptOut;
+	// The 16-byte secure install ID (32 hex digits) a game patch installed on a PSP was decrypted
+	// with - what the game passes to sceKernelLoadModuleDNAS.
+	std::optional<std::string> reDecryptKey;
+	// The Fuse ID of the PSP a game patch was installed on, overriding the FuseID setting.
+	std::optional<std::string> fuseId;
 	// Headless: copy one file out of the disc image given as the positional argument, to
 	// --dump-file-out, and exit.
 	std::optional<std::string> dumpFile;
@@ -161,6 +166,7 @@ struct CommandLineOptions {
 	bool optionS = false;   // a legacy option
 
 	std::optional<bool> oldAtrac;
+	std::optional<bool> accurateVdot;
 
 	// Headless options that may also be mildly useful in application mode
 	std::optional<int> resolutionScale;
@@ -188,6 +194,10 @@ struct CommandLineOptions {
 	std::optional<int> replayEnd;
 	// Headless: apply the game's compatibility settings when replaying a GE frame dump.
 	std::optional<bool> dumpCompat;
+	std::optional<bool> hardwareTransform;
+	std::optional<bool> vertexJit;
+	// Headless: comma-separated clip-distance, cull-distance, depth-clamp, framebuffer-fetch, dual-source-blend.
+	std::optional<std::string> disableGPUFeatures;
 	std::optional<bool> screenshotRenderTarget;
 	std::optional<std::string> screenshotFilenameDiff;
 	// Headless: preserve the alpha channel when saving PNG screenshots.

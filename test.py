@@ -87,15 +87,23 @@ class Command(object):
 tests_good = [
   "cpu/cpu_alu/cpu_alu",
   "cpu/cpu_alu/cpu_branch",
+  "cpu/cpu_alu/branch_link_ra",
   "cpu/cpu_alu/cpu_branch2",
   "cpu/cpu_alu/cpu_div",
+  "cpu/cpu_alu/shift_encodings",
+  "cpu/cpu_alu/allegrex_encodings",
   "cpu/vfpu/callout",
   "cpu/vfpu/colors",
   "cpu/vfpu/convert",
   "cpu/vfpu/convert_scaled",
   "cpu/vfpu/minmax",
+  "cpu/vfpu/minmax_zero",
+  "cpu/vfpu/minmax_tie",
   "cpu/vfpu/prefix_branch",
   "cpu/vfpu/prefix_ctrl",
+  "cpu/vfpu/prefix_lanes",
+  "cpu/vfpu/prefix_load",
+  "cpu/vfpu/vfim",
   "cpu/vfpu/vbranch",
   "cpu/vfpu/vrnd",
   "cpu/vfpu/overlap",
@@ -205,6 +213,7 @@ tests_good = [
   "gpu/bounding/vertexaddr",
   "gpu/bounding/viewport",
   "gpu/callbacks/ge_callbacks",
+  "gpu/callstack/depth",
   "gpu/clipping/guardband",
   "gpu/clipping/homogeneous",
   "gpu/clipping/xycull",
@@ -558,6 +567,11 @@ known_failures = {
   "loongarch64": [
     "cpu/fpu/fpu",
   ],
+  "armhf": [
+    # A bus error under qemu-arm, which doesn't fix up unaligned accesses the way the kernel does.
+    # Happens on every CPU core, so it's in the hashing code, not the JIT.
+    "hash/hash",
+  ],
 }
 
 tests_next = [
@@ -567,8 +581,6 @@ tests_next = [
   "cpu/vfpu/prefix_sat",
   "cpu/vfpu/prefix_unpack",  # an invalid swizzle replays an earlier prefixed value, not emulated
   "cpu/vfpu/vbranch_hazard",  # VFPU pipeline latencies, which a compiler pads for; not emulated
-  "cpu/vfpu/minmax_tie",  # vmin/vmax return the second operand on a -0/+0 tie; the IR path returns the first
-  "cpu/vfpu/minmax_zero",  # signed zero and denormals in vmin/vmax
   "cpu/vfpu/specials",  # vcmp on denormals, NaN canonicalization and denormal flush in vbfy/vocp/vavg/vfad/vsocp
   "cpu/vfpu/overlap_vcrsp",  # vcrsp overlapping its source, which the assembler refuses; the hardware doesn't read-before-write
   "cpu/fpu/fpu_branch_hazard",  # a bc1x right after c.xx.s sees the old condition; the compiler pads for it, not emulated
@@ -577,6 +589,11 @@ tests_next = [
   "cpu/vfpu/prefixes",
   "cpu/vfpu/vector",
   "cpu/vfpu/vregs",
+  "cpu/fpu/denormal",  # see docs/cpu-equivalence.md for these five
+  "cpu/vfpu/fcr31",
+  "cpu/vfpu/signed_zero",
+  "cpu/vfpu/nan_gen",
+  "cpu/vfpu/undefined",
   "audio/sceaudio/output",
   "audio/sascore/setadsr",
   "audio/mp3/init",

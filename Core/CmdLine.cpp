@@ -200,6 +200,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(compare), CmdParamType::Bool, "compare", 'c', "Enable comparison mode", CmdLineMode::Headless},
 	{POFF(bench), CmdParamType::Bool, "bench", 'b', "Enable benchmark mode", CmdLineMode::Headless},
 	{POFF(oldAtrac), CmdParamType::Bool, "old-atrac", '\0', "Use old ATRAC decoder"},
+	{POFF(accurateVdot), CmdParamType::Bool, "accurate-vdot", '\0', "Compute VFPU dot products bit-exactly like the PSP (default; =false for the faster approximation)"},
 	{POFF(memStickInserted), CmdParamType::BoolInverse, "no-memstick", '\0', "Run with the memory stick removed"},
 	{POFF(log), CmdParamType::String, "log", '\0', "Output log to FILE", CmdLineMode::Application},
 	{POFF(enableLogging), CmdParamType::Bool, "log", '\0', "Full log output, not just emulated printfs", CmdLineMode::Headless},
@@ -207,6 +208,9 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(screenshotFilenameSave), CmdParamType::String, "screenshot-save", '\0', "Save rendered screenshot to specified path (PNG if the path ends in .png, BMP otherwise)", CmdLineMode::Headless},
 	{POFF(replayEnd), CmdParamType::Int, "replay-end", '\0', "When replaying a GE frame dump, only draw primitives up to this one (1-based)", CmdLineMode::Headless},
 	{POFF(dumpCompat), CmdParamType::Bool, "dump-compat", '\0', "Apply the game's compat.ini settings when replaying a GE frame dump (off by default)", CmdLineMode::Headless},
+	{POFF(hardwareTransform), CmdParamType::Bool, "hardware-transform", '\0', "Transform vertices on the GPU (default true); false transforms them on the CPU", CmdLineMode::Headless},
+	{POFF(vertexJit), CmdParamType::Bool, "vertex-jit", '\0', "Decode vertices with the JIT where the host can (default; =false for the C++ decoder)", CmdLineMode::Headless},
+	{POFF(disableGPUFeatures), CmdParamType::String, "disable-gpu-features", '\0', "Act as if the GPU lacked these, to test the fallbacks: comma-separated clip-distance, cull-distance, depth-clamp, framebuffer-fetch, dual-source-blend", CmdLineMode::Headless},
 	{POFF(depthFilenameSave), CmdParamType::String, "depth-save", '\0', "Save the depth buffer to FILE along with the screenshot (u32 width, u32 height, u16 depths; float depths if FILE ends in .f32)", CmdLineMode::Headless},
 	{POFF(screenshotRenderTarget), CmdParamType::Bool, "screenshot-render-target", '\0', "Take screenshots of the current render target instead of the displayed framebuffer", CmdLineMode::Headless},
 	{POFF(screenshotFilenameDiff), CmdParamType::String, "screenshot-diff", '\0', "Save a visual comparison image to FILE when comparing screenshots", CmdLineMode::Headless},
@@ -231,6 +235,8 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(reRawBase), CmdParamType::String, "re-raw-base", '\0', "Treat --re-module as a raw code image loaded at this address, e.g. 0x08300000", CmdLineMode::Headless},
 	{POFF(reDecrypt), CmdParamType::String, "re-decrypt", '\0', "Decrypt one encrypted PSP file (PRX or ME image) and exit", CmdLineMode::Headless},
 	{POFF(reDecryptOut), CmdParamType::String, "re-decrypt-out", '\0', "Output file for --re-decrypt (default: decrypted.bin)", CmdLineMode::Headless},
+	{POFF(reDecryptKey), CmdParamType::String, "re-decrypt-key", '\0', "Secure install ID (32 hex digits) for --re-decrypt of a game patch installed on a PSP; also needs --fuse-id", CmdLineMode::Headless},
+	{POFF(fuseId), CmdParamType::String, "fuse-id", '\0', "Fuse ID (12 hex digits) of the PSP a game patch was installed on"},
 	{POFF(dumpFile), CmdParamType::String, "dump-file", '\0', "Copy one file out of the disc image, e.g. disc0:/PSP_GAME/USRDIR/MOVIE.PMF, or list a directory, and exit", CmdLineMode::Headless},
 	{POFF(dumpFileOut), CmdParamType::String, "dump-file-out", '\0', "Output file for --dump-file (default: the file's own name)", CmdLineMode::Headless},
 	{POFF(odsLog), CmdParamType::Bool, "odslog", 'o', "Also log through OutputDebugString (Windows)", CmdLineMode::Headless},
@@ -534,6 +540,10 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 }
 
 void CommandLineOptions::ApplyToConfig() const {
+	if (fuseId.has_value()) {
+		g_Config.sFuseID = fuseId.value();
+		g_Config.DoNotSaveSetting(&g_Config.sFuseID);
+	}
 	if (fullscreen.has_value()) {
 		g_Config.bFullScreen = fullscreen.value();
 		g_Config.DoNotSaveSetting(&g_Config.bFullScreen);
@@ -544,6 +554,10 @@ void CommandLineOptions::ApplyToConfig() const {
 	}
 	if (cpuCore.has_value()) {
 		g_Config.iCpuCore = (int)cpuCore.value();
+	}
+	if (hardwareTransform.has_value()) {
+		g_Config.bHardwareTransform = hardwareTransform.value();
+		g_Config.DoNotSaveSetting(&g_Config.bHardwareTransform);
 	}
 	if (softwareRendering.has_value()) {
 		g_Config.bSoftwareRendering = softwareRendering.value();
@@ -601,6 +615,10 @@ void CommandLineOptions::ApplyToConfig() const {
 	if (oldAtrac.has_value()) {
 		g_Config.bUseOldAtrac = oldAtrac.value();
 		g_Config.DoNotSaveSetting(&g_Config.bUseOldAtrac);
+	}
+	if (accurateVdot.has_value()) {
+		g_Config.bAccurateVdot = accurateVdot.value();
+		g_Config.DoNotSaveSetting(&g_Config.bAccurateVdot);
 	}
 
 	if (root.has_value()) {

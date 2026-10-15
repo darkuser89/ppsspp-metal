@@ -40,7 +40,6 @@
 #include "Common/CPUDetect.h"
 #include "Common/ExceptionHandlerSetup.h"
 #include "Common/File/VFS/VFS.h"
-#include "Common/File/VFS/ZipFileReader.h"
 #include "Common/File/VFS/DirectoryReader.h"
 #include "Common/File/FileUtil.h"
 #include "GPU/Debugger/Playback.h"
@@ -84,6 +83,8 @@
 #include "WindowsHeadlessHost.h"
 #elif defined(SDL)
 #include "SDLHeadlessGLGraphicsContext.h"
+#elif PPSSPP_PLATFORM(ANDROID)
+#include "AndroidHeadlessGLContext.h"
 #endif
 
 static Path g_comparisonScreenshot;
@@ -379,8 +380,7 @@ static GraphicsContext *CreateGraphicsContext(GPUCore gpuCore, std::string **dev
 	*deviceSetting = nullptr;
 	return nullptr;
 #elif PPSSPP_PLATFORM(ANDROID)
-	// The Android headless build is compile-tested only and never actually needs to create a graphics context at runtime.
-	// However, it would still be nice if hardware rendering worked - it can be executed over adb.
+	// Both hardware backends are created up front, with no window (see the caller).
 	*deviceSetting = nullptr;
 	return nullptr;
 #else
@@ -1040,11 +1040,12 @@ int main(int argc, const char* argv[]) {
 	g_Config.bUseOldAtrac = oldAtrac;
 	g_Config.bSkipDeadbeefFilling = false;
 
-	if (cmdLineOptions.appendConfig.has_value() && cmdLineOptions.gpuBackend == GPUBackend::METAL &&
-		!cmdLineOptions.softwareRendering.value_or(false)) {
-		g_Config.SetAppendedConfigIni(Path(cmdLineOptions.appendConfig.value()), false);
-		if (!g_Config.LoadAppendedConfig()) {
-			fprintf(stderr, "Failed to load appended config: %s\n", cmdLineOptions.appendConfig.value().c_str());
+	// After the test defaults above, so the file can override them (JitDisableFlags, say), but never
+	// saved: headless doesn't write a config.
+	if (cmdLineOptions.appendConfig.has_value()) {
+		g_Config.SetAppendedConfigIni(Path(cmdLineOptions.appendConfig.value()));
+		if (!g_Config.LoadAppendedConfig(false)) {
+			fprintf(stderr, "Couldn't read %s\n", cmdLineOptions.appendConfig.value().c_str());
 			return 1;
 		}
 	}
@@ -1097,7 +1098,7 @@ int main(int argc, const char* argv[]) {
 		// We don't bother with a window.
 		graphicsContext = new NullGraphicsContext();
 	} else {
-#if PPSSPP_PLATFORM(ANDROID) || defined(HEADLESS_NO_SDL)
+#if defined(HEADLESS_NO_SDL)
 		fprintf(stderr, "Headless graphics context creation is not supported on this platform.\n");
 		return 1;
 #else
@@ -1111,8 +1112,16 @@ int main(int argc, const char* argv[]) {
 		} else if (gpuCore == GPUCORE_GLES) {
 			// So does OpenGL, into a framebuffer object of its own.
 			graphicsContext = new CGLHeadlessGraphicsContext(480, 272);
+#elif PPSSPP_PLATFORM(ANDROID)
+		} else if (gpuCore == GPUCORE_GLES) {
+			// Into an EGL pbuffer.
+			graphicsContext = new AndroidHeadlessGLContext(480, 272);
 #endif
 		} else {
+#if PPSSPP_PLATFORM(ANDROID)
+			fprintf(stderr, "Only --graphics=vulkan and --graphics=gles are supported on Android\n");
+			return 1;
+#else
 			// TODO: Will we need a larger window for higher resolutions? Well, not if we use buffered rendering.
 			window = CreateHiddenWindow(480, 272, cmdLineOptions.gpuBackend.value_or(GPUBackend::OPENGL), &windowDesc);
 			if (!windowDesc.Valid()) {
@@ -1125,6 +1134,7 @@ int main(int argc, const char* argv[]) {
 				fprintf(stderr, "Failed to create a graphics context for GPU core\n");
 				return 1;
 			}
+#endif
 		}
 #endif
 	}
@@ -1133,9 +1143,8 @@ int main(int argc, const char* argv[]) {
 	// but not now.
 	CoreParameter coreParameter;
 	coreParameter.cpuCore = (CPUCore)cpuCore;
-	// The pspautotests expectations and frametest references were recorded with the C++ vertex
-	// decoder, and the JIT decoders don't match it everywhere yet.
-	coreParameter.bUseVertexDecoderJit = false;
+	// Like the app, decode vertices with the JIT where the host can run one.
+	coreParameter.bUseVertexDecoderJit = cmdLineOptions.vertexJit.value_or(System_GetPropertyBool(SYSPROP_CAN_JIT));
 	coreParameter.gpuCore = (GPUCore)gpuCore;
 	coreParameter.graphicsContext = graphicsContext;
 	coreParameter.enableSound = false;
@@ -1144,6 +1153,26 @@ int main(int argc, const char* argv[]) {
 	coreParameter.startBreak = false;
 	coreParameter.headLess = true;
 	coreParameter.dumpCompat = cmdLineOptions.dumpCompat.value_or(false);
+	if (cmdLineOptions.disableGPUFeatures.has_value()) {
+		std::vector<std::string> names;
+		SplitString(cmdLineOptions.disableGPUFeatures.value(), ',', names);
+		for (const std::string &name : names) {
+			if (name == "clip-distance") {
+				coreParameter.disabledGPUFeatures |= GPU_USE_CLIP_DISTANCE;
+			} else if (name == "cull-distance") {
+				coreParameter.disabledGPUFeatures |= GPU_USE_CULL_DISTANCE;
+			} else if (name == "depth-clamp") {
+				coreParameter.disabledGPUFeatures |= GPU_USE_DEPTH_CLAMP;
+			} else if (name == "framebuffer-fetch") {
+				coreParameter.disabledGPUFeatures |= GPU_USE_FRAMEBUFFER_FETCH;
+			} else if (name == "dual-source-blend") {
+				coreParameter.disabledGPUFeatures |= GPU_USE_DUALSOURCE_BLEND;
+			} else {
+				fprintf(stderr, "Unknown feature for --disable-gpu-features: %s (expected clip-distance, cull-distance, depth-clamp, framebuffer-fetch or dual-source-blend)\n", name.c_str());
+				return 1;
+			}
+		}
+	}
 	coreParameter.loadGameConfigs = false;
 	coreParameter.renderScaleFactor = cmdLineOptions.resolutionScale.value_or(1);
 	coreParameter.renderWidth = 480 * coreParameter.renderScaleFactor;
@@ -1206,7 +1235,8 @@ int main(int argc, const char* argv[]) {
 	// Placed here rather than with the other early-exit subcommands above, because resolving a
 	// "flash0:/kd/foo.prx" module path needs nandRootDirectory, which is only settled just above.
 	if (cmdLineOptions.reDecrypt.has_value()) {
-		return RunDecryptFile(cmdLineOptions.reDecrypt.value(), cmdLineOptions.reDecryptOut.value_or("decrypted.bin"));
+		return RunDecryptFile(cmdLineOptions.reDecrypt.value(), cmdLineOptions.reDecryptOut.value_or("decrypted.bin"),
+			cmdLineOptions.reDecryptKey.value_or(""), cmdLineOptions.fuseId.value_or(""));
 	}
 	if (cmdLineOptions.dumpFile.has_value()) {
 		if (cmdLineOptions.bootFilenames.empty()) {
@@ -1234,13 +1264,11 @@ int main(int argc, const char* argv[]) {
 
 
 	// Try to find the assets flash0 directory. Often this is from a subdirectory.
-	// This is needed for our fallback fonts.
+	// This is needed for our fallback fonts. On Android, push assets/ next to the executable.
 	Path nextPath = exePath;
 	for (int i = 0; i < 5; ++i) {
 		if (File::Exists(nextPath / "assets/flash0")) {
-#if !PPSSPP_PLATFORM(ANDROID)
 			g_VFS.Register("", new DirectoryReader(nextPath / "assets"));
-#endif
 			break;
 		}
 
@@ -1283,15 +1311,7 @@ int main(int argc, const char* argv[]) {
 	g_writeDebugOutput = !testOptions.compare && !testOptions.bench;
 	g_forwardHostOutput = !testOptions.compare && !testOptions.bench;
 
-#if PPSSPP_PLATFORM(ANDROID)
-	// For some reason the debugger installs it with this name?
-	if (File::Exists(Path("/data/app/org.ppsspp.ppsspp-2.apk"))) {
-		g_VFS.Register("", ZipFileReader::Create(Path("/data/app/org.ppsspp.ppsspp-2.apk"), "assets/"));
-	}
-	if (File::Exists(Path("/data/app/org.ppsspp.ppsspp.apk"))) {
-		g_VFS.Register("", ZipFileReader::Create(Path("/data/app/org.ppsspp.ppsspp.apk"), "assets/"));
-	}
-#elif PPSSPP_PLATFORM(LINUX)
+#if PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID)
 	g_VFS.Register("", new DirectoryReader(Path("/usr/local/share/ppsspp/assets")));
 	g_VFS.Register("", new DirectoryReader(Path("/usr/local/share/games/ppsspp/assets")));
 	g_VFS.Register("", new DirectoryReader(Path("/usr/share/ppsspp/assets")));

@@ -3,7 +3,18 @@
 
 #pragma once
 #include "GPU/Common/ShaderCommon.h"
+struct alignas(16) MetalGERasterUniforms {
+	uint32_t dither[4];
+	float raster[3];  // Target format + 1 (zero disables conversion), render scale X/Y.
+	uint32_t flags;
+};
+static_assert(sizeof(MetalGERasterUniforms) == 32);
+enum : uint32_t {
+	METAL_RASTER_DITHER = 1,
+	METAL_RASTER_LINEAR_FILTER = 4,
+};
 namespace ShaderBinding {
+constexpr uint32_t DRAW_BINDING_METAL_RASTER = 15;
 enum {
 	DRAW_BINDING_TEXTURE = 0,
 	DRAW_BINDING_2ND_TEXTURE = 1,

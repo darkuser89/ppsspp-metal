@@ -29,6 +29,8 @@ for it:
 | [docs/VSHBootInvestigation.md](docs/VSHBootInvestigation.md) | Booting the PSP's Visual Shell with `--vsh` against a real firmware dump |
 | [docs/PsarFileFormat.md](docs/PsarFileFormat.md) | The PSAR archive inside a firmware updater - the format `Core/Util/PSARUnpack.cpp` walks |
 | [docs/pkg_notes.md](docs/pkg_notes.md) | The NPDRM `.pkg` format PSP game updates ship in, and how PPSSPP installs them |
+| [docs/cpu-equivalence.md](docs/cpu-equivalence.md) | Making the CPU cores agree bit for bit on every host: the `CPUEquivalence` fuzzer, what it found, and the differences still open (several waiting on a hardware test) |
+| [docs/dnas-patches.md](docs/dnas-patches.md) | Game patches installed on a real PSP (Killzone: Liberation's DLC): installing one over PSPLink, and the Fuse-ID-keyed PGD and type 3 PRX that `sceKernelLoadModuleDNAS` decrypts |
 | [docs/kernel-hle-review.md](docs/kernel-hle-review.md) | Findings from a review pass over `Core/HLE/sceKernel*.cpp`, and what was verified clean |
 | [docs/metal-backend.md](docs/metal-backend.md) | What a native Metal backend would take, and why programmable blending is the reason to want one |
 
@@ -38,7 +40,8 @@ for it:
 2. Keep cross-platform parity in mind when changing shared code. See below for more multiplatform tips
 3. **Commit freely, push only when asked.** Once a change is done and tested, commit it on its
    branch without waiting to be told. Never `git push` (to any remote) without the user's explicit
-   approval.
+   approval. The exception is a useful new or re-recorded test in `pspautotests`, which goes
+   straight to its `master` without asking (see [docs/pspautotests-hardware.md](docs/pspautotests-hardware.md#committing)).
 4. **Don't write code on `master`.** When asked to make a code change while on `master`, create an
    appropriately named branch first (`git checkout -b some-descriptive-name`) and do the work there.
    If you're already on a topic branch, just keep working on it.
@@ -74,6 +77,9 @@ for it:
    the next test. Concurrent runs collide in PSPLink and `host0:`: they time out, their results are
    garbage, and the PSP wedges until someone resets it by hand. This has happened repeatedly; there
    is no case where it is acceptable.
+8. **Update submodules when you start working.** Run `git submodule update --init --recursive`
+   before anything else, and again after switching or rebasing branches, so that builds and tests
+   use the submodule commits the branch records.
 
 ## Core Safety Checks
 
@@ -290,8 +296,19 @@ Keep commit messages focused, not overly long (although sometimes it's motivated
 is super complex). Do not report things like 100/100 tests passed - that's a given, if tests break
 you aren't supposed to make a commit.
 
-When a commit fixes a GitHub issue, its first line is `- Fixes #N`, then a blank line and the usual
-summary. GitHub shows a reference that stands alone in a list item with the issue's title, so the PR
+When a commit fixes a GitHub issue, the title comes first as usual, then a blank line, then
+`- Fixes #N` as the first line of the body, then a blank line and the rest of the summary:
+
+```
+GE: Nest CALLs only two deep, like the hardware
+
+- Fixes #7395
+
+The GE has two return address registers, ...
+```
+
+The blank line after the title matters: without it, git and GitHub treat both lines as the title.
+GitHub shows a reference that stands alone in a list item with the issue's title, so the PR
 (which takes its description from the commit) shows what is being fixed, and the keyword closes the
 issue on merge. Don't repeat the number in the body.
 

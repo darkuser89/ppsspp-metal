@@ -11,7 +11,6 @@
 #include "Common/GPU/Vulkan/VulkanBarrier.h"
 #include "Common/GPU/Vulkan/VulkanFrameData.h"
 #include "Common/GPU/Vulkan/VulkanFramebuffer.h"
-#include "Common/Data/Convert/SmallDataConvert.h"
 #include "Common/Data/Collections/TinySet.h"
 #include "Common/GPU/DataFormat.h"
 
@@ -26,6 +25,7 @@ enum {
 	QUEUE_HACK_MGS2_ACID = 1,
 	QUEUE_HACK_SONIC = 2,
 	QUEUE_HACK_RENDERPASS_MERGE = 8,
+	QUEUE_HACK_TILED_DEPAL = 16,
 };
 
 enum class VKRRenderCommand : uint8_t {
@@ -290,6 +290,7 @@ private:
 
 	static void ApplyMGSHack(std::vector<VKRStep *> &steps);
 	static void ApplySonicHack(std::vector<VKRStep *> &steps);
+	static void ApplyTiledDepalHack(std::vector<VKRStep *> &steps);
 	static void ApplyRenderPassMerge(std::vector<VKRStep *> &steps);
 
 	static void SetupTransferDstWriteAfterWrite(VKRImage &img, VkImageAspectFlags aspect, VulkanBarrierBatch *recordBarrier);

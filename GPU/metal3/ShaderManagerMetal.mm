@@ -5,13 +5,15 @@
 #include "GPU/metal3/ShaderManagerMetal.h"
 
 #include "Common/File/FileUtil.h"
+#include "Common/GPU/metal3/MetalResources.h"
 #include "Core/Config.h"
 #include "GPU/Common/GPUStateUtils.h"
+#include "GPU/metal3/TextureCachePolicyMetal.h"
 
 namespace {
 
 constexpr uint32_t METAL_SHADER_CACHE_MAGIC = 0x4D534844;
-constexpr uint32_t METAL_SHADER_CACHE_VERSION = 1;
+constexpr uint32_t METAL_SHADER_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 3 : 1;
 constexpr uint32_t MAX_CACHED_SHADERS = 8192;
 
 struct MetalShaderCacheHeader {
@@ -223,7 +225,8 @@ bool ShaderManagerMetal::Compile(MetalGEShader *shader, ShaderStage stage, const
 	for (const auto &resource : shader->compiled.resources) {
 		if (resource.kind == Metal::ResourceKind::UniformBuffer) {
 			size_t available = resource.binding == ShaderBinding::DRAW_BINDING_DYNUBO_BASE ? sizeof(base_) :
-				resource.binding == ShaderBinding::DRAW_BINDING_DYNUBO_LIGHT ? sizeof(lights_) : 0;
+				resource.binding == ShaderBinding::DRAW_BINDING_DYNUBO_LIGHT ? sizeof(lights_) :
+				resource.binding == ShaderBinding::DRAW_BINDING_METAL_RASTER ? sizeof(MetalGERasterUniforms) : 0;
 			if (!available || resource.byteSize > available) {
 				shader->error = "Generated GE uniform block does not match the Metal upload layout";
 				return false;
@@ -419,6 +422,34 @@ bool ShaderManagerMetal::BindUniforms(id<MTLRenderCommandEncoder> encoder, std::
 		return false;
 	}
 	const uint64_t serial = manager_->RenderStateSerial();
+#if PPSSPP_PLATFORM(MAC)
+	MetalGERasterUniforms raster{};
+	if (gstate.isModeThrough() && gstate_c.textureIsFramebuffer) {
+		const auto sampler = GetMetalFramebufferSamplingParams(gstate, gstate_c.curTextureWidth, gstate_c.curTextureHeight, pixelMapped_);
+		if (sampler.magFilt && sampler.minFilt) {
+			raster.flags |= METAL_RASTER_LINEAR_FILTER;
+		}
+	}
+	for (int i = 0; i < 4; ++i) {
+		raster.dither[i] = gstate.dithmtx[i];
+	}
+	auto *target = static_cast<Metal::Framebuffer *>(manager_->RenderTarget());
+	raster.raster[1] = target && gstate_c.curRTWidth ? (float)target->Width() / gstate_c.curRTWidth : 1.0f;
+	raster.raster[2] = target && gstate_c.curRTHeight ? (float)target->Height() / gstate_c.curRTHeight : 1.0f;
+	bool partialMask = false;
+	for (int i = 0; i < 3; ++i) {
+		const uint32_t mask = (gstate.getColorMask() >> (i * 8)) & 255;
+		partialMask |= mask != 0 && mask != 255;
+	}
+	if (!gstate.isAlphaBlendEnabled() && !gstate.isModeClear() && !gstate.isLogicOpEnabled() && !partialMask &&
+		(gstate.isDitherEnabled() || gstate_c.framebufFormat != GE_FORMAT_8888)) {
+		raster.raster[0] = (int)gstate_c.framebufFormat + 1;
+		if (gstate.isDitherEnabled()) {
+			raster.flags |= METAL_RASTER_DITHER;
+		}
+	}
+	[encoder setFragmentBytes:&raster length:sizeof(raster) atIndex:ShaderBinding::DRAW_BINDING_METAL_RASTER];
+#endif
 	const bool sameEncoderState = boundUniformsValid_ && boundRenderStateSerial_ == serial;
 	if (!sameEncoderState || boundBuffers_.base.buffer != buffers_.base.buffer || boundBuffers_.base.offset != buffers_.base.offset) {
 		[encoder setVertexBuffer:buffers_.base.buffer offset:buffers_.base.offset atIndex:ShaderBinding::DRAW_BINDING_DYNUBO_BASE];

@@ -421,8 +421,10 @@ void IRNativeBackend::CompileIRInst(IRInst inst) {
 		break;
 
 	case IROp::Vec4Dot:
+	case IROp::Vec4VfpuDot:
 		CompIR_VecHoriz(inst);
 		break;
+
 
 	case IROp::Vec2Unpack16To31:
 	case IROp::Vec2Unpack16To32:
@@ -626,6 +628,7 @@ const u8 *IRNativeJit::GetCrashHandler() const {
 }
 
 void IRNativeJit::UpdateFCR31() {
+	IRJit::UpdateFCR31();
 	backend_->UpdateFCR31(mips_);
 }
 

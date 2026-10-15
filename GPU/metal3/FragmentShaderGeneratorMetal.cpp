@@ -209,6 +209,9 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 		}
 
 		WRITE(p, "layout (std140, set = 0, binding = %d) uniform baseUBO {\n%s};\n", ShaderBinding::DRAW_BINDING_DYNUBO_BASE, ub_baseStr);
+#if PPSSPP_PLATFORM(MAC)
+		WRITE(p, "layout (std140, set = 0, binding = %d) uniform metalRasterUBO { uvec4 m_dither; vec3 m_raster; uint m_flags; };\n", ShaderBinding::DRAW_BINDING_METAL_RASTER);
+#endif
 		if (doTexture) {
 			WRITE(p, "layout (set = 0, binding = %d) uniform %s%s tex;\n", ShaderBinding::DRAW_BINDING_TEXTURE, texture3D ? "sampler3D" : "sampler2D", arrayTexture ? "Array" : "");
 		}
@@ -663,6 +666,37 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 						}
 					}
 				}
+#if PPSSPP_PLATFORM(MAC)
+				if (arrayTexture && !texture3D) {
+					// Keep the postprocessing filter footprint in PSP texels at higher render scales.
+					p.C("  if ((m_flags & 4u) != 0u) {\n");
+					p.F("    highp vec2 filterUV = %s.xy%s;\n", texcoord, doTextureProjection ? "/ projTexcoord.z" : "");
+					p.C("    highp vec2 filterSize = 0.5 / u_texclamp.zw;\n");
+					p.C("    highp vec2 filterPos = filterUV * filterSize - vec2(0.5);\n");
+					p.C("    highp vec2 filterBase = floor(filterPos);\n");
+					p.C("    highp vec2 filterWeight = floor(fract(filterPos) * 16.0);\n");
+					p.C("    highp vec4 filterColors[4];\n");
+					p.C("    for (int tap = 0; tap < 4; ++tap) {\n");
+					p.C("      highp vec2 filterTap = (filterBase + vec2(tap & 1, tap >> 1) + vec2(0.5)) / filterSize;\n");
+					if (needShaderTexClamp) {
+						p.C("      filterTap -= u_texclampoff;\n");
+						for (const char axis : {'x', 'y'}) {
+							if (!id.Bit(axis == 'x' ? FS_BIT_CLAMP_S : FS_BIT_CLAMP_T)) {
+								p.F("      filterTap.%c = mod(filterTap.%c, u_texclamp.%c);\n", axis, axis, axis);
+							} else {
+								p.F("      filterTap.%c = clamp(filterTap.%c, u_texclamp.%c, u_texclamp.%c - u_texclamp.%c);\n", axis, axis, axis == 'x' ? 'z' : 'w', axis, axis == 'x' ? 'z' : 'w');
+							}
+						}
+						p.C("      filterTap += u_texclampoff;\n");
+					}
+					p.C("      filterColors[tap] = floor(").SampleTexture2D("tex", "filterTap").C(" * 255.0 + 0.5);\n");
+					p.C("    }\n");
+					p.C("    highp vec4 filterTop = floor((filterColors[0] * (16.0 - filterWeight.x) + filterColors[1] * filterWeight.x) / 16.0);\n");
+					p.C("    highp vec4 filterBottom = floor((filterColors[2] * (16.0 - filterWeight.x) + filterColors[3] * filterWeight.x) / 16.0);\n");
+					p.C("    t = floor((filterTop * (16.0 - filterWeight.y) + filterBottom * filterWeight.y) / 16.0) / 255.0;\n");
+					p.C("  }\n");
+				}
+#endif
 				break;
 			case ShaderDepalMode::SMOOTHED:
 				// Specific mode for Test Drive. Fixes the banding.
@@ -942,7 +976,14 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 
 			switch (texFunc) {
 			case GE_TEXFUNC_MODULATE:
-				WRITE(p, "  vec4 v = p * t%s;\n", secondary);
+				if (PPSSPP_PLATFORM(MAC)) {
+					// Match Software/Sampler.cpp before color doubling and secondary color.
+					WRITE(p, "  highp vec4 color8 = floor(p * 255.0 + 0.01);\n");
+					WRITE(p, "  highp vec4 texel8 = floor(t * 255.0 + 0.01);\n");
+					WRITE(p, "  vec4 v = floor((color8 + 1.0) * texel8 * vec4(vec3(u_texNoAlphaMul.y), 1.0) / 256.0) / 255.0%s;\n", secondary);
+				} else {
+					WRITE(p, "  vec4 v = p * t%s;\n", secondary);
+				}
 				break;
 			case GE_TEXFUNC_DECAL:
 				WRITE(p, "  vec4 v = vec4(mix(p.rgb, t.rgb, t.a), p.a)%s;\n", secondary);
@@ -972,7 +1013,9 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 
 			// We only need a clamp if the color will be further processed directly in the shader.
 			// Otherwise the hardware color conversion will clamp for us (unless we start using FP formats for fake HDR but then we probably don't want the clamp...)
-			if (enableFog || enableColorTest || replaceBlend != REPLACE_BLEND_NO || simulateLogicOpType != LOGICOPTYPE_NORMAL || colorWriteMask || blueToAlpha) {
+			if (PPSSPP_PLATFORM(MAC) && texFunc == GE_TEXFUNC_MODULATE) {
+				WRITE(p, "  v.rgb = clamp(v.rgb, 0.0, 1.0);\n");
+			} else if (enableFog || enableColorTest || replaceBlend != REPLACE_BLEND_NO || simulateLogicOpType != LOGICOPTYPE_NORMAL || colorWriteMask || blueToAlpha) {
 				WRITE(p, "  v.rgb = clamp(v.rgb * u_texNoAlphaMul.y, 0.0, 1.0);\n");
 			} else {
 				WRITE(p, "  v.rgb *= u_texNoAlphaMul.y;\n");
@@ -1326,6 +1369,18 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 	if (blueToAlpha) {
 		WRITE(p, "  %s = vec4(0.0, 0.0, 0.0, %s.z);  // blue to alpha\n", compat.fragColor0, compat.fragColor0);
 	}
+	if (PPSSPP_PLATFORM(MAC) && compat.shaderLanguage == GLSL_VULKAN) {
+		WRITE(p, "  if (m_raster.x > 0.0) {\n");
+		WRITE(p, "    ivec2 pixel = ivec2(floor(gl_FragCoord.xy / m_raster.yz));\n");
+		WRITE(p, "    int dither = int((m_dither[pixel.y & 3] >> ((pixel.x & 3) * 4)) & 15u);\n");
+		WRITE(p, "    dither = dither >= 8 ? dither - 16 : dither;\n");
+		WRITE(p, "    ivec3 rgb = ivec3(clamp(floor(%s.rgb * 255.0 + 0.01) + float(dither) * float(m_flags & 1u), 0.0, 255.0));\n", compat.fragColor0);
+		WRITE(p, "    if (m_raster.x == 1.0) { rgb >>= ivec3(3, 2, 3); rgb = (rgb << ivec3(3, 2, 3)) | (rgb >> ivec3(2, 4, 2)); }\n");
+		WRITE(p, "    else if (m_raster.x == 2.0) { rgb >>= 3; rgb = (rgb << 3) | (rgb >> 2); }\n");
+		WRITE(p, "    else if (m_raster.x == 3.0) { rgb >>= 4; rgb *= 17; }\n");
+		WRITE(p, "    %s.rgb = vec3(rgb) / 255.0;\n", compat.fragColor0);
+		WRITE(p, "  }\n");
+	}
 
 	if (fsDepthClamp || fsMinmaxDiscard) {
 		WRITE(p, "  highp float projZ = v_zw.x / v_zw.y;\n");
@@ -1351,7 +1406,7 @@ bool GenerateMetalFragmentShader(const FShaderID &id, char *buffer, const MetalS
 				WRITE(p, "  gl_FragDepth = floor(gl_FragCoord.z * 65536.0 + 0.01) / 65535.0;\n");
 			}
 		} else if (fsDepthClamp) {
-			WRITE(p, "  gl_FragDepth = clamp(projZ, 0.0, 65535.0) / 65535.0;\n");
+			WRITE(p, "  gl_FragDepth = clamp(projZ * (1.0 / 65536.0), 0.0, 1.0);\n");
 		}
 	} else if (useDiscardStencilBugWorkaround) {
 		// Adreno and some Mali drivers apply early frag tests even with discard in the shader,

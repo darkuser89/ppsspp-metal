@@ -288,16 +288,18 @@ namespace MIPSInt {
 		int imm = _SIMM16_SHL2;
 		int rs = _RS;
 		u32 addr = PC + imm + 4;
+		// The linking ones test rs from before they link, ra included (cpu/cpu_alu/branch_link_ra).
+		const s32 value = (s32)R(rs);
 
 		switch ((op>>16) & 0x1F) {
-		case 0: if ((s32)R(rs) <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltz
-		case 1: if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgez
-		case 2: if ((s32)R(rs) <  0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzl
-		case 3: if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezl
-		case 16: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltzal
-		case 17: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgezal
-		case 18: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) <	0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzall
-		case 19: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezall
+		case 0: if (value <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltz
+		case 1: if (value >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgez
+		case 2: if (value <  0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzl
+		case 3: if (value >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezl
+		case 16: R(MIPS_REG_RA) = PC + 8; if (value <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltzal
+		case 17: R(MIPS_REG_RA) = PC + 8; if (value >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgezal
+		case 18: R(MIPS_REG_RA) = PC + 8; if (value <  0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzall
+		case 19: R(MIPS_REG_RA) = PC + 8; if (value >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezall
 		default:
 			_dbg_assert_msg_(false,"Trying to interpret instruction that can't be interpreted");
 			break;
@@ -748,9 +750,6 @@ namespace MIPSInt {
 					} else {
 						// The interpreter emulates the rounding mode by putting the host FPU in it,
 						// so it has to switch right here rather than at the next block boundary.
-						// Restore first: the new value may be back to the default, which Apply
-						// deliberately doesn't write.
-						RestoreHostRoundingMode();
 						ApplyHostRoundingMode(mips);
 					}
 				} else {
@@ -970,34 +969,26 @@ namespace MIPSInt {
 		{
 		case 0: R(rd) = R(rt) << sa; break; //sll
 		case 2:
-			if (_RS == 0) //srl
-			{
-				R(rd) = R(rt) >> sa;
-				break;
-			}
-			else if (_RS == 1) //rotr
-			{
+			// Only the low bit of the unused rs field counts (cpu/cpu_alu/shift_encodings).
+			if (_RS & 1) { //rotr
 				R(rd) = __rotr(R(rt), sa);
-				break;
+			} else { //srl
+				R(rd) = R(rt) >> sa;
 			}
-			else
-				goto wrong;
+			break;
 
 		case 3: R(rd) = (u32)(((s32)R(rt)) >> sa); break; //sra
 		case 4: R(rd) = R(rt) << (R(rs) & 0x1F); break; //sllv
 		case 6:
-			if (_FD == 0) { //srlv
-				R(rd) = R(rt) >> (R(rs)&0x1F);
-				break;
-			} else if (_FD == 1) { // rotrv
+			// Same for the unused sa field.
+			if (_FD & 1) { // rotrv
 				R(rd) = __rotr(R(rt), R(rs));
-				break;
-			} else {
-				goto wrong;
+			} else { //srlv
+				R(rd) = R(rt) >> (R(rs) & 0x1F);
 			}
+			break;
 		case 7: R(rd) = (u32)(((s32)R(rt)) >> (R(rs) & 0x1F)); break; //srav
 		default:
-			wrong:
 			_dbg_assert_msg_(false,"Trying to interpret instruction that can't be interpreted");
 			break;
 		}
@@ -1014,7 +1005,7 @@ namespace MIPSInt {
 			return;
 		}
 
-		switch ((op >> 6) & 31) {
+		switch (AllegrexBitOp(op)) {
 		case 16: // seb
 			R(rd) = SignExtend8ToU32(R(rt));
 			break;
@@ -1044,11 +1035,11 @@ namespace MIPSInt {
 			return;
 		}
 
-		switch (op & 0x3ff) {
-		case 0xA0: //wsbh
+		switch (AllegrexBitOp(op)) {
+		case 2: //wsbh
 			R(rd) = ((R(rt) & 0xFF00FF00) >> 8) | ((R(rt) & 0x00FF00FF) << 8);
 			break;
-		case 0xE0: //wsbw
+		case 3: //wsbw
 			R(rd) = swap32(R(rt));
 			break;
 		default:
@@ -1141,10 +1132,10 @@ namespace MIPSInt {
 			{
 			// round.w.s is round-half-to-even, not half-away-from-zero - and its mode is fixed,
 			// so unlike cvt.w.s below it must not follow fcr31. round_ieee_754 is both.
-			case 12: FsI(fd) = SaturatedFloatToInt(round_ieee_754(F(fs))); break; //round.w.s
-			case 13: FsI(fd) = SaturatedFloatToInt(truncf(F(fs))); break; //trunc.w.s
-			case 14: FsI(fd) = SaturatedFloatToInt(ceilf(F(fs))); break; //ceil.w.s
-			case 15: FsI(fd) = SaturatedFloatToInt(floorf(F(fs))); break; //floor.w.s
+			case 12: FsI(fd) = SaturatedFloatToInt(round_ieee_754(FlushForConversion(mips, F(fs)))); break; //round.w.s
+			case 13: FsI(fd) = SaturatedFloatToInt(truncf(FlushForConversion(mips, F(fs)))); break; //trunc.w.s
+			case 14: FsI(fd) = SaturatedFloatToInt(ceilf(FlushForConversion(mips, F(fs)))); break; //ceil.w.s
+			case 15: FsI(fd) = SaturatedFloatToInt(floorf(FlushForConversion(mips, F(fs)))); break; //floor.w.s
 			}
 			break;
 		case 32: F(fd) = (float)FsI(fs); break; //cvt.s.w
@@ -1152,10 +1143,10 @@ namespace MIPSInt {
 		case 36:
 			switch (mips->fcr31 & 3)
 			{
-			case 0: FsI(fd) = SaturatedFloatToInt(round_ieee_754(F(fs))); break;  // RINT_0
-			case 1: FsI(fd) = SaturatedFloatToInt(truncf(F(fs))); break;  // CAST_1
-			case 2: FsI(fd) = SaturatedFloatToInt(ceilf(F(fs))); break;  // CEIL_2
-			case 3: FsI(fd) = SaturatedFloatToInt(floorf(F(fs))); break;  // FLOOR_3
+			case 0: FsI(fd) = SaturatedFloatToInt(round_ieee_754(FlushForConversion(mips, F(fs)))); break;  // RINT_0
+			case 1: FsI(fd) = SaturatedFloatToInt(truncf(FlushForConversion(mips, F(fs)))); break;  // CAST_1
+			case 2: FsI(fd) = SaturatedFloatToInt(ceilf(FlushForConversion(mips, F(fs)))); break;  // CEIL_2
+			case 3: FsI(fd) = SaturatedFloatToInt(floorf(FlushForConversion(mips, F(fs)))); break;  // FLOOR_3
 			}
 			break; //cvt.w.s
 		default:

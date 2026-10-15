@@ -19,3 +19,5 @@
 
 bool TestJit();
 bool TestJitReplacementHooks();
+bool TestCPUEquivalence();
+bool TestCPURoundingMode();

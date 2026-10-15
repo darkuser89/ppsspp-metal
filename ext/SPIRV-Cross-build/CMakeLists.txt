@@ -77,6 +77,8 @@ if(APPLE AND NOT LIBRETRO)
 	target_compile_definitions(spirv-cross-metal PRIVATE SPIRV_CROSS_NAMESPACE_OVERRIDE=ppsspp_metal_spirv)
 	target_compile_options(spirv-cross-metal PRIVATE -fexceptions)
 endif()
+# Only built when something links them (spirv-cross-hlsl on Windows).
+set_target_properties(spirv-cross-cpp spirv-cross-msl spirv-cross-hlsl PROPERTIES EXCLUDE_FROM_ALL ON)
 
 set(spirv-compiler-options "")
 set(spirv-compiler-defines "")
