@@ -62,7 +62,24 @@ bool RiscVJitBackend::CompileBlock(IRBlockCache *irBlockCache, int block_num) {
 		return false;
 
 	IRBlock *block = irBlockCache->GetBlock(block_num);
-	BeginWrite(std::min(GetSpaceLeft(), (size_t)block->GetNumIRInstructions() * 32));
+	// An accurate dot product stores its operands and flushes registers around its call.
+	size_t sizeEstimate = 0;
+	const IRInst *estimateInsts = irBlockCache->GetBlockInstructionPtr(*block);
+	for (int i = 0; i < block->GetNumIRInstructions(); ++i) {
+		switch (estimateInsts[i].op) {
+		case IROp::Vec4VfpuDot:
+			sizeEstimate += 160;
+			break;
+		// The jump to a register looks up the block itself.
+		case IROp::ExitToReg:
+			sizeEstimate += 128;
+			break;
+		default:
+			sizeEstimate += 32;
+			break;
+		}
+	}
+	BeginWrite(std::min(GetSpaceLeft(), sizeEstimate));
 
 	u32 startPC = block->GetOriginalStart();
 	bool wroteCheckedOffset = false;
@@ -136,6 +153,8 @@ bool RiscVJitBackend::CompileBlock(IRBlockCache *irBlockCache, int block_num) {
 		LI(SCRATCH1, startPC);
 		QuickJ(R_RA, outerLoopPCInSCRATCH1_);
 	}
+
+	RecordIRAddresses(block_num, addresses);
 
 	if (logBlocks_ > 0) {
 		--logBlocks_;
@@ -288,7 +307,7 @@ bool RiscVJitBackend::DescribeCodePtr(const u8 *ptr, std::string &name) const {
 	} else if (ptr == applyRoundingMode_) {
 		name = "applyRoundingMode";
 	} else if (ptr >= GetBasePtr() && ptr < GetBasePtr() + jitStartOffset_) {
-		name = "fixedCode";
+		name = DescribeFixedCode(ptr);
 	} else {
 		return IRNativeBackend::DescribeCodePtr(ptr, name);
 	}

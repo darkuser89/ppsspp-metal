@@ -19,10 +19,10 @@
 #include "GPU/Common/DepalettizeShaderCommon.h"
 
 #if PPSSPP_PLATFORM(MAC) && defined(PPSSPP_HAS_METAL)
-#include "Common/GPU/metal3/MetalShaderCompiler.h"
-#include "Common/GPU/metal3/thin3d_metal.h"
-#include "GPU/metal3/FragmentShaderGeneratorMetal.h"
-#include "GPU/metal3/ShaderBindingsMetal.h"
+#include "Common/GPU/metal4/MetalShaderCompiler.h"
+#include "Common/GPU/metal4/thin3d_metal.h"
+#include "GPU/metal4/FragmentShaderGeneratorMetal.h"
+#include "GPU/metal4/ShaderBindingsMetal.h"
 #include "GPU/Common/Draw2D.h"
 
 Draw2DPipelineInfo GenerateDraw2DCopyColorFs(ShaderWriter &writer);
@@ -658,7 +658,7 @@ bool TestMetalDelayedReadback() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
 	if (!draw) {
-		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+		if (error == "This Mac does not support Metal 4" || error == "Metal 4 requires macOS 26 or later") {
 			printf("Metal delayed readback skipped: %s\n", error.c_str());
 			return true;
 		}
@@ -782,7 +782,7 @@ bool TestMetalTriangleFan() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
 	if (!draw) {
-		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+		if (error == "This Mac does not support Metal 4" || error == "Metal 4 requires macOS 26 or later") {
 			printf("Metal triangle fan skipped: %s\n", error.c_str());
 			return true;
 		}
@@ -895,7 +895,7 @@ bool TestMetalCullPointsLines() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
 	if (!draw) {
-		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+		if (error == "This Mac does not support Metal 4" || error == "Metal 4 requires macOS 26 or later") {
 			printf("Metal point/line culling skipped: %s\n", error.c_str());
 			return true;
 		}
@@ -978,7 +978,7 @@ bool TestMetalDualSourceBlend() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
 	if (!draw) {
-		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+		if (error == "This Mac does not support Metal 4" || error == "Metal 4 requires macOS 26 or later") {
 			printf("Metal dual-source blend skipped: %s\n", error.c_str());
 			return true;
 		}
@@ -1083,7 +1083,7 @@ bool TestMetalMSAAResolve() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
 	if (!draw) {
-		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+		if (error == "This Mac does not support Metal 4" || error == "Metal 4 requires macOS 26 or later") {
 			printf("Metal MSAA resolve skipped: %s\n", error.c_str());
 			return true;
 		}
@@ -1273,7 +1273,7 @@ bool TestMetalLoadDiscardBlit() {
 	std::string error;
 	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
 	if (!draw) {
-		if (error == "This device does not support Metal 3" || error == "Metal 3 requires macOS 13 or iOS 16 or later") {
+		if (error == "This Mac does not support Metal 4" || error == "Metal 4 requires macOS 26 or later") {
 			printf("Metal load discard blit skipped: %s\n", error.c_str());
 			return true;
 		}

@@ -31,8 +31,9 @@
 #endif
 #include "GPU/Vulkan/GPU_Vulkan.h"
 #include "GPU/Software/SoftGpu.h"
+#include "GPU/Null/GPU_Null.h"
 #ifdef PPSSPP_HAS_METAL
-#include "GPU/metal3/GPU_Metal.h"
+#include "GPU/metal4/GPU_Metal.h"
 #endif
 
 #if PPSSPP_API(D3D11)
@@ -78,13 +79,15 @@ static GPUCommon *CreateGPUCore(GPUCore gpuCore, GraphicsContext *ctx, Draw::Dra
 		}
 		return new GPU_Vulkan(ctx, draw);
 #endif
+	case GPUCORE_NULL:
+		return CreateNullGPU(ctx);
 	default:
 		return nullptr;
 	}
 }
 
 bool GPU_Init(GPUCore gpuCore, GraphicsContext *ctx, Draw::DrawContext *draw) {
-	_dbg_assert_(draw || gpuCore == GPUCORE_SOFTWARE);
+	_dbg_assert_(draw || gpuCore == GPUCORE_SOFTWARE || gpuCore == GPUCORE_NULL);
 	_dbg_assert_(!gpu);
 
 	GPUCommon *createdGPU = CreateGPUCore(gpuCore, ctx, draw);

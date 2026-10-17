@@ -1483,6 +1483,116 @@ static int Hook_codedarms_stencil_check() {
 	return 0;
 }
 
+static int Hook_resistance_draw_trail() {
+	// Smoke trails get a new node per update rather than per unit of time, while the nodes expire by
+	// time, so the higher the frame rate, the more of them are alive. After the angel boss in Bonn the
+	// trails behind the debris make the display list overflow its buffer at 60fps, into the music
+	// stream and beyond (#19755). Locking the CPU to 222MHz, which slows the frame rate, avoids it.
+	// resistance_update_trail now limits the node rate, so this is a backstop.
+	// The game keeps its two list buffers and their limits next to the write pointer, but doesn't
+	// check them here. Hooked where the node count is about to become the loop count: when the
+	// current buffer is nearly full, skip the trail by making the count zero.
+	u32 listPtrAddr;
+	if (!GetMIPSStaticAddress(listPtrAddr, 0x6C, 0x3A4) || !Memory::IsValid4AlignedRange(listPtrAddr - 0x10, 0x14 + 8)) {
+		return 0;
+	}
+	const u32 ptr = Memory::ReadUnchecked_U32(listPtrAddr) & 0x0FFFFFFF;
+	for (int i = 0; i < 2; i++) {
+		const u32 base = Memory::ReadUnchecked_U32(listPtrAddr - 0x10 + i * 4) & 0x0FFFFFFF;
+		const u32 limit = Memory::ReadUnchecked_U32(listPtrAddr + 4 + i * 4) & 0x0FFFFFFF;
+		if (ptr >= base && ptr <= limit) {
+			// A trail is at most 17 nodes of six sprites (0x84 bytes each), so this leaves room for it
+			// and for everything drawn after it.
+			if (limit - ptr < 0x18000) {
+				currentMIPS->r[MIPS_REG_A1] = (u32)-1;
+			}
+			break;
+		}
+	}
+	return 0;
+}
+
+static int Hook_medievil_projectile_update() {
+	// The dragon armour's fire breath only works at 30fps, on hardware too. Each flame is a projectile
+	// whose init looks up the "Volume_Attached_Hurt" node in its model and keeps it at +0x3F8. The
+	// projectile dies on its first update if the node wasn't found. The model's node list is filled
+	// from a resource that's only loaded after init. At 30fps a dying flame is still alive when the
+	// next one spawns, which keeps the resource loaded, so later flames find the node. At 60fps
+	// each flame dies first, the resource is freed and reloaded, and no flame ever finds it.
+	// Hooked where the update checks for the node: by then the list is filled, so look again.
+	const u32 obj = currentMIPS->r[MIPS_REG_S2];
+	if (!Memory::IsValid4AlignedRange(obj + 0xBC, 4) || !Memory::IsValid4AlignedRange(obj + 0x3F8, 4)) {
+		return 0;
+	}
+	if (Memory::ReadUnchecked_U32(obj + 0x3F8) != 0) {
+		return 0;
+	}
+	const u32 model = Memory::ReadUnchecked_U32(obj + 0xBC);
+	if (!Memory::IsValid4AlignedRange(model + 0x4C, 0xC)) {
+		return 0;
+	}
+	// The list's nodes link through a pointer at an offset kept in the list header.
+	const u32 nextOffset = Memory::ReadUnchecked_U32(model + 0x4C + 8);
+	static const char nodeName[] = "Volume_Attached_Hurt";
+	u32 node = Memory::ReadUnchecked_U32(model + 0x4C);
+	for (int i = 0; i < 1024 && node != 0; i++) {
+		if (!Memory::IsValidRange(node, 0x20) || !Memory::IsValid4AlignedRange(node + nextOffset, 4)) {
+			break;
+		}
+		// The game reads the name pointer with lwl/lwr, so it may be unaligned.
+		u32 namePtr;
+		memcpy(&namePtr, Memory::GetPointerUnchecked(node + 0x14), 4);
+		if (Memory::IsValidRange(namePtr, sizeof(nodeName) - 1) && memcmp(Memory::GetPointerUnchecked(namePtr), nodeName, sizeof(nodeName) - 1) == 0) {
+			Memory::WriteUnchecked_U32(Memory::ReadUnchecked_U32(node + 0x1C), obj + 0x3F8);
+			break;
+		}
+		node = Memory::ReadUnchecked_U32(node + nextOffset);
+	}
+	return 0;
+}
+
+static int Hook_resistance_update_trail() {
+	// The trail adds a node on every update that its emitter's rate allows (one per update at most,
+	// and the explosion debris always allow one), and the effect's clock advances 1/60 per update
+	// at 60fps. Keep the nodes at least 1/30 of that clock apart, as if the game ran at 30fps, so
+	// running faster doesn't pack the smoke denser and multiply the trails (#19755). Hooked where the
+	// accumulator is about to be tested: holding it under the threshold postpones the node.
+	const u32 trail = currentMIPS->r[MIPS_REG_S0];
+	if (!Memory::IsValid4AlignedRange(trail + 0x140, 0x3C)) {
+		return 0;
+	}
+	const u32 emitter = Memory::ReadUnchecked_U32(trail + 0x140);
+	const u32 nodes = Memory::ReadUnchecked_U32(trail + 0x144);
+	const s32 count = (s32)Memory::ReadUnchecked_U32(trail + 0x178);
+	if (count <= 0 || !Memory::IsValid4AlignedAddress(emitter + 8) || !Memory::IsValid4AlignedAddress(nodes + (count - 1) * 4)) {
+		return 0;
+	}
+	const u32 lastNode = Memory::ReadUnchecked_U32(nodes + (count - 1) * 4);
+	if (!Memory::IsValid4AlignedAddress(lastNode + 0x50)) {
+		return 0;
+	}
+	const float now = currentMIPS->f[20];
+	const float lastNodeTime = Memory::ReadUnchecked_Float(lastNode + 0x50);
+	// Updates come 1/60 apart, so this lets every other one through.
+	if (now - lastNodeTime < 1.0f / 30.0f - 0.001f) {
+		const float rate = Memory::ReadUnchecked_Float(emitter + 8);
+		const float acc = Memory::ReadUnchecked_Float(trail + 0x170);
+		Memory::WriteUnchecked_Float(std::min(acc, 1.0f - rate - 0.001f), trail + 0x170);
+	}
+	return 0;
+}
+
+static int Hook_resistance_muzzle_light() {
+	// Each shot spawns a light that is removed once its effect's clock reaches 0.1s, and the new
+	// one only lights up an update after it's spawned. At 30fps the 303 assault rifle fires every
+	// third update (0.1s), so the wall goes dark for one frame per shot and flickers. At 60fps it
+	// fires every fifth update (1/12s), the light outlives the gap and the wall stays lit (#20420).
+	// 0.075s keeps the 30fps pattern and gives 60fps four lit updates out of five. Hooked where
+	// f13 holds the lifetime, about to be added to the clock.
+	currentMIPS->f[13] = 0.075f;
+	return 0;
+}
+
 static int Hook_katamari_render_check() {
 	if (!Memory::IsValidRange(currentMIPS->r[MIPS_REG_A0] + 0x3C, 8)) {
 		return 0;
@@ -1687,6 +1797,62 @@ static int Hook_ZZT3_select_hack() {
 	return 0;
 }
 
+// Bejeweled 2 only presents once mNextDrawTick has passed, and while the loading thread runs, it moves
+// it 35-50ms on per present to hold the loading screen to 20fps. The PSP port presents every frame while
+// loading, but still moves it on, so by the end of loading it's seconds ahead.
+// Whether that's undone depends on a race: if mLoadingThreadCompleted is set during a present, the present
+// ends by setting mNextDrawTick to now. If not, nothing is presented for those seconds while every frame
+// still draws into the same display list, which overruns its 128KB into the game's globals and crashes.
+// So, we do what the present would have, once loading has completed.
+static int Hook_bejeweled2_draw_dirty_stuff() {
+	const u32 func = currentMIPS->pc;
+	const u32 app = currentMIPS->r[MIPS_REG_A0];
+	// The hash masks immediates, so check the fields are where we expect.
+	if (Memory::Read_Instruction(func + 0x48).encoding != 0x90840411 ||  // lbu a0, 0x411(a0) - mLoadingThreadStarted
+		Memory::Read_Instruction(func + 0x58).encoding != 0x90840412 ||  // lbu a0, 0x412(a0) - mLoadingThreadCompleted
+		Memory::Read_Instruction(func + 0xC0).encoding != 0x8C8403C8 ||  // lw a0, 0x3C8(a0) - mLastDrawTick
+		Memory::Read_Instruction(func + 0xDC).encoding != 0x8C8403CC) {  // lw a0, 0x3CC(a0) - mNextDrawTick
+		return 0;
+	}
+	if (!Memory::IsValidRange(app, 0x414) || Memory::ReadUnchecked_U8(app + 0x412) == 0) {
+		return 0;
+	}
+	// After loading, a present leaves mNextDrawTick at mLastDrawTick.
+	const u32 lastDrawTick = Memory::ReadUnchecked_U32(app + 0x3C8);
+	const u32 nextDrawTick = Memory::ReadUnchecked_U32(app + 0x3CC);
+	if ((s32)(nextDrawTick - lastDrawTick) > 1000) {
+		Memory::WriteUnchecked_U32(lastDrawTick, app + 0x3CC);
+	}
+	return 0;
+}
+
+// GTA: Vice City Stories (#13200). A vehicle that moves less than 0.005 a frame with its gas pedal up gets
+// stopped dead, so that parked vehicles don't drift. Planes never set the pedal (the Bovver '64 hovercraft
+// is one), so where the frame rate is high enough that they cover less than that per frame, they stick to
+// the ground. It happens on a PSP too, in light enough scenes. The plane control code clears the pedal
+// in a branch delay slot, which a hook can't follow, so we hook both instructions the branch leads to,
+// and set the pedal from the throttle at 0x78C. The fix is Parik27's, from the issue.
+static int GTAVCSPlaneGasPedal(u32 hookOffset) {
+	const u32 func = currentMIPS->pc - hookOffset;
+	// The hash masks immediates, so check it's the store we expect.
+	if (Memory::Read_Instruction(func + 0x61C).encoding != 0xE61C025C) {  // swc1 f28, 0x25C(s0)
+		return 0;
+	}
+	const u32 vehicle = currentMIPS->r[MIPS_REG_S0];
+	if (Memory::IsValid4AlignedRange(vehicle + 0x25C, 4) && Memory::IsValid4AlignedRange(vehicle + 0x78C, 4)) {
+		Memory::WriteUnchecked_U32(Memory::ReadUnchecked_U32(vehicle + 0x78C), vehicle + 0x25C);
+	}
+	return 0;
+}
+
+static int Hook_gtavcs_plane_control_1() {
+	return GTAVCSPlaneGasPedal(0x620);
+}
+
+static int Hook_gtavcs_plane_control_2() {
+	return GTAVCSPlaneGasPedal(0x6AC);
+}
+
 #define JITFUNC(f) (&MIPSComp::MIPSFrontendInterface::f)
 
 // Can either replace with C functions or functions emitted in Asm/ArmAsm.
@@ -1822,6 +1988,13 @@ static const ReplacementTableEntry entries[] = {
 	{ "everybodysgolf_copy_portrait", &Hook_everybodysgolf_copy_portrait, 0, REPFLAG_HOOKENTER, 0x50 },
 	{ "everybodysgolf_spinner_background", &Hook_everybodysgolf_spinner_background, 0, REPFLAG_HOOKENTER, 0x138 },
 	{ "codedarms_stencil_check", &Hook_codedarms_stencil_check, 0, REPFLAG_HOOKENTER, 0x8C },
+	{ "resistance_draw_trail", &Hook_resistance_draw_trail, 0, REPFLAG_HOOKENTER, 0x198 },
+	{ "resistance_update_trail", &Hook_resistance_update_trail, 0, REPFLAG_HOOKENTER, 0x438 },
+	{ "resistance_muzzle_light", &Hook_resistance_muzzle_light, 0, REPFLAG_HOOKENTER, 0xF0 },
+	{ "bejeweled2_draw_dirty_stuff", &Hook_bejeweled2_draw_dirty_stuff, 0, REPFLAG_HOOKENTER, 0 },
+	{ "gtavcs_plane_control", &Hook_gtavcs_plane_control_1, 0, REPFLAG_HOOKENTER, 0x620 },
+	{ "gtavcs_plane_control", &Hook_gtavcs_plane_control_2, 0, REPFLAG_HOOKENTER, 0x6AC },
+	{ "medievil_projectile_update", &Hook_medievil_projectile_update, 0, REPFLAG_HOOKENTER, 0x6BC },
 	{}
 };
 

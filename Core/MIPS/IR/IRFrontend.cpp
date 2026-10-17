@@ -41,7 +41,7 @@ IRFrontend::IRFrontend(bool startDefaultPrefix) {
 
 	// The debugger sets this so that "go" on a breakpoint will actually... go.
 	// But if they reset, we can end up hitting it by mistake, since it's based on PC and ticks.
-	g_breakpoints.SetSkipFirst(0);
+	g_breakpoints.ClearSkipFirst();
 }
 
 void IRFrontend::DoState(PointerWrap &p) {
@@ -61,7 +61,7 @@ void IRFrontend::DoState(PointerWrap &p) {
 
 	// The debugger sets this so that "go" on a breakpoint will actually... go.
 	// But if they reset, we can end up hitting it by mistake, since it's based on PC and ticks.
-	g_breakpoints.SetSkipFirst(0);
+	g_breakpoints.ClearSkipFirst();
 }
 
 bool IRFrontend::UpdateFCR31(u32 fcr31) {
@@ -290,6 +290,7 @@ void IRFrontend::DoJit(u32 em_address, std::vector<IRInst> &instructions, u32 &m
 	ir.Reserve(64); // Estimate a reasonable number of IR instructions per block
 
 	js.numInstructions = 0;
+	js.continuedBranches = 0;
 	while (js.compiling) {
 		// Jit breakpoints are quite fast, so let's do them in release too.
 		CheckBreakpoint(GetCompilerPC());

@@ -1,6 +1,6 @@
 #ifdef PPSSPP_HAS_METAL
-#include "Common/GPU/metal3/MetalBackend.h"
-#include "GPU/metal3/PostShaderMetal.h"
+#include "Common/GPU/metal4/MetalBackend.h"
+#include "GPU/metal4/PostShaderMetal.h"
 #endif
 // Copyright (c) 2013- PPSSPP Project.
 

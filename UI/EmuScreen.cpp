@@ -282,6 +282,11 @@ void EmuScreen::ProcessGameBoot(const Path &filename) {
 		g_OSD.Show(OSDType::MESSAGE_WARNING, "Shader cache is disabled (developer)");
 	}
 
+	if (!g_Config.bHardwareTransform) {
+		// Only developers should ever see this.
+		g_OSD.Show(OSDType::MESSAGE_WARNING, "Hardware transform is disabled (developer)");
+	}
+
 	if (g_Config.bTiltInputEnabled && g_Config.iTiltInputType != 0 && System_GetPropertyBool(SYSPROP_HAS_ACCELEROMETER)) {
 		auto co = GetI18NCategory(I18NCat::CONTROLS);
 		auto di = GetI18NCategory(I18NCat::DIALOG);
@@ -888,6 +893,9 @@ void EmuScreen::ProcessVKey(VirtKey virtKey, bool down) {
 				auto n = GetI18NCategory(I18NCat::NETWORKING);
 				auto di = GetI18NCategory(I18NCat::DIALOG);
 				g_Config.bEnableWlan = !g_Config.bEnableWlan;
+				if (g_Config.bEnableWlan) {
+					System_RequestLocalNetworkPermission();
+				}
 				// Try to avoid adding more strings so we piece together a message from existing ones.
 				g_OSD.Show(OSDType::MESSAGE_INFO, StringFromFormat(
 					"%s: %s", n->T_cstr("Enable networking"), g_Config.bEnableWlan ? di->T_cstr("Enabled") : di->T_cstr("Disabled")), 2.0, "toggle_wlan");

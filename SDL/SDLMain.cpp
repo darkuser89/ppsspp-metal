@@ -55,8 +55,8 @@ SDLJoystick *joystick = NULL;
 #include "Common/GPU/Vulkan/VulkanContext.h"
 #include "Common/GPU/Vulkan/VulkanGraphicsContext.h"
 #ifdef PPSSPP_HAS_METAL
-#include "Common/GPU/metal3/MetalGraphicsContext.h"
-#include "Common/GPU/metal3/MetalBackend.h"
+#include "Common/GPU/metal4/MetalGraphicsContext.h"
+#include "Common/GPU/metal4/MetalBackend.h"
 #include <SDL3/SDL_metal.h>
 #endif
 #include "Common/TimeUtil.h"

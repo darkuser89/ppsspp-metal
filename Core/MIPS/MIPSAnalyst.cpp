@@ -144,6 +144,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x1aad94c0723edfc0, 124, "sceVfpuMatrix3Mul", },
 	{ 0x1ab33b12b3cb8cb0, 28, "vqmul_q", },
 	{ 0x1ac05627df1f87f4, 112, "memcpy16", }, // Valkyria Chronicles 3
+	{ 0x1aee5a57e8bc2e78, 740, "resistance_muzzle_light", },
 	{ 0x1bdf3600844373fd, 112, "strstr", },
 	{ 0x1c967be07917ddc9, 92, "strcat", },
 	{ 0x1d03fa48334ca966, 556, "_strtol_r", },
@@ -368,6 +369,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xa44f6227fdbc12b1, 132, "memcmp", }, // Popolocrois (US)
 	{ 0xa46cc6ea720d5775, 44, "sceGupFrontFace", },
 	{ 0xa54967288afe8f26, 600, "ceil", },
+	{ 0xa5bada68329c05ba, 1904, "medievil_projectile_update", }, // MediEvil Resurrection (US, EU)
 	{ 0xa5ddbbc688e89a4d, 56, "isinf", },
 	{ 0xa615f6bd33195dae, 220, "atvoffroadfuryprodemo_download_frame", }, // ATV Offroad Fury Pro (US) demo
 	{ 0xa662359e30b829e4, 148, "memcmp", },
@@ -377,6 +379,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xa85fe8abb88b1c6f, 52, "vector_sub_t", },
 	{ 0xa9194e55cc586557, 268, "memcpy", },
 	{ 0xa91b3d60bd75105b, 28, "vadd_t", },
+	{ 0xaaf1cc9399336a21, 1872, "resistance_update_trail", },
 	{ 0xab97ec58c58a7c75, 52, "sceVfpuVector3Div", },
 	{ 0xac84fa7571895c9a, 68, "memcpy", }, // Marvel Ultimate Alliance 2
 	{ 0xacc2c11c3ea28320, 268, "ceilf", },
@@ -430,6 +433,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xc51519f5dab342d4, 224, "cosf", },
 	{ 0xc52c14b9af8c3008, 76, "memcmp", },
 	{ 0xc54eae62622f1e11, 164, "dl_write_bone_matrix_2", },
+	{ 0xc626403884cabcbf, 532, "bejeweled2_draw_dirty_stuff", }, // Bejeweled 2
 	{ 0xc6b29de7d3245198, 656, "starocean_write_stencil" }, // Star Ocean 1 (US)
 	{ 0xc7b1113cfdfedab6, 104, "tonyhawkp8_upload_tutorial_frame", }, // Tony Hawk's Project 8 (US)
 	{ 0xc96e3a087ebf49a9, 100, "dl_write_light_color", },
@@ -449,6 +453,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xd1db467a23ebe00d, 724, "rewrite_download_frame", }, // Rewrite Portable
 	{ 0xd1faacfc711d61e8, 68, "__negdf2", },
 	{ 0xd207b0650a41dd9c, 28, "vmin_q", },
+	{ 0xd4af2d7a4df495ae, 1728, "resistance_draw_trail", },
 	{ 0xd6d6e0bb21654778, 24, "vneg_t", },
 	{ 0xd7229fee680e7851, 40, "sceVfpuScalarMin", },
 	{ 0xd75670860a7f4b05, 144, "wcsncpy", },
@@ -494,6 +499,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xf4ea7d2ec943fa02, 224, "sinf", },
 	{ 0xf4f8cdf479dfc4a4, 224, "sinf", },
 	{ 0xf527d906d69005a0, 848, "photokano_download_frame_2", }, // Photo Kano
+	{ 0xf52da867662e04ad, 2024, "gtavcs_plane_control", }, // GTA: Vice City Stories (US, EU)
 	{ 0xf52f993e444b6c52, 44, "sceGupShadeModel", },
 	{ 0xf56641884b36c638, 468, "scalbn", },
 	{ 0xf5e91870b5b76ddc, 288, "motorstorm_download_frame", }, // MotorStorm: Arctic Edge
@@ -1289,6 +1295,16 @@ namespace MIPSAnalyst {
 		for (auto iter = functions.begin(), end = functions.end(); iter != end; ++iter) {
 			if (iter->start <= addr && iter->end >= addr) {
 				*out = *iter;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool HasFunctionsInRange(u32 startAddr, u32 endAddr) {
+		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+		for (const AnalyzedFunction &f : functions) {
+			if (f.start >= startAddr && f.start < endAddr) {
 				return true;
 			}
 		}

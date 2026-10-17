@@ -433,25 +433,25 @@ target_link_libraries(Common ${GlslangLibs})
 if(APPLE AND NOT IOS AND NOT LIBRETRO)
 	target_compile_definitions(Common PUBLIC PPSSPP_HAS_METAL=1)
 	target_sources(Common PRIVATE
-		GPU/metal3/ShaderWriterMetal.cpp
-		GPU/metal3/MetalBackend.h
-		GPU/metal3/MetalShaderCompiler.h
-		GPU/metal3/MetalShaderCompiler.cpp
-		GPU/metal3/MetalRenderContext.h
-		GPU/metal3/MetalRenderContext.mm
-		GPU/metal3/MetalResources.h
-		GPU/metal3/MetalResources.mm
-		GPU/metal3/thin3d_metal.h
-		GPU/metal3/thin3d_metal.mm
-		GPU/metal3/MetalRenderManager.h
-		GPU/metal3/MetalGraphicsContext.h
-		GPU/metal3/MetalGraphicsContext.mm
+		GPU/metal4/ShaderWriterMetal.cpp
+		GPU/metal4/MetalBackend.h
+		GPU/metal4/MetalShaderCompiler.h
+		GPU/metal4/MetalShaderCompiler.cpp
+		GPU/metal4/MetalRenderContext.h
+		GPU/metal4/MetalRenderContext.mm
+		GPU/metal4/MetalResources.h
+		GPU/metal4/MetalResources.mm
+		GPU/metal4/thin3d_metal.h
+		GPU/metal4/thin3d_metal.mm
+		GPU/metal4/MetalRenderManager.h
+		GPU/metal4/MetalGraphicsContext.h
+		GPU/metal4/MetalGraphicsContext.mm
 	)
-	set_source_files_properties(GPU/metal3/MetalShaderCompiler.cpp PROPERTIES COMPILE_FLAGS -fexceptions)
-	set_source_files_properties(GPU/metal3/MetalRenderContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
-	set_source_files_properties(GPU/metal3/MetalResources.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
-	set_source_files_properties(GPU/metal3/thin3d_metal.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
-	set_source_files_properties(GPU/metal3/MetalGraphicsContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal4/MetalShaderCompiler.cpp PROPERTIES COMPILE_FLAGS -fexceptions)
+	set_source_files_properties(GPU/metal4/MetalRenderContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal4/MetalResources.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal4/thin3d_metal.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+	set_source_files_properties(GPU/metal4/MetalGraphicsContext.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
 	target_link_libraries(Common spirv-cross-metal "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 	if(NOT CMAKE_OSX_SYSROOT OR EXISTS "${CMAKE_OSX_SYSROOT}/System/Library/Frameworks/MetalFX.framework")
 		target_link_libraries(Common "-weak_framework MetalFX")

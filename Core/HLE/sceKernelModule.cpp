@@ -587,6 +587,19 @@ void __KernelModuleDoState(PointerWrap &p) {
 				}
 			}
 		}
+		// A module that was only loaded in the state was never scanned, so nothing in it could be
+		// replaced or hooked (or show up as functions in the debugger.)
+		for (SceUID moduleId : loadedModules) {
+			PSPModule *module = kernelObjects.Get<PSPModule>(moduleId, error);
+			if (!module || module->isFake || module->textEnd <= module->textStart) {
+				continue;
+			}
+			// textEnd is inclusive.
+			if (Memory::IsValid4AlignedRange(module->textStart, module->textEnd + 4 - module->textStart) &&
+				!MIPSAnalyst::HasFunctionsInRange(module->textStart, module->textEnd + 4)) {
+				MIPSAnalyst::ScanForFunctions(module->textStart, module->textEnd, true);
+			}
+		}
 		// The functions were found in memory from before the load, where other code may have been
 		// (an overlay module, say.) Hash them from what's there now, so a hook only goes where it matches.
 		MIPSAnalyst::RehashFunctions();
@@ -2547,7 +2560,7 @@ int sceKernelLoadExec(const char *filename, u32 paramPtr) {
 	DEBUG_LOG(Log::sceModule, "sceKernelLoadExec(name=%s,...): loading %s", filename, exec_filename.c_str());
 	std::string error_string;
 	if (!__KernelLoadExec(currentMIPS, exec_filename.c_str(), paramPtr, &error_string)) {
-		Core_UpdateState(CORE_RUNTIME_ERROR);
+		Core_HLEError("sceKernelLoadExec failed: " + error_string);
 		return hleLogError(Log::sceModule, -1, "failed: %s", error_string.c_str());;
 	}
 	if (gpu) {
@@ -2720,6 +2733,15 @@ u32 sceKernelLoadModule(const char *name, u32 flags, u32 optionAddr) {
 		const SceUID threadID = __KernelGetCurThread();
 		PendingModuleLoad &load = g_pendingModuleLoads[threadID];
 		load.name = name;
+		// The event loads outside of any thread, so a relative path (Crash Tag Team Racing loads
+		// "prx/sc_sascore.prx") has to be resolved against the caller's current directory now.
+		// modulemgr.prx's sceKernelLoadModule also opens the file in the caller's thread.
+		if (load.name.find(':') == std::string::npos) {
+			const std::string cwd = pspFileSystem.GetCurrentDirForThread(threadID);
+			if (!cwd.empty()) {
+				load.name = cwd + "/" + load.name;
+			}
+		}
 		load.flags = flags;
 		load.hasOption = lmoption != nullptr;
 		if (lmoption) {

@@ -182,6 +182,8 @@ public:
 	// Debugger
 	bool bAutoRun;  // start immediately
 	bool bBreakOnFrameTimeout;  // not saved
+	// Sample the JIT and write a report of the hottest blocks to this file. Not saved.
+	std::string sJitProfileFile;
 
 	// General
 	bool bScreenshotsAsPNG;
@@ -381,7 +383,6 @@ public:
 	bool bReportAccurateFreeStorageSpace;
 	int iBloomHack; //0 = off, 1 = safe, 2 = balanced, 3 = aggressive
 	int iSkipGPUReadbackMode;  // 0 = off, 1 = skip, 2 = to texture
-	int iSplineBezierQuality; // 0 = low , 1 = Intermediate , 2 = High
 	bool bShaderCache;  // Hidden ini-only setting, useful for debugging shader compile times.
 	bool bMetalFXSpatial;
 	bool bUberShaderVertex;

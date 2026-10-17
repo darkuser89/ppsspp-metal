@@ -636,7 +636,7 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 	// Update things that depend on game-specific config here.
 
 	// Compat settings can override the software renderer, take care of that here.
-	if (g_Config.bSoftwareRendering || g_CoreParameter.compat.flags().ForceSoftwareRenderer) {
+	if ((g_Config.bSoftwareRendering || g_CoreParameter.compat.flags().ForceSoftwareRenderer) && g_CoreParameter.gpuCore != GPUCORE_NULL) {
 		g_CoreParameter.gpuCore = GPUCORE_SOFTWARE;
 	}
 
@@ -651,6 +651,11 @@ void CPU_Shutdown(bool success) {
 	// memory map - and this is the lock they take to be sure none of it goes away mid-read. See
 	// Core_LockAgainstShutdown(); it's recursive, so the nested acquire in Memory::Shutdown() is fine.
 	CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+
+	// The GPU outlives memory (GPU_Shutdown comes later), so it must stop writing to it now.
+	if (gpu) {
+		gpu->FlushPendingDrawing();
+	}
 
 	UninstallExceptionHandler();
 

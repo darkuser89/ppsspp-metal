@@ -18,6 +18,8 @@
 #pragma once
 
 bool TestJit();
+bool TestJitDotBench();
 bool TestJitReplacementHooks();
 bool TestCPUEquivalence();
 bool TestCPURoundingMode();
+bool TestVFPUDotJit();

@@ -53,11 +53,6 @@ alignas(16) static const uint32_t lowBytesMask[4] = {
 };
 
 u32 IRRunBreakpoint(u32 pc) {
-	// Should we skip this breakpoint?
-	uint32_t skipFirst = g_breakpoints.CheckSkipFirst();
-	if (skipFirst == pc || skipFirst == currentMIPS->pc)
-		return 0;
-
 	// Did we already hit one?
 	if (coreState != CORE_RUNNING_CPU && coreState != CORE_NEXTFRAME)
 		return 1;
@@ -67,11 +62,6 @@ u32 IRRunBreakpoint(u32 pc) {
 }
 
 u32 IRRunMemCheck(u32 pc, u32 addr) {
-	// Should we skip this breakpoint?
-	uint32_t skipFirst = g_breakpoints.CheckSkipFirst();
-	if (skipFirst == pc || skipFirst == currentMIPS->pc)
-		return 0;
-
 	// Did we already hit one?
 	if (coreState != CORE_RUNNING_CPU && coreState != CORE_NEXTFRAME)
 		return 1;
@@ -83,6 +73,9 @@ u32 IRRunMemCheck(u32 pc, u32 addr) {
 // With GCC and Clang, each op jumps straight to the next op's handler through a table ("threaded"
 // dispatch), which predicts much better than the one shared indirect jump of a switch. Other
 // compilers get the switch. Ops missing from the table fall back to the switch, so they still work.
+// Clang keeps one jump per op only while the shared tail stays small, and a direct goto to a handler
+// label also makes it give up, leaving a single indirect jump (10-15% slower). Count the `br`s in
+// the disassembly after changing the dispatch.
 #if defined(__GNUC__) || defined(__clang__)
 #define IR_THREADED_DISPATCH 1
 #define IR_CASE(op) case IROp::op: L_##op:
@@ -98,11 +91,28 @@ u32 IRRunMemCheck(u32 pc, u32 addr) {
 
 #if IR_THREADED_DISPATCH
 #define IR_NEXT do { IR_CHECK_ZERO_REG(); inst++; goto *dispatch[(int)inst->op]; } while (false)
+#define IR_DISPATCH goto *dispatch[(int)inst->op]
 #else
 #define IR_NEXT { IR_CHECK_ZERO_REG(); inst++; continue; }
+#define IR_DISPATCH goto L_switch
 #endif
 
-u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
+// Leaves the block for pcExpr. While downcount lasts, runs the block there right away if it's
+// compiled, the way IRJit::RunBlocks would after we returned (minus the call and the lookup there).
+#define IR_EXIT(pcExpr) do { \
+	const u32 exitPC = (pcExpr); \
+	if (!chainArena || mips->downcount < 0 || !Memory::IsValid4AlignedAddress(exitPC)) \
+		return exitPC; \
+	const u32 offset = *Memory::GetBlockShadowEntry(exitPC); \
+	if (offset <= Memory::BLOCK_SHADOW_HOOK_NO_JIT) \
+		return exitPC; \
+	mips->pc = exitPC; \
+	inst = chainArena + offset; \
+	IR_CHECK_ZERO_REG(); \
+	IR_DISPATCH; \
+} while (false)
+
+u32 IRInterpret(MIPSState *mips, const IRInst *inst, const IRInst *chainArena) {
 #if IR_THREADED_DISPATCH
 	static const void *dispatch[256];
 	static bool dispatchReady = false;
@@ -171,7 +181,13 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 		dispatch[(int)IROp::FCmpVfpuAggregate] = &&L_FCmpVfpuAggregate;
 		dispatch[(int)IROp::FCmovVfpuCC] = &&L_FCmovVfpuCC;
 		dispatch[(int)IROp::Vec4Dot] = &&L_Vec4Dot;
+		dispatch[(int)IROp::Vec4Min] = &&L_Vec4Min;
+		dispatch[(int)IROp::Vec4Max] = &&L_Vec4Max;
+		dispatch[(int)IROp::Vec4Slt] = &&L_Vec4Slt;
+		dispatch[(int)IROp::Vec4Sge] = &&L_Vec4Sge;
+		dispatch[(int)IROp::Vec4CvtScaledSW] = &&L_Vec4CvtScaledSW;
 		dispatch[(int)IROp::Vec4VfpuDot] = &&L_Vec4VfpuDot;
+		dispatch[(int)IROp::Vec4VfpuMultiDot] = &&L_Vec4VfpuMultiDot;
 		dispatch[(int)IROp::FSin] = &&L_FSin;
 		dispatch[(int)IROp::FCos] = &&L_FCos;
 		dispatch[(int)IROp::FRSqrt] = &&L_FRSqrt;
@@ -287,9 +303,7 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 #endif
 
 	while (true) {
-#if IR_THREADED_DISPATCH
 	L_switch:
-#endif
 		switch (inst->op) {
 		IR_CASE(SetConst)
 			mips->r[inst->dest] = inst->constant;
@@ -582,6 +596,56 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			IR_NEXT;
 		}
 
+		IR_CASE(Vec4Min)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++) {
+				const u32 a = mips->fi[inst->src1 + i], b = mips->fi[inst->src2 + i];
+				result[i] = vfpu_minmax_key(a) < vfpu_minmax_key(b) ? mips->f[inst->src1 + i] : mips->f[inst->src2 + i];
+			}
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Max)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++) {
+				const u32 a = mips->fi[inst->src1 + i], b = mips->fi[inst->src2 + i];
+				result[i] = vfpu_minmax_key(a) > vfpu_minmax_key(b) ? mips->f[inst->src1 + i] : mips->f[inst->src2 + i];
+			}
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Slt)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++)
+				result[i] = mips->f[inst->src1 + i] < mips->f[inst->src2 + i] ? 1.0f : 0.0f;
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Sge)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++)
+				result[i] = mips->f[inst->src1 + i] >= mips->f[inst->src2 + i] ? 1.0f : 0.0f;
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4CvtScaledSW)
+		{
+			float result[4];
+			const float scale = 1.0f / (1UL << (inst->src2 & 0x1F));
+			for (int i = 0; i < 4; i++)
+				result[i] = (float)mips->fs[inst->src1 + i] * scale;
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
 		IR_CASE(Vec4Abs)
 		{
 #if PPSSPP_ARCH(SSE2)
@@ -801,6 +865,10 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 
 		IR_CASE(Vec4VfpuDot)
 			mips->f[inst->dest] = vfpu_dot(&mips->f[inst->src1], &mips->f[inst->src2]);
+			IR_NEXT;
+
+		IR_CASE(Vec4VfpuMultiDot)
+			vfpu_multi_dot(&mips->f[inst->dest], &mips->f[inst->src1], &mips->f[inst->src2], IRMULTIDOT_TERMS(inst->constant), (inst->constant & IRMULTIDOT_TRANSPOSED) != 0);
 			IR_NEXT;
 
 		IR_CASE(FSin)
@@ -1232,47 +1300,47 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 		}
 
 		IR_CASE(ExitToConst)
-			return inst->constant;
+			IR_EXIT(inst->constant);
 
 		IR_CASE(ExitToReg)
-			return mips->r[inst->src1];
+			IR_EXIT(mips->r[inst->src1]);
 
 		// The next instruction is the ExitToConst to take otherwise, never run itself.
 		IR_CASE(OptExitToConstIfEqElse)
-			return mips->r[inst->src1] == mips->r[inst->src2] ? inst->constant : inst[1].constant;
+			IR_EXIT(mips->r[inst->src1] == mips->r[inst->src2] ? inst->constant : inst[1].constant);
 		IR_CASE(OptExitToConstIfNeqElse)
-			return mips->r[inst->src1] != mips->r[inst->src2] ? inst->constant : inst[1].constant;
+			IR_EXIT(mips->r[inst->src1] != mips->r[inst->src2] ? inst->constant : inst[1].constant);
 		IR_CASE(OptExitToConstIfGtZElse)
-			return (s32)mips->r[inst->src1] > 0 ? inst->constant : inst[1].constant;
+			IR_EXIT((s32)mips->r[inst->src1] > 0 ? inst->constant : inst[1].constant);
 		IR_CASE(OptExitToConstIfGeZElse)
-			return (s32)mips->r[inst->src1] >= 0 ? inst->constant : inst[1].constant;
+			IR_EXIT((s32)mips->r[inst->src1] >= 0 ? inst->constant : inst[1].constant);
 		IR_CASE(OptExitToConstIfLtZElse)
-			return (s32)mips->r[inst->src1] < 0 ? inst->constant : inst[1].constant;
+			IR_EXIT((s32)mips->r[inst->src1] < 0 ? inst->constant : inst[1].constant);
 		IR_CASE(OptExitToConstIfLeZElse)
-			return (s32)mips->r[inst->src1] <= 0 ? inst->constant : inst[1].constant;
+			IR_EXIT((s32)mips->r[inst->src1] <= 0 ? inst->constant : inst[1].constant);
 		IR_CASE(ExitToConstIfEq)
 			if (mips->r[inst->src1] == mips->r[inst->src2])
-				return inst->constant;
+				IR_EXIT(inst->constant);
 			IR_NEXT;
 		IR_CASE(ExitToConstIfNeq)
 			if (mips->r[inst->src1] != mips->r[inst->src2])
-				return inst->constant;
+				IR_EXIT(inst->constant);
 			IR_NEXT;
 		IR_CASE(ExitToConstIfGtZ)
 			if ((s32)mips->r[inst->src1] > 0)
-				return inst->constant;
+				IR_EXIT(inst->constant);
 			IR_NEXT;
 		IR_CASE(ExitToConstIfGeZ)
 			if ((s32)mips->r[inst->src1] >= 0)
-				return inst->constant;
+				IR_EXIT(inst->constant);
 			IR_NEXT;
 		IR_CASE(ExitToConstIfLtZ)
 			if ((s32)mips->r[inst->src1] < 0)
-				return inst->constant;
+				IR_EXIT(inst->constant);
 			IR_NEXT;
 		IR_CASE(ExitToConstIfLeZ)
 			if ((s32)mips->r[inst->src1] <= 0)
-				return inst->constant;
+				IR_EXIT(inst->constant);
 			IR_NEXT;
 
 		IR_CASE(Downcount)
@@ -1317,7 +1385,7 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 		}
 
 		IR_CASE(ExitToPC)
-			return mips->pc;
+			IR_EXIT(mips->pc);
 
 		IR_CASE(Interpret)  // SLOW fallback. Can be made faster. Ideally should be removed but may be useful for debugging.
 		{
@@ -1424,5 +1492,7 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 }
 
 #undef IR_NEXT
+#undef IR_DISPATCH
+#undef IR_EXIT
 #undef IR_CASE
 #undef IR_CHECK_ZERO_REG

@@ -471,7 +471,7 @@ static bool CanUseSaveStates(bool isSaveAction) {
         if (!g_Config.IsBackendEnabled(backend)) {
             continue;
         }
-        NSString *backendName = backend == GPUBackend::METAL ? @"Metal 3" : @(GPUBackendToString(backend).c_str());
+        NSString *backendName = backend == GPUBackend::METAL ? @"Metal 4" : @(GPUBackendToString(backend).c_str());
         [self addItem:backendName to:backends action:^{
             if (g_Config.iGPUBackend != (int)backend) {
                 g_Config.iGPUBackend = (int)backend;

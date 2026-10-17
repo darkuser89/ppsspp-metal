@@ -1,6 +1,6 @@
 #ifdef PPSSPP_HAS_METAL
-#include "Common/GPU/metal3/MetalBackend.h"
-#include "GPU/metal3/PostShaderMetal.h"
+#include "Common/GPU/metal4/MetalBackend.h"
+#include "GPU/metal4/PostShaderMetal.h"
 #endif
 
 // Copyright (c) 2013- PPSSPP Project.
@@ -287,7 +287,7 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 #if !PPSSPP_PLATFORM(UWP)
 	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan",
 #ifdef PPSSPP_HAS_METAL
-		"Metal 3",
+		"Metal 4",
 #endif
 	};
 	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), I18NCat::GRAPHICS, screenManager()));
@@ -515,11 +515,6 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 	if (g_Config.iDepthRasterMode != 3)
 		depthRasterMode->HideChoice(3);
 
-	static const char *quality[] = { "Low", "Medium", "High" };
-	PopupMultiChoice *bezierQuality = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iSplineBezierQuality, gr->T("LowCurves", "Spline/Bezier curves quality"), quality, 0, ARRAY_SIZE(quality), I18NCat::GRAPHICS, screenManager()));
-	bezierQuality->SetDefault(2);
-	graphicsSettings->Add(new SettingHint(gr->T("LowCurves Tip", "Only used by some games, controls smoothness of curves"), bezierQuality));
-
 	static const char *bloomHackOptions[] = {"Off", "Safe", "Balanced", "Aggressive"};
 	PopupMultiChoice *bloomHack = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iBloomHack, gr->T("Lower resolution for effects"), bloomHackOptions, 0, ARRAY_SIZE(bloomHackOptions), I18NCat::GRAPHICS, screenManager()));
 	bloomHack->SetEnabledFunc([] {
@@ -539,11 +534,6 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 		PopupMultiChoice *inflightChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iInflightFrames, gr->T("Buffer graphics commands"), bufferOptions, 1, ARRAY_SIZE(bufferOptions), I18NCat::GRAPHICS, screenManager()));
 		inflightChoice->OnChoice.Handle(this, &GameSettingsScreen::OnInflightFramesChoice);
 		graphicsSettings->Add(new SettingHint(gr->T("Faster, input lag"), inflightChoice));  // TODO: This hint could use improvement.
-	}
-
-	if (deviceType != DEVICE_TYPE_VR) {
-		CheckBox *hwTransform = graphicsSettings->Add(new CheckBox(&g_Config.bHardwareTransform, gr->T("Hardware Transform")));
-		hwTransform->SetDisabledPtr(&g_Config.bSoftwareRendering);
 	}
 
 	graphicsSettings->Add(new ItemHeader(gr->T("Texture upscaling")));
@@ -1010,7 +1000,15 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 		System_LaunchUrl(LaunchUrlType::BROWSER_URL, url);
 	});
 
-	networkingSettings->Add(new CheckBox(&g_Config.bEnableWlan, n->T("Enable networking", "Enable networking/wlan (beta)")));
+	// Ad hoc play, the built-in server and UPnP all talk to the local network.
+	auto requestLocalNetwork = [](UI::EventParams &e) {
+		CheckBox *checkBox = static_cast<CheckBox *>(e.v);
+		if (checkBox->Toggled()) {
+			System_RequestLocalNetworkPermission();
+		}
+	};
+
+	networkingSettings->Add(new CheckBox(&g_Config.bEnableWlan, n->T("Enable networking", "Enable networking/wlan (beta)")))->OnClick.Add(requestLocalNetwork);
 	networkingSettings->Add(new MacAddressChooser(GetRequesterToken(), gamePath_, &g_Config.sMACAddress, n->T("MAC address"), screenManager()));
 
 	networkingSettings->Add(new ItemHeader(n->T("Ad Hoc multiplayer")));
@@ -1058,7 +1056,7 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 	});
 	networkingSettings->Add(new SettingHint(n->T("Try to pick a unique nickname for ad hoc play"), nullptr));
 
-	networkingSettings->Add(new CheckBox(&g_Config.bEnableAdhocServer, n->T("Enable built-in ad hoc server")));
+	networkingSettings->Add(new CheckBox(&g_Config.bEnableAdhocServer, n->T("Enable built-in ad hoc server")))->OnClick.Add(requestLocalNetwork);
 
 	networkingSettings->Add(new ItemHeader(n->T("Infrastructure")));
 	if (g_Config.sInfrastructureUsername.empty()) {
@@ -1079,7 +1077,8 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 	// and a game that's already mapped its ports wouldn't cope with them disappearing.
 	CheckBox *enableUPnP = networkingSettings->Add(new CheckBox(&g_Config.bEnableUPnP, n->T("Enable UPnP", "Enable UPnP (need a few seconds to detect)")));
 	enableUPnP->SetEnabled(!PSP_IsInited());
-	enableUPnP->OnClick.Add([](UI::EventParams &e) {
+	enableUPnP->OnClick.Add([requestLocalNetwork](UI::EventParams &e) {
+		requestLocalNetwork(e);
 		// Wake the UPnP service thread so it connects (or tears its mappings back down) right
 		// away, instead of waiting for a port request that may never come.
 		UPnP_Notify();

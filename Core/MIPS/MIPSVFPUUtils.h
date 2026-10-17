@@ -74,6 +74,11 @@ inline float vfpu_clamp(float v, float min, float max) {
 float vfpu_dot(const float a[4], const float b[4]);
 // The portable version vfpu_dot is checked against.
 float vfpu_dot_reference(const float a[4], const float b[4]);
+// vfpu_dot on hosts with no SIMD version.
+float vfpu_dot_scalar(const float a[4], const float b[4]);
+// Four vfpu_dot()s against v, over the first terms lanes: out[k] uses block[4 * i + k] for lane i,
+// or block[4 * k + i] if transposed (see IROp::Vec4VfpuMultiDot).
+void vfpu_multi_dot(float out[4], const float block[16], const float v[4], int terms, bool transposed);
 float vfpu_sqrt(float a);
 float vfpu_rsqrt(float a);
 
@@ -313,6 +318,19 @@ float Float16ToFloat32(unsigned short l);
 u32 vfpu_h2f(u16 h);
 // The same, as a float (vfim).
 float vfpu_h2f_float(u16 h);
+
+// How the debuggers show a VFPU register. The multi-part modes list the lowest part first.
+enum class VFPUDisplayMode {
+	Float,
+	HalfFloat,
+	Hex,
+	Bytes,
+	Shorts,
+	Ints,
+	COUNT,
+};
+extern const char *const g_vfpuDisplayModeNames[(int)VFPUDisplayMode::COUNT];
+void FormatVFPUValue(char *out, size_t outSize, u32 value, VFPUDisplayMode mode);
 // vh2f of the lower or upper half of a word, with the word and result as float bits. For the JITs.
 float vfpu_h2f_lower(float word);
 float vfpu_h2f_upper(float word);

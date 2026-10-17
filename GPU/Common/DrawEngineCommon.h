@@ -33,6 +33,7 @@
 
 class VertexDecoder;
 struct DepthDraw;
+class DepthRasterWorker;
 
 enum {
 	VERTEX_BUFFER_MAX = 65536,
@@ -102,8 +103,7 @@ public:
 	bool TestBoundingBox(const void *control_points, const void *inds, int vertexCount, const VertexDecoder *dec, u32 vertType);
 
 	// This is a less accurate version of TestBoundingBox, but faster. Can have more false positives.
-	// Doesn't support indexing.
-	bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags);
+	static bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags);
 	bool TestBoundingBoxThrough(GEPrimitiveType prim, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, int *bytesRead, ClipInfoFlags *flags);
 	// For a draw too big or complex for TestBoundingBoxFast: the fallbacks it would need on a GPU that lacks
 	// depth clamp or clip distances, assuming the worst, or nothing (not Valid) if none are needed.
@@ -160,7 +160,14 @@ public:
 		return decoded_ + 12 * 65536;
 	}
 
+	// Rasterizes the queued depth draws, and waits for them.
 	void FlushQueuedDepth();
+	// Starts rasterizing the queued depth draws, without waiting.
+	void SubmitQueuedDepth();
+	// Waits for the depth draws already submitted, leaving the queued ones queued.
+	void WaitForSubmittedDepth();
+	// Waits if depth rasterization in progress may write to these bytes.
+	void WaitForDepthWrites(u32 addr, u32 size);
 
 protected:
 	bool CheckClipFlags(bool useHwTransform) const;
@@ -182,6 +189,7 @@ protected:
 	void DepthRasterSubmitRaw(GEPrimitiveType prim, const VertexDecoder *dec, uint32_t vertTypeID, int vertexCount);
 	void DepthRasterPredecoded(GEPrimitiveType prim, const void *inVerts, int numDecoded, const VertexDecoder *dec, int vertexCount);
 	bool CalculateDepthDraw(DepthDraw *draw, GEPrimitiveType prim, int vertexCount, int numDecoded);
+	void CommitDepthDraw(const DepthDraw &draw, int vertexCount, int numDecoded);
 
 	static inline int IndexSize(u32 vtype) {
 		const u32 indexType = (vtype & GE_VTYPE_IDX_MASK);
@@ -369,18 +377,11 @@ protected:
 	// Software depth raster
 	bool useDepthRaster_ = false;
 
-	float *depthTransformed_ = nullptr;
-	int *depthScreenVerts_ = nullptr;
-	uint16_t *depthIndices_ = nullptr;
+	DepthRasterWorker *depthWorker_ = nullptr;
 
 	// Depth tracking
 	ClipInfoFlags clipInfoFlags_{};
 	ClipInfoFlags lastClipInfoFlags_{};  // Flags at the last flush. For dirtying.
-
-	// Queue
-	int depthVertexCount_ = 0;
-	int depthIndexCount_ = 0;
-	std::vector<DepthDraw> depthDraws_;
 
 	double rasterTimeStart_ = 0.0;
 

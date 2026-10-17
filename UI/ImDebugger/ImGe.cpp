@@ -1,5 +1,5 @@
 #ifdef PPSSPP_HAS_METAL
-#include "GPU/metal3/TextureCachePolicyMetal.h"
+#include "GPU/metal4/TextureCachePolicyMetal.h"
 #endif
 #include "ext/imgui/imgui.h"
 #include "ext/imgui/imgui_internal.h"

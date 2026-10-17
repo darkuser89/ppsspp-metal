@@ -694,6 +694,7 @@
     <ClCompile Include="MIPS\ARM\ArmIRJit.cpp" />
     <ClCompile Include="MIPS\ARM\ArmIRRegCache.cpp" />
     <ClCompile Include="MIPS\JitCommon\JitCommon.cpp" />
+    <ClCompile Include="MIPS\JitCommon\JitProfiler.cpp" />
     <ClCompile Include="MIPS\JitCommon\JitState.cpp" />
     <ClCompile Include="MIPS\MIPS.cpp" />
     <ClCompile Include="MIPS\MIPSAnalyst.cpp" />
@@ -879,8 +880,10 @@
     <ClInclude Include="MIPS\IR\IRRegCache.h" />
     <ClInclude Include="MIPS\LoongArch64\LoongArch64Jit.h" />
     <ClInclude Include="MIPS\LoongArch64\LoongArch64RegCache.h" />
+    <ClInclude Include="MIPS\LoongArch64\LoongArch64VfpuDot.h" />
     <ClInclude Include="MIPS\RiscV\RiscVJit.h" />
     <ClInclude Include="MIPS\RiscV\RiscVRegCache.h" />
+    <ClInclude Include="MIPS\RiscV\RiscVVfpuDot.h" />
     <ClInclude Include="MIPS\x86\X64IRJit.h" />
     <ClInclude Include="Replay.h" />
     <ClInclude Include="Compatibility.h" />
@@ -1019,6 +1022,7 @@
     <ClInclude Include="MIPS\ARM\ArmVfpuDot.h" />
     <ClInclude Include="MIPS\JitCommon\JitBlockCache.h" />
     <ClInclude Include="MIPS\JitCommon\JitCommon.h" />
+    <ClInclude Include="MIPS\JitCommon\JitProfiler.h" />
     <ClInclude Include="MIPS\JitCommon\JitState.h" />
     <ClInclude Include="MIPS\MIPS.h" />
     <ClInclude Include="MIPS\MIPSAnalyst.h" />

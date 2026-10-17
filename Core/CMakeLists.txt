@@ -82,6 +82,7 @@ list(APPEND CoreExtra
 	MIPS/RiscV/RiscVJit.h
 	MIPS/RiscV/RiscVRegCache.cpp
 	MIPS/RiscV/RiscVRegCache.h
+	MIPS/RiscV/RiscVVfpuDot.h
 )
 
 list(APPEND CoreExtra
@@ -96,6 +97,7 @@ list(APPEND CoreExtra
 	MIPS/LoongArch64/LoongArch64Jit.h
 	MIPS/LoongArch64/LoongArch64RegCache.cpp
 	MIPS/LoongArch64/LoongArch64RegCache.h
+	MIPS/LoongArch64/LoongArch64VfpuDot.h
 )
 
 if(NOT MOBILE_DEVICE)
@@ -630,6 +632,8 @@ add_library(Core STATIC
 	MIPS/MIPSTracer.h
 	MIPS/JitCommon/JitCommon.cpp
 	MIPS/JitCommon/JitCommon.h
+	MIPS/JitCommon/JitProfiler.cpp
+	MIPS/JitCommon/JitProfiler.h
 	MIPS/JitCommon/JitBlockCache.h
 	MIPS/JitCommon/JitState.cpp
 	MIPS/JitCommon/JitState.h

@@ -640,6 +640,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/GPU/Software/RasterizerRectangle.cpp.arm \
   $(SRC)/GPU/Software/Sampler.cpp \
   $(SRC)/GPU/Software/SoftGpu.cpp \
+  $(SRC)/GPU/Null/GPU_Null.cpp \
   $(SRC)/GPU/Software/TransformUnit.cpp \
   $(SRC)/Core/ELF/ElfReader.cpp \
   $(SRC)/Core/ELF/PBPReader.cpp \
@@ -844,6 +845,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/FileSystems/VirtualDiscFileSystem.cpp \
   $(SRC)/Core/FileSystems/tlzrc.cpp \
   $(SRC)/Core/MIPS/JitCommon/JitCommon.cpp \
+  $(SRC)/Core/MIPS/JitCommon/JitProfiler.cpp \
   $(SRC)/Core/MIPS/JitCommon/JitState.cpp \
   $(SRC)/Core/Util/AtracTrack.cpp \
   $(SRC)/Core/Util/AudioFormat.cpp \
@@ -1100,11 +1102,14 @@ ifeq ($(UNITTEST),1)
     $(SRC)/unittest/TestIRPassSimplify.cpp \
     $(SRC)/unittest/TestShaderGenerators.cpp \
     $(SRC)/unittest/TestThreadManager.cpp \
+    $(SRC)/unittest/TestBoundingBox.cpp \
+    $(SRC)/unittest/TestDepthRaster.cpp \
     $(SRC)/unittest/TestVertexJit.cpp \
     $(SRC)/unittest/TestTextureReplacer.cpp \
     $(SRC)/unittest/TestVFS.cpp \
     $(SRC)/unittest/TestDemangle.cpp \
     $(SRC)/unittest/TestLzrc.cpp \
+    $(SRC)/unittest/TestCwCheat.cpp \
     $(SRC)/unittest/TestMpegCsc.cpp \
     $(SRC)/unittest/TestSplineTessellation.cpp \
     $(SRC)/unittest/TestGEMath.cpp \

@@ -1,0 +1,324 @@
+// Copyright (c) 2012- PPSSPP Project.
+// This program is free software, licensed under GPL-2.0-or-later.
+
+#pragma once
+#include <unordered_set>
+#include "GPU/Common/TextureCacheCommon.h"
+#include "GPU/metal4/TextureReplacerMetal.h"
+class FramebufferManagerMetal;
+enum class MetalTexStatus : u16 {
+	VIDEO = (1 << 0),
+	PSP_SIZE_CLIPPED = (1 << 1),  // Source is limited to the PSP's 512x512 texture area.
+	ALPHA_SOLID = (1 << 2),      // Has no alpha channel, or always solid (==1.0) alpha.
+
+	MANY_CLUT_VARIANTS = (1 << 3),   // Has multiple CLUT variants.
+	RELIABLE = (1 << 4),    // Hash will never change. This only really applies to the font texture.
+	// Free bit: 5,
+	HASH_RECHECK = (1 << 6),   // Hash failed, but addr is the same, so we want to check again next time.
+	TO_SCALE = (1 << 7),        // Pending texture scaling in a later frame.
+	IS_SCALED_OR_REPLACED = (1 << 8),  // Has been scaled already (ignored for replacement checks).
+	TO_REPLACE = (1 << 9),    // Pending texture replacement.
+	IS_3D = (1 << 10),
+	NO_MIPS = (1 << 11),      // Has bad or unusable mipmap levels.
+	FRAMEBUFFER_OVERLAP = (1 << 12),
+	IS_PPGE_ATLAS = (1 << 13),
+	CLUT8_INDEXED = (1 << 14),  // Decoded as plain CLUT8 indices instead of all the way to colors.
+	CLUT_GPU = (1 << 15),
+};
+ENUM_CLASS_BITOPS(MetalTexStatus);
+
+// TODO: Shrink this struct. There is some fluff.
+struct MetalTexCacheEntry {
+	MetalTexCacheEntry() = default;
+	MetalTexCacheEntry(const MetalTexCacheEntry &) = delete;
+	MetalTexCacheEntry &operator=(const MetalTexCacheEntry &) = delete;
+	~MetalTexCacheEntry() {
+#ifdef _DEBUG
+		if (texturePtr || textureName || vkTex)
+			Crash();
+#endif
+	}
+	// After marking STATUS_UNRELIABLE, if it stays the same this many frames we'll trust it again.
+	const static int FRAMES_REGAIN_TRUST = 1000;
+
+	// MetalTexStatus enum flag combination.
+	MetalTexStatus status;
+	GETextureFormat format;
+	u8 maxLevel;
+	u32 addr;
+	u16 dim;
+	u16 bufw;
+	u16 maxSeenV;
+	u32 fullhash;
+	u32 cluthash;
+	union {
+		GLRTexture *textureName;
+		void *texturePtr;
+		VulkanTexture *vkTex;
+	};
+	MetalReplacedTexture *replacedTexture;
+#ifdef _WIN32
+	void *textureView;  // Used by D3D11 only for the shader resource view. We could also just point to a struct of the two, similar to VulkanTexture.
+#endif
+	int lastFrame;
+	int lastSyncDomain;
+
+	TextureAlpha GetAlphaStatus() const {
+		return (status & MetalTexStatus::ALPHA_SOLID) ? TextureAlpha::Solid : TextureAlpha::Any;
+	}
+	void SetAlphaStatus(TextureAlpha newStatus) {
+		if (newStatus == TextureAlpha::Solid) {
+			status |= MetalTexStatus::ALPHA_SOLID;
+		} else {
+			status &= ~MetalTexStatus::ALPHA_SOLID;
+		}
+	}
+	void SetAlphaStatus(TextureAlpha newStatus, int level) {
+		// For non-level zero, only set more restrictive.
+		if (newStatus == TextureAlpha::Any || level == 0) {
+			SetAlphaStatus(newStatus);
+		}
+	}
+
+	// This is the full size in RAM, not the half size we use sometimes as a "safe" underestimate.
+	// And also not the exact hashed size, see ComputeTextureHash.
+	u32 SizeInRAM() const {
+		const int height = (status & MetalTexStatus::PSP_SIZE_CLIPPED) ? std::min(dimHeight(dim), 512) : dimHeight(dim);
+		return (textureBitsPerPixel[format] * bufw * height) / 8;
+	}
+
+	bool MatchesProperties(u16 dim2, u8 format2, u8 maxLevel2) const;
+	u64 CacheKey() const;
+	static u64 CacheKey(u32 addr, u8 format, u16 dim, u32 cluthash);
+	u32 EstimateTexMemoryUsage() const;
+};
+
+// TODO: Work on shrinking it further.
+static_assert(sizeof(MetalTexCacheEntry) <= 72, "MetalTexCacheEntry is too big");
+
+std::string MetalTexStatusToString(MetalTexStatus status);
+inline std::string TexStatusToString(MetalTexStatus status) { return MetalTexStatusToString(status); }
+
+// Can't be unordered_map, we use lower_bound ... although for some reason that (used to?) compiles on MSVC.
+// Would really like to replace this with DenseHashMap but can't as long as we need lower_bound.
+// Additionally, MetalTexCacheEntry is not that big, maybe it's beneficial to remove the unique_ptr indirection.
+typedef std::map<u64, std::unique_ptr<MetalTexCacheEntry>> MetalTexCache;
+
+struct MetalBuildTexturePlan {
+	// Inputs
+	bool hardwareScaling = false;
+	bool slowScaler = true;
+
+	// Set if the PSP software specified an unusual mip chain,
+	// such as the same size throughout, or anything else that doesn't divide by
+	// two on each level. If this is set, we won't generate mips nor use any.
+	// However, we still respect baseLevelSrc.
+	bool badMipSizes;
+
+	// Number of mip levels to load from PSP memory (or replacement).
+	int levelsToLoad;
+
+	// The number of levels in total to create.
+	// If greater than maxLevelToLoad, the backend is expected to either generate
+	// the missing levels, or limit itself to levelsToLoad levels.
+	int levelsToCreate;
+
+	// The maximum number of mips levels we can create for this texture.
+	int maxPossibleLevels;
+
+	// Load the 0-mip from this PSP texture level instead of 0.
+	// If non-zero, we are only loading one level.
+	int baseLevelSrc;
+
+	// The scale factor of the final texture.
+	int scaleFactor;
+
+	// Whether it's a video texture or not. Some decisions might depend on this.
+	bool isVideo;
+
+	// Unscaled size of the 0-mip of the original texture.
+	// Don't really need to have it here, but convenient.
+	int w;
+	int h;
+
+	// Scaled (or replaced) size of the 0-mip of the final texture.
+	int createW;
+	int createH;
+
+	// Used for 3D textures only. If not a 3D texture, will be 1.
+	int depth;
+
+	// The replacement for the texture.
+	MetalReplacedTexture *replaced;
+	// Need to only check once since it can change during the load!
+	bool doReplace;
+	bool saveTexture;
+	// Dump the indices and palette of a CLUT4/CLUT8 texture as a palette PNG (instead of saveTexture).
+	bool saveIndexed;
+
+	// TODO: Expand32 should probably also be decided in PrepareBuildTexture.
+	bool decodeToClut8;
+
+	void GetMipSize(int level, int *w, int *h) const {
+		if (doReplace) {
+			replaced->GetSize(level, w, h);
+			return;
+		}
+		if (depth == 1) {
+			*w = createW >> level;
+			*h = createH >> level;
+		} else {
+			// 3D texture, we look for layers instead of levels.
+			*w = createW;
+			*h = createH;
+		}
+	}
+};
+
+struct MetalTextureApplyResult {
+	// At most one of these will be set.
+	MetalTexCacheEntry *texCacheEntry = nullptr;
+	VirtualFramebuffer *framebuffer = nullptr;
+	RasterChannel framebufferTextureChannel = RASTER_COLOR;
+	bool otherTexture = false;
+};
+
+class MetalTextureCacheCommon : public ::TextureCacheCommon {
+public:
+	MetalTextureCacheCommon(const MetalTextureCacheCommon &) = delete;
+	MetalTextureCacheCommon &operator=(const MetalTextureCacheCommon &) = delete;
+	MetalTextureCacheCommon(Draw::DrawContext *draw, Draw2D *draw2D);
+	virtual ~MetalTextureCacheCommon();
+
+	void LoadClut(u32 clutAddr, u32 loadBytes, GPURecord::Recorder *recorder);
+	bool GetCurrentClutBuffer(GPUDebugBuffer &buffer);
+
+	void SetShaderManager(ShaderManagerCommon *sm) {
+		shaderManager_ = sm;
+	}
+
+	MetalTextureApplyResult ApplyTexture(bool doBind);
+	void ApplySampler(const MetalTextureApplyResult &result, bool flatZ, bool pixelMapped);  // Should follow ApplyTexture
+
+	void Invalidate(u32 addr, int size, GPUInvalidationType type);
+	void InvalidateAll(GPUInvalidationType type);
+	void ClearNextFrame();
+
+	const TextureShaderCache &GetTextureShaderCache() const { return textureShaderCache_; }
+
+	virtual void ForgetLastTexture() override = 0;
+	virtual void Clear(bool delete_them) override;
+	virtual void NotifyConfigChanged() override;
+
+	// FramebufferManager keeps TextureCache updated about what regions of memory are being rendered to,
+	// so that it can invalidate TexCacheEntries pointed at those addresses.
+	void NotifyFramebuffer(VirtualFramebuffer *framebuffer, FramebufferNotification msg);
+
+	int NumLoadedTextures() const {
+		return (int)cache_.size();
+	}
+	size_t NumSecondaryTextures() const {
+		return (int)secondCache_.size();
+	}
+	bool IsFakeMipmapChange() {
+		return PSP_CoreParameter().compat.flags().FakeMipmapChange && gstate.getTexLevelMode() == GE_TEXLEVEL_MODE_CONST;
+	}
+	virtual bool GetCurrentTextureDebug(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) override { return false; }
+
+	virtual void StartFrame() override;
+
+	virtual void DeviceLost() override;
+	virtual void DeviceRestore(Draw::DrawContext *draw) override;
+
+	// Accessors for the debugger.
+	virtual void *GetNativeTextureView(const MetalTexCacheEntry *entry, bool flat) const = 0;
+
+	const MetalTexCache &Cache() const { return cache_; }
+	const MetalTexCache &SecondCache() const { return secondCache_; }
+
+	virtual const size_t CacheSizeEstimate() const;
+	const size_t SecondCacheSizeEstimate() const;
+
+
+protected:
+	void WaitForDepthWrites(u32 addr, u32 bytes);
+
+	bool PrepareBuildTexture(MetalBuildTexturePlan &plan, MetalTexCacheEntry *entry);
+
+	// This updates nextTexture_ / nextFramebufferTexture_, which is then used by ApplyTexture.
+	// TODO: Return stuff directly instead of keeping state.
+	MetalTextureApplyResult ApplyTextureFinish(MetalTexCacheEntry *entry, bool doBind);
+	virtual void BindTexture(MetalTexCacheEntry *entry) = 0;
+	virtual void Unbind() override = 0;
+	virtual void BuildTexture(MetalTexCacheEntry *const entry) = 0;
+	virtual void ReleaseTexture(MetalTexCacheEntry *entry, bool delete_them) = 0;
+	VirtualFramebuffer *SetTextureFramebuffer(const AttachCandidate &candidate, RasterChannel *framebufferTextureChannel);
+	void Decimate(const MetalTexCacheEntry *const exceptThisOne, bool forcePressure);  // forcePressure defaults to false.
+
+	void ApplyTextureFramebuffer(VirtualFramebuffer *framebuffer, GETextureFormat texFormat, RasterChannel channel);
+	void ApplyTextureDepalFramebufferCLUT(const MetalTexCacheEntry *const entry);
+	virtual void ApplySamplerByKey(const SamplerCacheKey &key) override = 0;
+
+	virtual void UpdateCurrentClut(GEPaletteFormat clutFormat, u32 clutBase, bool clutIndexIsSimple) override;  // only overridden in GLES
+
+	virtual void BindAsClutTexture(Draw::Texture *tex, bool smooth) override {}
+
+	TextureAlpha DecodeTextureLevel(u8 *out, int outPitch, GETextureFormat format, GEPaletteFormat clutformat, uint32_t texaddr, int level, int bufw, TexDecodeFlags flags, bool clipToPSPSize = false);
+	static void UnswizzleFromMem(u32 *dest, u32 destPitch, const u8 *texptr, u32 bufw, u32 height, u32 bytesPerPixel);
+	// Unswizzles into tmpTexBuf32_, sized for what the decode will read. bytesPerPixel 0 means
+	// 4-bit indices. Returns the buffer and its row stride in bufw.
+	const u8 *UnswizzleToTemp(const u8 *texptr, int w, int h, int &bufw, int bytesPerPixel);
+	TextureAlpha ReadIndexedTex(u8 *out, int outPitch, int w, int h, int level, const u8 *texptr, int bytesPerIndex, int bufw, bool reverseColors, bool expandTo32Bit);
+	MetalReplacedTexture *FindReplacement(MetalTexCacheEntry *entry, int *w, int *h, int *d);
+	void PollReplacement(MetalTexCacheEntry *entry, int *w, int *h, int *d);
+
+	// Return value is mapData normally, but could be another buffer allocated with AllocateAlignedMemory.
+	void LoadTextureLevel(MetalTexCacheEntry &entry, uint8_t *mapData, size_t dataSize, int mapRowPitch, MetalBuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags, bool compressedPitched = false);
+	bool CopyIndexedReplacementLevel(MetalReplacedTexture *replaced, int level, uint8_t *data, size_t dataSize, int stride);
+	bool CanColorIndexedOnGpu(const MetalTexCacheEntry *entry) const;
+	const u32 *CurrentClutAsRGBA8888();
+	void SaveIndexedTexture(MetalTexCacheEntry *entry, const MetalBuildTexturePlan &plan);
+
+	// This needs to be a member functions just for IsVideo and Replacer.
+	SamplerCacheKey GetSamplingParams(int maxLevel, const MetalTexCacheEntry *entry, bool flatZ, bool pixelMapped);
+
+	void UpdateMaxSeenV(MetalTexCacheEntry *entry, bool throughMode);
+
+	bool GetFramebufferTextureDebug(const VirtualFramebuffer *vfb, RasterChannel channel, GPUDebugBuffer &buffer);
+
+	virtual void BoundFramebufferTexture() override {}
+
+	bool IsVideo(u32 texaddr) const;
+
+	static TextureAlpha CheckCLUTAlpha(const uint8_t *pixelData, GEPaletteFormat clutFmt, int w);
+
+	MetalTextureReplacer replacer_;
+	FramebufferManagerMetal *framebufferManager_ = nullptr;
+	MetalTexCache cache_;
+	MetalTexCache secondCache_;
+	std::unordered_set<u64> gpuIndexedKeys_;
+	bool metalTexturePolicy_ = true;
+
+	void BindTexture(::TexCacheEntry *) override {}
+	void BuildTexture(::TexCacheEntry *) override {}
+	void ReleaseTexture(::TexCacheEntry *, bool) override {}
+	void *GetNativeTextureView(const ::TexCacheEntry *, bool) const override { return nullptr; }
+};
+inline bool MetalTexCacheEntry::MatchesProperties(u16 dim2, u8 format2, u8 maxLevel2) const {
+	return dim == dim2 && format == format2 && maxLevel == maxLevel2;
+}
+
+inline u64 MetalTexCacheEntry::CacheKey() const {
+	return CacheKey(addr, format, dim, cluthash);
+}
+
+inline u64 MetalTexCacheEntry::CacheKey(u32 addr, u8 format, u16 dim, u32 cluthash) {
+	u64 cachekey = ((u64)(addr & 0x3FFFFFFF) << 32) | dim;
+	bool hasClut = (format & 4) != 0;
+	if (hasClut) {
+		cachekey ^= cluthash;
+	}
+	return cachekey;
+}
+
+SamplerCacheKey GetMetalFramebufferSamplingParams(const GEState &gstate, u16 bufferWidth, u16 bufferHeight, bool pixelMapped);

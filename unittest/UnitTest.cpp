@@ -131,6 +131,24 @@
 // Set to true for more verbose unit tests.
 bool g_testLog = false;
 
+Path UnitTestTempPath(const char *name) {
+#if PPSSPP_PLATFORM(WINDOWS)
+	const wchar_t *temp = _wgetenv(L"TEMP");
+	if (temp && *temp) {
+		return Path(ConvertWStringToUTF8(temp)) / name;
+	}
+#else
+	const char *temp = getenv("TMPDIR");
+	if (temp && *temp) {
+		return Path(temp) / name;
+	}
+#if !PPSSPP_PLATFORM(ANDROID)
+	return Path("/tmp") / name;
+#endif
+#endif
+	return Path(name);
+}
+
 std::string System_GetProperty(SystemProperty prop) { return ""; }
 std::vector<std::string> System_GetPropertyStringVec(SystemProperty prop) { return std::vector<std::string>(); }
 int64_t System_GetPropertyInt(SystemProperty prop) {
@@ -902,6 +920,55 @@ bool TestTempBreakpoints() {
 	EXPECT_TRUE((g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE) != 0);
 	g_breakpoints.RemoveBreakPoint(kAddrA);
 	EXPECT_FALSE(g_breakpoints.HasBreakPoints());
+
+	// Resuming from a breakpoint must not pause there again, and must not report it again if it's
+	// the one that stopped us. A breakpoint we merely stepped onto still has to log and count.
+	// Nothing retires an instruction here unless we move downcount, so the ticks stay put.
+	{
+		auto hitsAt = [](u32 addr) -> int {
+			for (const BreakPoint &bp : g_breakpoints.GetBreakpoints()) {
+				if (bp.addr == addr)
+					return (int)bp.numHits;
+			}
+			return -1;
+		};
+
+		g_breakpoints.ClearSkipFirst();
+		g_breakpoints.AddBreakPoint(kAddrA);
+		g_breakpoints.AddBreakPoint(kAddrB);
+
+		EXPECT_TRUE((g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE) != 0);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 1);
+
+		// Resuming off it. A step-over sets the skip twice for one resume, and that must not lose it.
+		g_breakpoints.SetSkipFirst(kAddrA);
+		g_breakpoints.SetSkipFirst(kAddrA);
+		EXPECT_EQ_INT((int)g_breakpoints.ExecBreakPoint(kAddrA), (int)BREAK_ACTION_NONE);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 1);
+
+		// Stepped onto B, never reported there: it logs and counts, only the pause is dropped.
+		g_breakpoints.SetSkipFirst(kAddrB);
+		EXPECT_EQ_INT((int)(g_breakpoints.ExecBreakPoint(kAddrB) & BREAK_ACTION_PAUSE), 0);
+		EXPECT_EQ_INT(hitsAt(kAddrB), 1);
+
+		// An unrelated address still pauses and reports.
+		EXPECT_TRUE((g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE) != 0);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 2);
+
+		// Step off A, which runs it, and land on A again (a one-instruction loop). That's a new
+		// execution, which nothing has reported yet.
+		g_breakpoints.SetSkipFirst(kAddrA);
+		EXPECT_EQ_INT((int)g_breakpoints.ExecBreakPoint(kAddrA), (int)BREAK_ACTION_NONE);
+		currentMIPS->downcount -= 1;
+		g_breakpoints.SetSkipFirst(kAddrA);
+		EXPECT_EQ_INT((int)(g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE), 0);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 3);
+		currentMIPS->downcount += 1;
+
+		g_breakpoints.ClearSkipFirst();
+		g_breakpoints.RemoveBreakPoint(kAddrA);
+		g_breakpoints.RemoveBreakPoint(kAddrB);
+	}
 
 	g_symbolMap = nullptr;
 	return true;
@@ -1823,10 +1890,10 @@ bool TestFastVec() {
 	return true;
 }
 
-// vfpu_dot's SIMD versions against the reference, on inputs chosen to make trouble: close
-// exponents, cancelling products, ties, zeroes and subnormals, the overflow and underflow edges,
-// inf and NaN, and sums whose rounding carries into the next power of two.
-bool TestVFPUDot() {
+// Calls check on inputs chosen to make trouble for a VFPU dot product: close exponents, cancelling
+// products, ties, zeroes and subnormals, the overflow and underflow edges, inf and NaN, and sums whose
+// rounding carries into the next power of two. Stops at the first false.
+bool ForEachVFPUDotTestCase(const std::function<bool(const float a[4], const float b[4])> &check) {
 	uint64_t state = 0x9E3779B97F4A7C15ULL;
 	auto rnd = [&]() {
 		state ^= state << 13;
@@ -1843,16 +1910,6 @@ bool TestVFPUDot() {
 		uint32_t bits;
 		memcpy(&bits, &f, sizeof(bits));
 		return bits;
-	};
-	auto check = [&](const float a[4], const float b[4]) {
-		const uint32_t expected = toBits(vfpu_dot_reference(a, b));
-		const uint32_t actual = toBits(vfpu_dot(a, b));
-		if (expected != actual) {
-			printf("vfpu_dot(%08x %08x %08x %08x, %08x %08x %08x %08x) = %08x, expected %08x\n",
-				toBits(a[0]), toBits(a[1]), toBits(a[2]), toBits(a[3]), toBits(b[0]), toBits(b[1]), toBits(b[2]), toBits(b[3]), actual, expected);
-			return false;
-		}
-		return true;
 	};
 	for (int n = 0; n < 4000000; n++) {
 		float a[4], b[4];
@@ -1891,6 +1948,20 @@ bool TestVFPUDot() {
 			return false;
 	}
 
+	// Cases that went wrong somewhere.
+	static const uint32_t fixed[][8] = {
+		{ 0x8055f97b, 0xcaa86851, 0, 0, 0x44282000, 0x3f800000, 0, 0 },
+	};
+	for (const auto &f : fixed) {
+		float a[4], b[4];
+		for (int i = 0; i < 4; i++) {
+			a[i] = fromBits(f[i]);
+			b[i] = fromBits(f[i + 4]);
+		}
+		if (!check(a, b))
+			return false;
+	}
+
 	// Sums just below and above a power of two, whose rounding carries into the next exponent:
 	// 1.0 from just under it, and inf at the top of the range.
 	for (int e = 1; e <= 254; e++) {
@@ -1913,6 +1984,55 @@ bool TestVFPUDot() {
 		}
 	}
 	return true;
+}
+
+
+// vfpu_dot's fast versions and vfpu_multi_dot against the reference.
+bool TestVFPUDot() {
+	auto toBits = [](float f) {
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		return bits;
+	};
+	float lastA[4][4];
+	int n = 0;
+	auto checkMulti = [&](const float v[4], int terms, bool transposed) {
+		float block[16], out[4];
+		for (int k = 0; k < 4; k++) {
+			for (int i = 0; i < 4; i++)
+				block[transposed ? 4 * k + i : 4 * i + k] = lastA[k][i];
+		}
+		vfpu_multi_dot(out, block, v, terms, transposed);
+		for (int k = 0; k < 4; k++) {
+			float a[4]{}, b[4]{};
+			for (int i = 0; i < terms; i++) {
+				a[i] = lastA[k][i];
+				b[i] = v[i];
+			}
+			const uint32_t expected = toBits(vfpu_dot_reference(a, b));
+			if (toBits(out[k]) != expected) {
+				printf("vfpu_multi_dot output %d, %d terms%s: %08x, expected %08x\n", k, terms, transposed ? " transposed" : "", toBits(out[k]), expected);
+				return false;
+			}
+		}
+		return true;
+	};
+	auto check = [&](const float a[4], const float b[4]) {
+		const uint32_t expected = toBits(vfpu_dot_reference(a, b));
+		const uint32_t actual = toBits(vfpu_dot(a, b));
+		const uint32_t scalar = toBits(vfpu_dot_scalar(a, b));
+		if (expected != actual || expected != scalar) {
+			printf("vfpu_dot(%08x %08x %08x %08x, %08x %08x %08x %08x) = %08x (scalar %08x), expected %08x\n",
+				toBits(a[0]), toBits(a[1]), toBits(a[2]), toBits(a[3]), toBits(b[0]), toBits(b[1]), toBits(b[2]), toBits(b[3]), actual, scalar, expected);
+			return false;
+		}
+		// vfpu_multi_dot on the last four a's as the matrix, each output against the reference.
+		memcpy(lastA[n & 3], a, sizeof(lastA[0]));
+		if ((n++ & 3) == 3 && !checkMulti(b, 2 + (int)(n % 3), (n & 4) != 0))
+			return false;
+		return true;
+	};
+	return ForEachVFPUDotTestCase(check);
 }
 
 bool TestVFPUSinCos() {
@@ -3108,9 +3228,12 @@ bool TestThreadManager();
 bool TestVFS();
 bool TestZipSlip();
 bool TestLzrc();
+bool TestCwCheat();
 bool TestMpegCsc();
 bool TestSplineTessellation();
 bool TestGEMath();
+bool TestBoundingBoxFast();
+bool TestDepthRaster();
 bool TestDemangle();
 
 // The 8.3 short names games read out of d_private. These aren't verified against hardware yet (no
@@ -3438,6 +3561,8 @@ TestItem availableTests[] = {
 	TEST_ITEM(LoongArch64Emitter),
 #endif
 	TEST_ITEM(VertexJit),
+	TEST_ITEM(BoundingBoxFast),
+	TEST_ITEM(DepthRaster),
 	TEST_ITEM(VFPUSinCos),
 	TEST_ITEM(VFPUDot),
 	TEST_ITEM(MathUtil),
@@ -3453,9 +3578,11 @@ TestItem availableTests[] = {
 	TEST_ITEM(Utf8),
 	TEST_ITEM(IRPassSimplify),
 	TEST_ITEM(Jit),
+	TEST_ITEM(JitDotBench),
 	TEST_ITEM(JitReplacementHooks),
 	TEST_ITEM(CPUEquivalence),
 	TEST_ITEM(CPURoundingMode),
+	TEST_ITEM(VFPUDotJit),
 	TEST_ITEM(VFPUMatrixTranspose),
 	TEST_ITEM(ParseLBN),
 	TEST_ITEM(CachingFileLoader),
@@ -3498,6 +3625,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(CmdLine),
 	TEST_ITEM(ZipSlip),
 	TEST_ITEM(Lzrc),
+	TEST_ITEM(CwCheat),
 	TEST_ITEM(MpegCsc),
 	TEST_ITEM(SplineTessellation),
 	TEST_ITEM(GEMath),
