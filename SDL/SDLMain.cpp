@@ -80,6 +80,10 @@ SDLJoystick *joystick = NULL;
 #if PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)
 #include "Core/Util/DarwinFileSystemServices.h"
 #include "SDL/SDLCocoaMetalLayer.h"
+#ifndef PPSSPP_HAS_METAL
+#include "Common/GPU/Metal/MetalGraphicsContext.h"
+#endif
+#include <SDL3/SDL_metal.h>
 #endif
 
 #if PPSSPP_PLATFORM(MAC)
@@ -2272,7 +2276,7 @@ int main(int argc, char *argv[]) {
 	if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
 		fprintf(stderr, "Failed to initialize graphics backend: %s\n", error_message.c_str());
 		if (fallbackGPUBackend != -1) {
-			fprintf(stderr, "Attempting to fall back to %s...\n", fallbackGPUBackend == (int)GPUBackend::OPENGL ? "OpenGL" : "Vulkan");
+			fprintf(stderr, "Attempting to fall back to %s...\n", GPUBackendToString((GPUBackend)fallbackGPUBackend).c_str());
 			g_Config.iGPUBackend = fallbackGPUBackend;
 			error_message.clear();
 			if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {

@@ -100,6 +100,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	// For accelerometer sensing.
 	private SensorManager mSensorManager;
 	private Sensor mAccelerometer;
+	private Sensor mGyroscope;
 
 	private String shortcutParam = "";
 	private static String overrideShortcutParam = null;
@@ -408,10 +409,6 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	}
 
 	public void Initialize() {
-		// isLandscape is used to trigger GetAppInfo currently, we
-		boolean landscape = NativeApp.isLandscape();
-		Log.d(TAG, "Landscape: " + landscape);
-
 		ApplicationInfo appInfo = getApplicationInfo();
 
 		int deviceType = NativeApp.DEVICE_TYPE_MOBILE;
@@ -728,6 +725,10 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 		mSensorManager = (SensorManager)getSystemService(Activity.SENSOR_SERVICE);
 		mAccelerometer = mSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+		mGyroscope = mSensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+		String sensors = (mAccelerometer != null ? "1" : "0") + ":" + (mGyroscope != null ? "1" : "0");
+		Log.i(TAG, "Sensors (accelerometer:gyro): " + sensors);
+		NativeApp.sendMessageFromJava("sensors", sensors);
 
 		surfaceManager = new NativeSurfaceManager(this);
 		TextRenderer.init(this);
@@ -1003,6 +1004,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 		mSensorManager = null;
 		mAccelerometer = null;
+		mGyroscope = null;
 
 		// Probably vain attempt to help the garbage collector...
 		audioFocusChangeListener = null;
@@ -1068,7 +1070,12 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			NativeApp.resume();
 		}
 		updateAudioFocus(this.audioManager, this.audioFocusChangeListener);
-		mSensorManager.registerListener(this, mAccelerometer, SensorManager.SENSOR_DELAY_GAME);
+		if (mAccelerometer != null) {
+			mSensorManager.registerListener(this, mAccelerometer, SensorManager.SENSOR_DELAY_GAME);
+		}
+		if (mGyroscope != null) {
+			mSensorManager.registerListener(this, mGyroscope, SensorManager.SENSOR_DELAY_GAME);
+		}
 
 		InputManager inputManager = (InputManager)getSystemService(Context.INPUT_SERVICE);
 		inputManager.registerInputDeviceListener(inputDeviceListener, null);
@@ -1155,11 +1162,14 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 	@Override
 	public void onSensorChanged(SensorEvent event) {
-		if (event.sensor.getType() != Sensor.TYPE_ACCELEROMETER) {
-			return;
+		switch (event.sensor.getType()) {
+		case Sensor.TYPE_ACCELEROMETER:
+			NativeApp.accelerometer(event.values[0], event.values[1], event.values[2]);
+			break;
+		case Sensor.TYPE_GYROSCOPE:
+			NativeApp.gyroscope(event.values[0], event.values[1], event.values[2], event.timestamp);
+			break;
 		}
-		// Can also look at event.timestamp for accuracy magic
-		NativeApp.accelerometer(event.values[0], event.values[1], event.values[2]);
 	}
 
 	@Override
@@ -1833,6 +1843,10 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			return true;
 		} else if (command.equals("gps_command")) {
 			if (params.equals("open")) {
+				if (!getPackageManager().hasSystemFeature(PackageManager.FEATURE_LOCATION)) {
+					Log.i(TAG, "No location hardware, not starting location updates");
+					return true;
+				}
 				if (!askForPermissions(permissionsForLocation, REQUEST_CODE_LOCATION_PERMISSION)) {
 					mLocationHelper.startLocationUpdates();
 				}
@@ -1877,6 +1891,11 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			return true;
 		} else if (command.equals("microphone_command")) {
 			if (params.startsWith("startRecording:")) {
+				// No point asking for permission for a microphone the device doesn't have.
+				if (!getPackageManager().hasSystemFeature(PackageManager.FEATURE_MICROPHONE)) {
+					Log.i(TAG, "No microphone, not starting recording");
+					return true;
+				}
 				int sampleRate = Integer.parseInt(params.replace("startRecording:", ""));
 				NativeApp.audioRecording_SetSampleRate(sampleRate);
 				if (!askForPermissions(permissionsForMicrophone, REQUEST_CODE_MICROPHONE_PERMISSION)) {
@@ -1974,13 +1993,19 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 	private static String parseIntent(Intent intent) {
 		Uri data = intent.getData();
+		String args = intent.getStringExtra(ARGS_EXTRA_KEY);
 		if (data != null) {
 			String path = data.toString();
 			// Do some unescaping. Not really sure why needed.
-			return "\"" + path.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+			String quotedPath = "\"" + path.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+			if (args != null) {
+				// Launchers that open the game by URI can still pass options. The path goes first, so it's the one booted.
+				Log.i(TAG, "Found args parameter in extra-data alongside the data URI: " + args);
+				return quotedPath + " " + args;
+			}
+			return quotedPath;
 		} else {
 			String param = intent.getStringExtra(SHORTCUT_EXTRA_KEY);
-			String args = intent.getStringExtra(ARGS_EXTRA_KEY);
 			if (param != null) {
 				Log.i(TAG, "Found Shortcut Parameter in extra-data: " + param);
 				return "\"" + param.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";

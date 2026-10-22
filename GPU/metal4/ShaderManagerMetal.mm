@@ -5,15 +5,19 @@
 #include "GPU/metal4/ShaderManagerMetal.h"
 
 #include "Common/File/FileUtil.h"
+#include "Common/TimeUtil.h"
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include "Common/GPU/metal4/MetalResources.h"
 #include "Core/Config.h"
+#include "GPU/Common/ShaderCommon.h"
 #include "GPU/Common/GPUStateUtils.h"
 #include "GPU/metal4/TextureCachePolicyMetal.h"
 
 namespace {
 
 constexpr uint32_t METAL_SHADER_CACHE_MAGIC = 0x4D534844;
-constexpr uint32_t METAL_SHADER_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 3 : 1;
+constexpr uint32_t METAL_SHADER_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 5 : 1;
 constexpr uint32_t MAX_CACHED_SHADERS = 8192;
 
 struct MetalShaderCacheHeader {
@@ -25,7 +29,27 @@ struct MetalShaderCacheHeader {
 	uint64_t buildHash;
 	uint32_t vertexCount;
 	uint32_t fragmentCount;
+	std::array<uint8_t, 16> compilerBuild;
 };
+
+// glslang and the private SPIRV-Cross compiler are linked into this image.
+// Its content UUID also invalidates caches after uncommitted compiler/backend builds.
+std::array<uint8_t, 16> CompilerBuild() {
+	std::array<uint8_t, 16> result{};
+	const auto *header = _dyld_get_image_header(0);
+	if (!header || header->magic != MH_MAGIC_64) {
+		return result;
+	}
+	const auto *command = (const load_command *)((const uint8_t *)header + sizeof(mach_header_64));
+	for (uint32_t i = 0; i < header->ncmds; ++i) {
+		if (command->cmd == LC_UUID && command->cmdsize >= sizeof(uuid_command)) {
+			memcpy(result.data(), ((const uuid_command *)command)->uuid, result.size());
+			break;
+		}
+		command = (const load_command *)((const uint8_t *)command + command->cmdsize);
+	}
+	return result;
+}
 
 uint64_t CacheStringHash(const char *value) {
 	uint64_t hash = 14695981039346656037ULL;
@@ -75,6 +99,10 @@ void ShaderManagerMetal::DeviceLost() {
 	ClearShaders();
 	buffers_ = {};
 	boundBuffers_ = {};
+	raster_ = {};
+	rasterBuffer_ = {};
+	boundRasterBuffer_ = {};
+	rasterGeneration_ = 0;
 	boundUniformsValid_ = false;
 	boundStereoViewMask_ = false;
 	base_ = {};
@@ -98,6 +126,13 @@ bool ShaderManagerMetal::LoadCache(const Path &filename) {
 	if (!g_Config.bShaderCache || !draw_) {
 		return false;
 	}
+	const uint64_t fileSize = File::GetFileSize(filename);
+	const auto compilerBuild = CompilerBuild();
+	// Bound checksum I/O and record allocations before invoking a compiler.
+	if (fileSize < sizeof(MetalShaderCacheHeader) + 8 || fileSize > Metal::TranslationCache::MAX_FILE_BYTES ||
+		compilerBuild == std::array<uint8_t, 16>{} || !VerifyShaderCacheChecksum(filename)) {
+		return false;
+	}
 	FILE *file = File::OpenCFile(filename, "rb");
 	if (!file) {
 		return false;
@@ -108,42 +143,50 @@ bool ShaderManagerMetal::LoadCache(const Path &filename) {
 		header.useFlags == gstate_c.GetUseFlags() && header.vendorChecks == (uint32_t)g_Config.bVendorBugChecksEnabled &&
 		header.deviceHash == CacheStringHash(draw_->GetDeviceCaps().deviceName.c_str()) &&
 		header.buildHash == CacheStringHash(PPSSPP_GIT_VERSION) &&
-		header.vertexCount <= MAX_CACHED_SHADERS && header.fragmentCount <= MAX_CACHED_SHADERS;
-	bool compileFailed = false;
+		header.vertexCount <= MAX_CACHED_SHADERS && header.fragmentCount <= MAX_CACHED_SHADERS &&
+		header.compilerBuild == compilerBuild;
+	Metal::TranslationCache::Reader reader(file, fileSize - sizeof(header) - 8);
 	if (valid) {
 		for (uint32_t i = 0; i < header.vertexCount; ++i) {
 			VShaderID id;
-			if (fread(&id, sizeof(id), 1, file) != 1) {
+			Metal::TranslationCache::Record record;
+			if (!reader.Value(&id) || !Metal::TranslationCache::Read(reader, &record)) {
 				valid = false;
 				break;
 			}
 			std::string error;
-			if (!GetVertexShaderFromID(id, &error)) {
+			loadingTranslation_ = &record;
+			const auto *shader = GetVertexShaderFromID(id, &error);
+			loadingTranslation_ = nullptr;
+			if (!shader) {
 				valid = false;
-				compileFailed = true;
 				break;
 			}
 		}
 		for (uint32_t i = 0; valid && i < header.fragmentCount; ++i) {
 			FShaderID id;
-			if (fread(&id, sizeof(id), 1, file) != 1) {
+			Metal::TranslationCache::Record record;
+			if (!reader.Value(&id) || !Metal::TranslationCache::Read(reader, &record)) {
 				valid = false;
 				break;
 			}
 			std::string error;
-			if (!GetFragmentShaderFromID(id, &error)) {
+			loadingTranslation_ = &record;
+			const auto *shader = GetFragmentShaderFromID(id, &error);
+			loadingTranslation_ = nullptr;
+			if (!shader) {
 				valid = false;
-				compileFailed = true;
 				break;
 			}
 		}
+		valid &= reader.Remaining() == 0;
 		if (valid) {
 			gstate_c.useFlagsChanged = false;
 		}
 	}
 	fclose(file);
-	if (compileFailed) {
-		// Failed shader entries must not stay cached as permanent failures.
+	if (!valid) {
+		// Reject partial loads and failed shaders as a unit.
 		ClearShaders();
 	}
 	return valid;
@@ -165,6 +208,10 @@ void ShaderManagerMetal::SaveCache(const Path &filename) const {
 	header.vendorChecks = g_Config.bVendorBugChecksEnabled;
 	header.deviceHash = CacheStringHash(draw_->GetDeviceCaps().deviceName.c_str());
 	header.buildHash = CacheStringHash(PPSSPP_GIT_VERSION);
+	header.compilerBuild = CompilerBuild();
+	if (header.compilerBuild == std::array<uint8_t, 16>{}) {
+		return;
+	}
 	for (const auto &entry : vertexCache_) {
 		header.vertexCount += entry.second->function != nil;
 	}
@@ -174,7 +221,8 @@ void ShaderManagerMetal::SaveCache(const Path &filename) const {
 	if (header.vertexCount > MAX_CACHED_SHADERS || header.fragmentCount > MAX_CACHED_SHADERS) {
 		return;
 	}
-	FILE *file = File::OpenCFile(filename, "wb");
+	const Path temporary = filename.WithExtraExtension(".tmp");
+	FILE *file = File::OpenCFile(temporary, "wb");
 	if (!file) {
 		return;
 	}
@@ -182,16 +230,29 @@ void ShaderManagerMetal::SaveCache(const Path &filename) const {
 	for (const auto &entry : vertexCache_) {
 		if (entry.second->function) {
 			valid &= fwrite(&entry.first, sizeof(entry.first), 1, file) == 1;
+			valid = valid && Metal::TranslationCache::Write(file, entry.second->translationOptions, entry.second->source, entry.second->compiled);
+			if (!valid || (uint64_t)ftell(file) > Metal::TranslationCache::MAX_FILE_BYTES - 8) {
+				valid = false;
+				break;
+			}
 		}
 	}
 	for (const auto &entry : fragmentCache_) {
+		if (!valid) {
+			break;
+		}
 		if (entry.second->function) {
 			valid &= fwrite(&entry.first, sizeof(entry.first), 1, file) == 1;
+			valid = valid && Metal::TranslationCache::Write(file, entry.second->translationOptions, entry.second->source, entry.second->compiled);
+			if (!valid || (uint64_t)ftell(file) > Metal::TranslationCache::MAX_FILE_BYTES - 8) {
+				valid = false;
+				break;
+			}
 		}
 	}
 	valid &= fclose(file) == 0;
-	if (!valid) {
-		File::Delete(filename);
+	if (!valid || !AppendShaderCacheChecksum(temporary) || !File::Rename(temporary, filename)) {
+		File::Delete(temporary);
 	}
 }
 
@@ -219,8 +280,22 @@ bool ShaderManagerMetal::Compile(MetalGEShader *shader, ShaderStage stage, const
 #if PPSSPP_PLATFORM(IOS)
 	options.ios = true;
 #endif
-	if (!Metal::CompileShader(shader->source, stage, options, &shader->compiled, &shader->error)) {
-		return false;
+	shader->translationOptions = Metal::TranslationCache::OptionsKey(stage, options);
+	if (loadingTranslation_ && loadingTranslation_->Matches(shader->source, stage, options)) {
+		shader->compiled = std::move(loadingTranslation_->compiled);
+		++compileMetrics_.translationCacheHits;
+	} else {
+		Metal::ShaderCompileTimings timings;
+		const double start = time_now_d();
+		const bool translated = Metal::CompileShader(shader->source, stage, options, &shader->compiled, &shader->error, &timings);
+		compileMetrics_.frontendSeconds += time_now_d() - start;
+		compileMetrics_.phases.glslSeconds += timings.glslSeconds;
+		compileMetrics_.phases.spirvSeconds += timings.spirvSeconds;
+		compileMetrics_.phases.mslSeconds += timings.mslSeconds;
+		++compileMetrics_.translated;
+		if (!translated) {
+			return false;
+		}
 	}
 	for (const auto &resource : shader->compiled.resources) {
 		if (resource.kind == Metal::ResourceKind::UniformBuffer) {
@@ -258,8 +333,12 @@ const MetalGEVertexShader *ShaderManagerMetal::GetVertexShaderFromID(VShaderID i
 		auto shader = std::make_unique<MetalGEVertexShader>();
 		shader->id = id;
 		code_.fill(0);
-		if (GenerateVertexShader(id, code_.data(), language_, draw_->GetBugs(), &shader->attributeMask,
-			&shader->uniformMask, &shader->flags, &shader->error)) {
+		const double generateStart = time_now_d();
+		const bool generated = GenerateVertexShader(id, code_.data(), language_, draw_->GetBugs(), &shader->attributeMask,
+			&shader->uniformMask, &shader->flags, &shader->error);
+		compileMetrics_.generationSeconds += time_now_d() - generateStart;
+		++compileMetrics_.generated;
+		if (generated) {
 			shader->source = code_.data();
 			Compile(shader.get(), ShaderStage::Vertex, id.Description().c_str());
 		} else if (shader->error.empty()) {
@@ -287,8 +366,12 @@ const MetalGEFragmentShader *ShaderManagerMetal::GetFragmentShaderFromID(FShader
 		auto shader = std::make_unique<MetalGEFragmentShader>();
 		shader->id = id;
 		code_.fill(0);
-		if (GenerateMetalFragmentShader(id, code_.data(), language_, draw_->GetBugs(), &shader->uniformMask,
-			&shader->flags, &shader->error, true)) {
+		const double generateStart = time_now_d();
+		const bool generated = GenerateMetalFragmentShader(id, code_.data(), language_, draw_->GetBugs(), &shader->uniformMask,
+			&shader->flags, &shader->error, true);
+		compileMetrics_.generationSeconds += time_now_d() - generateStart;
+		++compileMetrics_.generated;
+		if (generated) {
 			shader->source = code_.data();
 			Compile(shader.get(), ShaderStage::Fragment, id.Description().c_str());
 		} else if (shader->error.empty()) {
@@ -422,6 +505,7 @@ bool ShaderManagerMetal::BindUniforms(id<MTL4RenderCommandEncoder> encoder, std:
 		return false;
 	}
 	const uint64_t serial = manager_->RenderStateSerial();
+	const bool sameEncoderState = boundUniformsValid_ && boundRenderStateSerial_ == serial;
 #if PPSSPP_PLATFORM(MAC)
 	MetalGERasterUniforms raster{};
 	if (gstate.isModeThrough() && gstate_c.textureIsFramebuffer) {
@@ -448,9 +532,21 @@ bool ShaderManagerMetal::BindUniforms(id<MTL4RenderCommandEncoder> encoder, std:
 			raster.flags |= METAL_RASTER_DITHER;
 		}
 	}
-	manager_->Context().SetBytes(encoder, MTLRenderStageFragment, &raster, sizeof(raster), ShaderBinding::DRAW_BINDING_METAL_RASTER);
+	auto &context = manager_->Context();
+	if (!rasterBuffer_ || rasterGeneration_ != context.CommandGeneration() || memcmp(&raster_, &raster, sizeof(raster)) != 0) {
+		auto buffer = context.Upload(&raster, sizeof(raster), error);
+		if (!buffer) {
+			return false;
+		}
+		rasterBuffer_ = buffer;
+		raster_ = raster;
+		rasterGeneration_ = context.CommandGeneration();
+	}
+	if (!sameEncoderState || boundRasterBuffer_.buffer != rasterBuffer_.buffer || boundRasterBuffer_.offset != rasterBuffer_.offset) {
+		context.SetBuffer(encoder, MTLRenderStageFragment, rasterBuffer_.buffer, rasterBuffer_.offset, ShaderBinding::DRAW_BINDING_METAL_RASTER);
+	}
+	boundRasterBuffer_ = rasterBuffer_;
 #endif
-	const bool sameEncoderState = boundUniformsValid_ && boundRenderStateSerial_ == serial;
 	if (!sameEncoderState || boundBuffers_.base.buffer != buffers_.base.buffer || boundBuffers_.base.offset != buffers_.base.offset) {
 		manager_->Context().SetBuffer(encoder, MTLRenderStageVertex, buffers_.base.buffer, buffers_.base.offset, ShaderBinding::DRAW_BINDING_DYNUBO_BASE);
 		manager_->Context().SetBuffer(encoder, MTLRenderStageFragment, buffers_.base.buffer, buffers_.base.offset, ShaderBinding::DRAW_BINDING_DYNUBO_BASE);
@@ -461,9 +557,9 @@ bool ShaderManagerMetal::BindUniforms(id<MTL4RenderCommandEncoder> encoder, std:
 	}
 	const bool stereo = gstate_c.Use(GPU_USE_SINGLE_PASS_STEREO);
 	if (stereo && (!sameEncoderState || !boundStereoViewMask_)) {
-		const uint32_t viewMask[] = { 0, 2 };
-		manager_->Context().SetBytes(encoder, MTLRenderStageVertex, viewMask, sizeof(viewMask), Metal::VIEW_MASK_BUFFER_SLOT);
-		manager_->Context().SetBytes(encoder, MTLRenderStageFragment, viewMask, sizeof(viewMask), Metal::VIEW_MASK_BUFFER_SLOT);
+		if (!manager_->Context().BindViewMask(encoder, error)) {
+			return false;
+		}
 	}
 	boundBuffers_ = buffers_;
 	boundRenderStateSerial_ = serial;

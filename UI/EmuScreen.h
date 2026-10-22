@@ -40,7 +40,8 @@ struct ImGuiContext;
 
 class EmuScreen : public UIScreen, protected ControlListener {
 public:
-	EmuScreen(const Path &filename);
+	// mountIso, if set, is mounted on umd1: when filename is an ELF/PBP (like the VSH).
+	EmuScreen(const Path &filename, const Path &mountIso = Path());
 	~EmuScreen();
 
 	const char *tag() const override { return "Emu"; }
@@ -90,6 +91,7 @@ private:
 
 	void AutoLoadSaveState();
 	bool checkPowerDown();
+	void leaveGame();
 
 	void ProcessQueuedVKeys();
 	void ProcessVKey(VirtKey vkey, bool down);
@@ -100,6 +102,7 @@ private:
 	bool bootPending_ = true;
 	bool bootIsReset_ = false;
 	Path gamePath_;
+	Path mountIso_;
 
 	bool quit_ = false;
 	std::string errorMessage_;
@@ -124,11 +127,17 @@ private:
 	UI::CallbackColorTween *loadingViewColor_ = nullptr;
 	UI::VisibilityTween *loadingViewVisible_ = nullptr;
 	UI::Spinner *loadingSpinner_ = nullptr;
+	// Shown while a savestate is being saved or loaded, if that takes long enough to notice.
+	UI::Spinner *saveStateSpinner_ = nullptr;
+	double saveStateBusySince_ = -1.0;
 	UI::Button *resumeButton_ = nullptr;
 	UI::Button *resetButton_ = nullptr;
 	UI::Button *backButton_ = nullptr;
 	UI::Clickable *chatButton_ = nullptr;
 	ChatMenu *chatMenu_ = nullptr;
+	// Set when the chat opens. Stick movements don't reach the control mapper while it's open (key
+	// releases do), so what's held is let go up front.
+	bool releaseMapperInput_ = false;
 
 	UI::Button *cardboardDisableButton_ = nullptr;
 

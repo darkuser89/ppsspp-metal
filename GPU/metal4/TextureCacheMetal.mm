@@ -25,11 +25,11 @@ bool TextureScalerMetal::Configure(Metal::RenderContext &context, const MetalTex
 	Clear();
 	error->clear();
 	const bool multipass = info.computeShaderFiles.size() > 1;
-	const size_t expectedStages = multipass ? (info.scaleFactor == 2 ? 3 : info.scaleFactor == 4 ? 4 : 0) : 1;
-	if (info.computeShaderFiles.size() != expectedStages || info.scaleFactor < 2 || info.scaleFactor >= 8) {
+	if (!MetalTextureShaderSupported(info)) {
 		*error = "Unsupported Metal texture scaling shader";
 		return false;
 	}
+	const size_t expectedStages = info.computeShaderFiles.size();
 	size_t constantsSize = 0;
 	if (!info.constantBuffer.empty()) {
 		uint8_t *constants = g_VFS.ReadFile(info.constantBuffer.c_str(), &constantsSize);
@@ -144,7 +144,7 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		return nullptr;
 	}
 	if (pipelineCount_ == 1) {
-		auto encoder = context.ComputeEncoder(commands, "Texture scaling");
+		auto encoder = context.ComputeEncoder(commands, "Texture scaling", true);
 		if (!encoder) {
 			*error = "Failed to create Metal texture scaling encoder";
 			texture->Release();
@@ -158,7 +158,7 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		if (constants_) {
 			context.SetBuffer(encoder, constants_, 0, 4);
 		}
-		context.SetTexture(encoder, texture->Native(), 0);
+		context.SetTexture(encoder, texture->Native(), 0, MTLResourceUsageWrite);
 		[encoder dispatchThreadgroups:MTLSizeMake((width + 7) / 8, (height + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 		context.EndEncoder(encoder);
 	} else {
@@ -202,9 +202,7 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 				return nullptr;
 			}
 		}
-		// A serial compute encoder orders these dispatches and makes each
-		// scratch texture available to the following stage.
-		auto pass = context.ComputeEncoder(commands, "Multistage texture scaling");
+		auto pass = context.ComputeEncoder(commands, "Multistage texture scaling", true);
 		if (!pass) {
 			*error = "Failed to create Metal texture scaling pass";
 			texture->Release();
@@ -212,6 +210,10 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		}
 		for (int i = 0; i < stageCount; ++i) {
 			const StageDesc &stage = stages[i];
+			if (stage.inputScratch >= 0) {
+				// Metal 4 dispatches run concurrently; publish the preceding scratch writes.
+				[pass barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+			}
 			id<MTLTexture> output = stage.outputScratch < 0 ? texture->Native() : scratch[stage.outputScratch]->Native();
 			id<MTLTexture> source = stage.inputScratch < 0 ? nil : scratch[stage.inputScratch]->Native();
 			const int params[4] = {
@@ -222,11 +224,11 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 			};
 			context.Keep(pipelines_[stage.shaderIndex]);
 			[pass setComputePipelineState:pipelines_[stage.shaderIndex]];
-			context.SetTexture(pass, output, 0);
+			context.SetTexture(pass, output, 0, MTLResourceUsageWrite);
 			if (stage.inputScratch < 0) {
 				context.SetBuffer(pass, input.buffer, input.offset, 1);
 			} else {
-				context.SetTexture(pass, source, 3);
+				context.SetTexture(pass, source, 3, MTLResourceUsageRead);
 			}
 			context.SetBytes(pass, params, sizeof(params), 2);
 			if (constants_) {
@@ -237,13 +239,14 @@ Metal::Texture *TextureScalerMetal::Scale(Metal::RenderContext &context, Metal::
 		context.EndEncoder(pass);
 	}
 	if (mipLevels > 1) {
-		auto blit = context.BlitEncoder(commands, "Scaled texture mipmaps");
+		auto blit = context.BlitEncoder(commands, "Scaled texture mipmaps", true);
 		if (!blit) {
 			*error = "Failed to encode Metal texture scaling mipmaps";
 			texture->Release();
 			return nullptr;
 		}
 		context.Keep(texture->Native());
+		context.UseResource(blit, texture->Native(), MTLStageBlit, MTLStageBlit);
 		[blit generateMipmapsForTexture:texture->Native()];
 		context.EndEncoder(blit);
 	}
@@ -398,20 +401,17 @@ void TextureCacheMetal::RestoreGETextureBindings() {
 	manager_->SetNativeSampler(ShaderBinding::DRAW_BINDING_DEPAL_TEXTURE, geClutSampler_);
 }
 
-bool TextureCacheMetal::BindSamplingRegion(const TransformedVertex *vertices, TransformedVertex *adjusted, const MTLViewport &viewport) {
+bool TextureCacheMetal::ComputeSamplingRegion(const TransformedVertex *vertices, const MTLViewport &viewport, std::array<int, 4> *region) const {
 #if PPSSPP_PLATFORM(MAC)
-	temporaryRegion_.reset(nullptr);
 	if (!geScaledTexture_) {
 		return false;
 	}
-	// A previous quad may have bound another region of this same PSP texture.
-	geTexture_ = geScaledTexture_->Native();
 	if (!vertices || geSamplerKey_.minFilt || geSamplerKey_.magFilt || geSamplerKey_.mipEnable ||
 		gstate_c.textureIsFramebuffer || gstate_c.textureIsArray || gstate_c.needShaderTexClamp || gstate_c.curTextureIs3D ||
 		viewport.width <= 0 || viewport.height <= 0 || gstate_c.curRTWidth <= 0 || gstate_c.curRTHeight <= 0) {
 		return false;
 	}
-	auto &source = scaledSources_.at(geScaledTexture_);
+	const auto &source = scaledSources_.at(geScaledTexture_);
 	float minU = vertices[0].u, maxU = minU;
 	float minV = vertices[0].v, maxV = minV;
 	for (int i = 0; i < 4; ++i) {
@@ -509,10 +509,30 @@ bool TextureCacheMetal::BindSamplingRegion(const TransformedVertex *vertices, Tr
 	if (width <= 0 || height <= 0 || (width == source.width && height == source.height)) {
 		return false;
 	}
-	const std::array<int, 4> key{x, y, right, bottom};
+	*region = {x, y, right, bottom};
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool TextureCacheMetal::BindSamplingRegion(const TransformedVertex *vertices, TransformedVertex *adjusted, const std::array<int, 4> *regionBounds) {
+#if PPSSPP_PLATFORM(MAC)
+	temporaryRegion_.reset(nullptr);
+	if (!geScaledTexture_) {
+		return false;
+	}
+	geTexture_ = geScaledTexture_->Native();
+	if (!vertices || !regionBounds) {
+		return false;
+	}
+	auto &source = scaledSources_.at(geScaledTexture_);
+	const auto &key = *regionBounds;
+	const int x = key[0], y = key[1], width = key[2] - x, height = key[3] - y;
 	auto region = source.regions.find(key);
 	id<MTLTexture> uncached = nil;
 	if (region == source.regions.end()) {
+		++regionMetrics_.misses;
 		std::string error;
 		auto &context = manager_->Context();
 		auto input = context.ReserveUpload((size_t)width * height * 4, &error);
@@ -531,25 +551,32 @@ bool TextureCacheMetal::BindSamplingRegion(const TransformedVertex *vertices, Tr
 		}
 		const size_t bytes = texture->Native().width * texture->Native().height * 4;
 		constexpr size_t REGION_CACHE_BYTES = 16 * 1024 * 1024;
-		// Encoded draws retain their textures until completion. Dropping cached
-		// regions here bounds retained memory without synchronizing with the GPU.
-		if (regionBytes_ + bytes > REGION_CACHE_BYTES || regionCount_ >= 256) {
-			for (auto &item : scaledSources_) {
-				item.second.regions.clear();
-			}
-			regionBytes_ = 0;
-			regionCount_ = 0;
-		}
 		if (bytes > REGION_CACHE_BYTES) {
 			temporaryRegion_ = texture;
 			uncached = texture->Native();
 		} else {
-			region = source.regions.emplace(key, texture).first;
+			// Encoders retain referenced textures through GPU completion. Evict only
+			// enough least-recently-used regions to bound the persistent cache.
+			while (regionBytes_ > REGION_CACHE_BYTES - bytes || regionCount_ >= 256) {
+				const auto &oldest = regionLRU_.front();
+				auto &regions = scaledSources_.at(oldest.first).regions;
+				auto evicted = regions.find(oldest.second);
+				regionBytes_ -= evicted->second.bytes;
+				regions.erase(evicted);
+				regionLRU_.pop_front();
+				--regionCount_;
+				++regionMetrics_.evictions;
+			}
+			regionLRU_.emplace_back(geScaledTexture_, key);
+			region = source.regions.emplace(key, ScaledRegion{texture, std::prev(regionLRU_.end()), bytes}).first;
 			regionBytes_ += bytes;
 			++regionCount_;
 		}
+	} else {
+		++regionMetrics_.hits;
+		regionLRU_.splice(regionLRU_.end(), regionLRU_, region->second.lru);
 	}
-	geTexture_ = uncached ? uncached : region->second->Native();
+	geTexture_ = uncached ? uncached : region->second.texture->Native();
 	for (int i = 0; i < 4; ++i) {
 		adjusted[i] = vertices[i];
 		adjusted[i].u = (vertices[i].u * source.width - x) / width;
@@ -634,7 +661,8 @@ void TextureCacheMetal::ReleaseTexture(MetalTexCacheEntry *entry, bool deleteThe
 			sourceBytes_ -= source->second.pixels.size() * sizeof(uint32_t);
 			regionCount_ -= source->second.regions.size();
 			for (const auto &region : source->second.regions) {
-				regionBytes_ -= region.second->Native().width * region.second->Native().height * 4;
+				regionBytes_ -= region.second.bytes;
+				regionLRU_.erase(region.second.lru);
 			}
 			scaledSources_.erase(source);
 		}
@@ -661,7 +689,7 @@ void TextureCacheMetal::ApplySamplerByKey(const SamplerCacheKey &key) {
 		return;
 	}
 	std::string error;
-	auto sampler = samplers_.GetOrCreate(manager_->Context().Device(), key, &error);
+	auto sampler = GetSampler(key, &error);
 	if (!sampler) {
 		ERROR_LOG(Log::G3D, "%s", error.c_str());
 	}
@@ -670,6 +698,10 @@ void TextureCacheMetal::ApplySamplerByKey(const SamplerCacheKey &key) {
 	if (shaderManager_) {
 		static_cast<ShaderManagerMetal *>(shaderManager_)->SetSamplerLodBias(key.mipEnable ? key.lodBias / 256.0f : 0.0f);
 	}
+}
+
+id<MTLSamplerState> TextureCacheMetal::GetSampler(const SamplerCacheKey &key, std::string *error) {
+	return samplers_.GetOrCreate(manager_ ? manager_->Context().Device() : nil, key, error);
 }
 
 void TextureCacheMetal::BindAsClutTexture(Draw::Texture *texture, bool smooth) {
@@ -684,7 +716,7 @@ void TextureCacheMetal::BindAsClutTexture(Draw::Texture *texture, bool smooth) {
 	key.minFilt = smooth;
 	key.magFilt = smooth;
 	std::string error;
-	geClutSampler_ = samplers_.GetOrCreate(manager_->Context().Device(), key, &error);
+	geClutSampler_ = GetSampler(key, &error);
 	manager_->SetNativeSampler(ShaderBinding::DRAW_BINDING_DEPAL_TEXTURE, geClutSampler_);
 	if (!error.empty()) {
 		ERROR_LOG(Log::G3D, "%s", error.c_str());

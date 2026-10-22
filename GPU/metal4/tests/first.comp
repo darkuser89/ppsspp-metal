@@ -1,0 +1,12 @@
+// Copyright (c) 2012- PPSSPP Project.
+// This program is free software, licensed under GPL-2.0-or-later.
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(push_constant) uniform Params { ivec2 srcSize; ivec2 dstSize; } params;
+layout(set=0, binding=0, rgba16f) writeonly uniform image2D outputImage;
+layout(set=0, binding=1, std430) readonly buffer Input { uint pixels[]; };
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(p, params.dstSize))) { return; }
+	imageStore(outputImage, p, vec4(float(pixels[(p.y / 2) * params.srcSize.x + p.x]) / 32.0, 0.25, 0.5, 1.0));
+}

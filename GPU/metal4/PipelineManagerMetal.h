@@ -11,6 +11,7 @@
 #pragma pop_macro("ABS")
 
 #include <condition_variable>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -45,12 +46,32 @@ struct MetalGEPipeline {
 	uint32_t textureMask = 0;
 };
 
+// Native compiler elapsed time; asynchronous intervals may overlap.
+struct MetalPipelineMetrics {
+	uint64_t syncCompiles = 0;
+	uint64_t asyncCompiles = 0;
+	uint64_t waits = 0;
+	uint64_t archiveSaves = 0;
+	uint64_t archivePipelines = 0;
+	uint64_t cacheSaves = 0;
+	uint64_t archiveDeferrals = 0;
+	uint64_t archiveFailures = 0;
+	double syncSeconds = 0.0;
+	double asyncSeconds = 0.0;
+	double waitSeconds = 0.0;
+	double archiveSeconds = 0.0;
+	double cacheSaveSeconds = 0.0;
+};
+
 // Native GE pipelines use the shared decoder layout for hardware transform and
 // TransformedVertex for CPU transform. Raster, viewport, stencil reference and
 // blend constants are dynamic encoder state, not render pipeline identity.
 class PipelineManagerMetal {
 public:
 	explicit PipelineManagerMetal(Metal::RenderManager *manager) : manager_(manager) {}
+	// Called on the render owner thread; completion callbacks only update each entry.
+	bool PipelinesPending() const;
+	MetalPipelineMetrics Metrics() const;
 	void Clear();
 	void DeviceLost();
 	void DeviceRestore(Metal::RenderManager *manager);
@@ -83,14 +104,26 @@ private:
 	const MetalGEPipeline *GetOrCreateInternal(ShaderManagerMetal &shaders, VShaderID vertexID, FShaderID fragmentID,
 		const DecVtxFormat *decoded, const MetalGEBlendState &blend, MTLPixelFormat colorFormat,
 		MTLPixelFormat depthStencilFormat, std::string *error, int sampleCount, bool async);
+	struct MetricsState {
+		std::mutex mutex;
+		MetalPipelineMetrics value;
+		uint32_t activeCompiles = 0;
+	};
+	// Native callbacks can outlive Clear/DeviceLost and the owner itself.
+	std::shared_ptr<MetricsState> metrics_ = std::make_shared<MetricsState>();
 	Metal::RenderManager *manager_ = nullptr;
 	const ShaderManagerMetal *shaderOwner_ = nullptr;
 	uint64_t shaderGeneration_ = 0;
+	PipelineKey lastKey_{};
+	const MetalGEPipeline *lastPipeline_ = nullptr;
 	std::map<PipelineKey, MetalGEPipeline> pipelines_;
 	std::map<PipelineKey, std::shared_ptr<PendingPipeline>> pending_;
 	std::map<DepthKey, id<MTLDepthStencilState>> depthStates_;
 #if PPSSPP_PLATFORM(MAC)
-	id<MTL4Archive> binaryArchive_ = nil;
+	mutable NSArray<id<MTL4Archive>> *binaryArchives_ = nil;
+	mutable uint32_t binaryArchiveBank_ = 0;
+	mutable Path binaryArchiveCachePath_;
 	mutable std::vector<PipelineKey> binaryArchiveKeys_;
+	mutable std::array<uint64_t, 8> binaryArchiveHashes_{};
 #endif
 };

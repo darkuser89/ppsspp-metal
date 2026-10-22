@@ -28,3 +28,16 @@ void MetalFixPostShaderOrder(std::vector<std::string> *names);
 
 std::vector<TextureShaderInfo> MetalTextureShaderList();
 bool MetalTextureShaderSupported(std::string_view name);
+// Structural support; Configure also validates resource bindings and native compilation.
+bool MetalTextureShaderSupported(const MetalTextureShaderInfo &info);
+
+// Native macOS callers share one metadata load while other backends keep the
+// official registry. Metal-only shader fields stay in the private registry.
+namespace Metal::PostShaders {
+void ReloadAllPostShaderInfo(Draw::DrawContext *draw);
+const ShaderInfo *GetPostShaderInfo(std::string_view name);
+const TextureShaderInfo *GetTextureShaderInfo(std::string_view name);
+const std::vector<ShaderInfo> &GetAllPostShaderInfo();
+std::vector<const ShaderInfo *> GetFullPostShadersChain(const std::vector<std::string> &names);
+void FixPostShaderOrder(std::vector<std::string> *names);
+}

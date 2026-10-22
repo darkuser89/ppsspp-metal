@@ -348,11 +348,11 @@ const MetalCommandTableEntry metalCommandTable[] = {
 	{ GE_CMD_TRANSFERSIZE, 0 },
 	{ GE_CMD_TRANSFERSTART, FLAG_EXECUTE | FLAG_READS_PC, 0, &GPUCommonHWMetal::Execute_BlockTransferStart },
 
-	// We don't use the dither table.
-	{ GE_CMD_DITH0 },
-	{ GE_CMD_DITH1 },
-	{ GE_CMD_DITH2 },
-	{ GE_CMD_DITH3 },
+	// The raster uniforms snapshot the dither matrix when the batch is flushed.
+	{ GE_CMD_DITH0, FLAG_FLUSHBEFOREONCHANGE },
+	{ GE_CMD_DITH1, FLAG_FLUSHBEFOREONCHANGE },
+	{ GE_CMD_DITH2, FLAG_FLUSHBEFOREONCHANGE },
+	{ GE_CMD_DITH3, FLAG_FLUSHBEFOREONCHANGE },
 
 	// These handle their own flushing.
 	{ GE_CMD_WORLDMATRIXNUMBER, FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC, 0, &GPUCommonHWMetal::Execute_WorldMtxNum },
@@ -569,10 +569,9 @@ bool GPUCommonHWMetal::PresentedThisFrame() const {
 void GPUCommonHWMetal::DoState(PointerWrap &p) {
 	GPUCommon::DoState(p);
 
-	// TODO: Some of these things may not be necessary.
 	// None of these are necessary when saving.
 	if (p.mode == p.MODE_READ && !PSP_CoreParameter().frozen) {
-		textureCache_->Clear(true);
+		textureCache_->RecheckAllAfterLoad();
 
 		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE);
 		framebufferManager_->DestroyAllFBOs();
@@ -932,6 +931,12 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 	// We store it in the cache so it can be modified for blue-to-alpha, next.
 	gstate_c.framebufFormat = gstate.FrameBufFormat();
 
+	const u32 count = op & 0xFFFF;
+	// Draws nothing, and the vertex address doesn't have to be valid (NFS Most Wanted sends one with it 0 every frame).
+	if (count == 0) {
+		return;
+	}
+
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
 		ERROR_LOG(Log::G3D, "Bad vertex address %08x!", gstate_c.vertexAddr);
 		return;
@@ -977,7 +982,6 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 		vertexCost_ = EstimatePerVertexCost();
 	}
 
-	const u32 count = op & 0xFFFF;
 	// Must check this after SetRenderFrameBuffer so we know SKIPDRAW_NON_DISPLAYED_FB.
 	if (gstate_c.skipDrawReason & (SKIPDRAW_SKIPFRAME | SKIPDRAW_NON_DISPLAYED_FB)) {
 		// Rough estimate, not sure what's correct.
@@ -1070,10 +1074,24 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 
 	int bytesRead = 0;
 
+	// A logic op done in the shader reads a copy of the framebuffer taken when the batch is drawn.
+	const bool readsFramebufferPerDraw = PSP_CoreParameter().compat.flags().SeparateLogicOpDraws && gstate.isLogicOpEnabled() && gstate.getLogicOp() != GE_LOGIC_COPY &&
+		!gstate_c.Use(GPU_USE_LOGIC_OP) && !gstate_c.Use(GPU_USE_FRAMEBUFFER_FETCH);
+
 	// If the first one in a batch passes, let's assume the whole batch passes.
 	// Cuts down on checking, while not losing that much efficiency.
 	bool onePassed = false;
-	if (passCulling) {
+	if (passCulling && readsFramebufferPerDraw && prim == GE_PRIM_RECTANGLES && count > 2 && !inds) {
+		// Its rectangles can overlap too.
+		const int vertexSize = decoder->VertexSize();
+		for (int i = 0; i + 1 < count; i += 2) {
+			int rectBytesRead = 0;
+			drawEngineCommon_->SubmitPrim((const u8 *)verts + i * vertexSize, nullptr, prim, 2, decoder, vertTypeID, true, &rectBytesRead, flags);
+			drawEngineCommon_->Flush();
+			bytesRead += rectBytesRead;
+		}
+		canExtend = false;
+	} else if (passCulling) {
 		if (!drawEngineCommon_->SubmitPrim(verts, inds, prim, count, decoder, vertTypeID, true, &bytesRead, flags)) {
 			canExtend = false;
 		}
@@ -1102,8 +1120,11 @@ void GPUCommonHWMetal::Execute_Prim(u32 op, u32 diff) {
 	// between each prim, we just change the triangle winding right here to still be able to join draw calls.
 	constexpr uint32_t vtypeCheckMask = ~GE_VTYPE_WEIGHTCOUNT_MASK;
 
-	if (!useFastRunLoop_)
-		goto bail;  // we're either recording or stepping.
+	if (readsFramebufferPerDraw) {
+		drawEngineCommon_->Flush();
+	}
+	if (!useFastRunLoop_ || readsFramebufferPerDraw)
+		goto bail;  // we're either recording or stepping, or each draw has to go alone.
 
 	while (src != stall) {
 		uint32_t data = *src;
@@ -1373,7 +1394,12 @@ void GPUCommonHWMetal::Execute_Bezier(u32 op, u32 diff) {
 	surface.num_patches_v = (surface.num_points_v - 1) / 3;
 	surface.primType = gstate.getPatchPrimitiveType();
 	surface.patchFacing = gstate.patchfacing & 1;
+	// Keep overlapping curve surfaces coincident through GE-precision tessellation.
+#if PPSSPP_PLATFORM(MAC)
+	surface.geExact = true;
+#else
 	surface.geExact = PSP_CoreParameter().compat.flags().AccurateSplines;
+#endif
 
 	SetDrawType(DRAW_BEZIER, PatchPrimToPrim(surface.primType));
 
@@ -1446,7 +1472,12 @@ void GPUCommonHWMetal::Execute_Spline(u32 op, u32 diff) {
 	surface.num_patches_v = surface.num_points_v - 3;
 	surface.primType = gstate.getPatchPrimitiveType();
 	surface.patchFacing = gstate.patchfacing & 1;
+	// Keep overlapping curve surfaces coincident through GE-precision tessellation.
+#if PPSSPP_PLATFORM(MAC)
+	surface.geExact = true;
+#else
 	surface.geExact = PSP_CoreParameter().compat.flags().AccurateSplines;
+#endif
 
 	SetDrawType(DRAW_SPLINE, PatchPrimToPrim(surface.primType));
 
@@ -1686,6 +1717,10 @@ void GPUCommonHWMetal::BeginHostFrame(const DisplayLayoutConfig &config) {
 	UpdateMSAALevel(draw_);
 	CheckConfigChanged(config);
 	CheckDisplayResized();
+	// Configuration changes can bypass the normal render-resize notification.
+	if (framebufferManager_ && framebufferManager_->UseBufferedRendering() == g_Config.bSkipBufferEffects) {
+		renderResized_ = true;
+	}
 	CheckRenderResized(config);
 
 	// After the resizes, which ask for the post shaders to be rebuilt at the new size.
@@ -2437,7 +2472,7 @@ bool GPUCommonHWMetal::PerformWriteColorFromMemory(u32 dest, int size) {
 }
 
 void GPUCommonHWMetal::PerformWriteFormattedFromMemory(u32 addr, int size, int frameWidth, GEBufferFormat format, int rectWidth) {
-	NoteVideoRange(addr, (u32)size);
+	NoteVideoRange(addr, (u32)size, (u32)(rectWidth * BufferFormatBytesPerPixel(format)));
 	if (Memory::IsVRAMAddress(addr)) {
 		framebufferManager_->PerformWriteFormattedFromMemory(addr, size, frameWidth, format, rectWidth);
 	}

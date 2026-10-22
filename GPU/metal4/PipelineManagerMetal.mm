@@ -4,12 +4,15 @@
 #include "GPU/metal4/PipelineManagerMetal.h"
 
 #include <algorithm>
+#include <iterator>
 #include "Common/File/FileUtil.h"
 #include "Common/Log.h"
 #include "Common/TimeUtil.h"
 #include "Core/Config.h"
+#include "GPU/Common/ShaderCommon.h"
 #include "GPU/GPUDefinitions.h"
 #include "GPU/GPUState.h"
+#include "ext/xxhash.h"
 
 #include <climits>
 #include <vector>
@@ -17,7 +20,8 @@
 namespace {
 
 constexpr uint32_t METAL_PIPELINE_CACHE_MAGIC = 0x4D50534F;
-constexpr uint32_t METAL_PIPELINE_CACHE_VERSION = 4;
+constexpr uint32_t METAL_PIPELINE_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 6 : 5;
+constexpr uint32_t MAX_BINARY_ARCHIVES = 8;
 constexpr uint32_t MAX_CACHED_PIPELINES = 8192;
 
 struct MetalPipelineCacheHeader {
@@ -28,7 +32,45 @@ struct MetalPipelineCacheHeader {
 	uint64_t deviceHash;
 	uint64_t buildHash;
 	uint32_t count;
+#if PPSSPP_PLATFORM(MAC)
+	uint32_t archiveBank;
+	uint32_t archiveCount;
+	std::array<uint64_t, MAX_BINARY_ARCHIVES> archiveHashes;
+#endif
 };
+
+static_assert(sizeof(MetalPipelineCacheHeader) == (PPSSPP_PLATFORM(MAC) ? 112 : 40));
+
+Path BinaryArchivePath(const Path &filename, uint32_t bank, uint32_t index) {
+	return filename.WithExtraExtension(".metal4archive." + std::to_string(bank) + "." + std::to_string(index));
+}
+
+#if PPSSPP_PLATFORM(MAC)
+bool BinaryArchiveHash(const Path &filename, uint64_t *hash) {
+	FILE *file = File::OpenCFile(filename, "rb");
+	if (!file) {
+		return false;
+	}
+	XXH3_state_t *state = XXH3_createState();
+	if (!state) {
+		fclose(file);
+		return false;
+	}
+	XXH3_64bits_reset(state);
+	uint8_t buffer[65536];
+	size_t size;
+	uint64_t bytes = 0;
+	while ((size = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+		XXH3_64bits_update(state, buffer, size);
+		bytes += size;
+	}
+	const bool valid = bytes != 0 && !ferror(file);
+	*hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
+	fclose(file);
+	return valid;
+}
+#endif
 
 uint64_t CacheStringHash(const char *value) {
 	uint64_t hash = 14695981039346656037ULL;
@@ -119,14 +161,30 @@ MTLVertexDescriptor *MakeLayout(const MetalGEVertexShader &shader, const DecVtxF
 
 }
 
+MetalPipelineMetrics PipelineManagerMetal::Metrics() const {
+	std::lock_guard<std::mutex> lock(metrics_->mutex);
+	return metrics_->value;
+}
+
+bool PipelineManagerMetal::PipelinesPending() const {
+	for (const auto &entry : pending_) {
+		std::lock_guard<std::mutex> lock(entry.second->mutex);
+		if (!entry.second->complete) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void PipelineManagerMetal::Clear() {
+	lastPipeline_ = nullptr;
 	pipelines_.clear();
 	pending_.clear();
 	depthStates_.clear();
 	shaderOwner_ = nullptr;
 	shaderGeneration_ = 0;
 #if PPSSPP_PLATFORM(MAC)
-	binaryArchive_ = nil;
+	binaryArchives_ = nil;
 	binaryArchiveKeys_.clear();
 #endif
 }
@@ -146,9 +204,15 @@ bool PipelineManagerMetal::LoadCache(const Path &filename, ShaderManagerMetal &s
 		return false;
 	}
 #if PPSSPP_PLATFORM(MAC)
-	binaryArchive_ = nil;
+	binaryArchives_ = nil;
 	binaryArchiveKeys_.clear();
 #endif
+	// Reject damaged IDs before invoking shader generation or native compilation.
+	const uint64_t bytes = File::GetFileSize(filename);
+	if (bytes < sizeof(MetalPipelineCacheHeader) + 8 || bytes > sizeof(MetalPipelineCacheHeader) + MAX_CACHED_PIPELINES * sizeof(PipelineKey) + 8 ||
+		!VerifyShaderCacheChecksum(filename)) {
+		return false;
+	}
 	FILE *file = File::OpenCFile(filename, "rb");
 	if (!file) {
 		return false;
@@ -158,7 +222,11 @@ bool PipelineManagerMetal::LoadCache(const Path &filename, ShaderManagerMetal &s
 		header.magic == METAL_PIPELINE_CACHE_MAGIC && header.version == METAL_PIPELINE_CACHE_VERSION &&
 		header.useFlags == gstate_c.GetUseFlags() && header.vendorChecks == (uint32_t)g_Config.bVendorBugChecksEnabled &&
 		header.deviceHash == CacheStringHash(manager_->Context().DeviceName().c_str()) &&
-		header.buildHash == CacheStringHash(PPSSPP_GIT_VERSION) && header.count <= MAX_CACHED_PIPELINES;
+		header.buildHash == CacheStringHash(PPSSPP_GIT_VERSION) && header.count <= MAX_CACHED_PIPELINES &&
+		bytes == sizeof(header) + header.count * sizeof(PipelineKey) + 8;
+#if PPSSPP_PLATFORM(MAC)
+	valid &= header.archiveBank <= 1 && header.archiveCount <= MAX_BINARY_ARCHIVES;
+#endif
 	std::vector<PipelineKey> keys;
 	if (valid) {
 		keys.resize(header.count);
@@ -169,18 +237,33 @@ bool PipelineManagerMetal::LoadCache(const Path &filename, ShaderManagerMetal &s
 		return false;
 	}
 #if PPSSPP_PLATFORM(MAC)
-	const Path archivePath = filename.WithExtraExtension(".metal4archive");
-	if (File::Exists(archivePath)) {
-		NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:archivePath.c_str()]];
-		NSError *nativeError = nil;
-		binaryArchive_ = [manager_->Context().Device() newArchiveWithURL:url error:&nativeError];
-		if (!binaryArchive_) {
-			WARN_LOG(Log::G3D, "Ignoring invalid Metal GE binary archive: %s",
-				nativeError.localizedDescription.UTF8String ?: "unknown error");
-		} else {
-			binaryArchiveKeys_ = keys;
-			std::sort(binaryArchiveKeys_.begin(), binaryArchiveKeys_.end());
+	NSMutableArray<id<MTL4Archive>> *archives = [NSMutableArray new];
+	for (uint32_t i = 0; i < header.archiveCount; ++i) {
+		const Path path = BinaryArchivePath(filename, header.archiveBank, i);
+		uint64_t hash;
+		// Validate opaque archive bytes before passing them to the native loader.
+		if (!BinaryArchiveHash(path, &hash) || hash != header.archiveHashes[i]) {
+			WARN_LOG(Log::G3D, "Ignoring missing or damaged Metal GE binary archives");
+			[archives removeAllObjects];
+			break;
 		}
+		NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+		NSError *nativeError = nil;
+		id<MTL4Archive> archive = [manager_->Context().Device() newArchiveWithURL:url error:&nativeError];
+		if (!archive) {
+			WARN_LOG(Log::G3D, "Ignoring incomplete Metal GE binary archives: %s", nativeError.localizedDescription.UTF8String ?: "missing file");
+			[archives removeAllObjects];
+			break;
+		}
+		[archives addObject:archive];
+	}
+	if (archives.count) {
+		binaryArchives_ = archives;
+		binaryArchiveBank_ = header.archiveBank;
+		binaryArchiveCachePath_ = filename;
+		binaryArchiveKeys_ = keys;
+		binaryArchiveHashes_ = header.archiveHashes;
+		std::sort(binaryArchiveKeys_.begin(), binaryArchiveKeys_.end());
 	}
 #endif
 	const double start = time_now_d();
@@ -253,6 +336,24 @@ void PipelineManagerMetal::SaveCache(const Path &filename) const {
 		(shaderOwner_ && (shaderGeneration_ != shaderOwner_->CacheGeneration() || !shaderOwner_->CacheMatchesEnvironment()))) {
 		return;
 	}
+	struct SaveTimer {
+		std::shared_ptr<MetricsState> metrics;
+		double start = time_now_d();
+		~SaveTimer() {
+			std::lock_guard<std::mutex> lock(metrics->mutex);
+			metrics->value.cacheSaveSeconds += time_now_d() - start;
+			++metrics->value.cacheSaves;
+		}
+	} timer{metrics_};
+	{
+		std::lock_guard<std::mutex> lock(metrics_->mutex);
+		// Discarded generations can still have native compiler callbacks in flight.
+		// Defer file replacement until all users of the loaded archives finish.
+		if (metrics_->activeCompiles) {
+			++metrics_->value.archiveDeferrals;
+			return;
+		}
+	}
 	std::vector<PipelineKey> keys;
 	keys.reserve(pipelines_.size() + pending_.size());
 	for (const auto &entry : pipelines_) {
@@ -264,55 +365,22 @@ void PipelineManagerMetal::SaveCache(const Path &filename) const {
 			keys.push_back(entry.first);
 		}
 	}
+	std::sort(keys.begin(), keys.end());
+#if PPSSPP_PLATFORM(MAC)
+	bool haveArchives = binaryArchiveCachePath_ == filename && binaryArchives_.count > 0;
+	for (NSUInteger i = 0; haveArchives && i < binaryArchives_.count; ++i) {
+		haveArchives = File::Exists(BinaryArchivePath(filename, binaryArchiveBank_, i));
+	}
+	if (haveArchives) {
+		// Preserve already archived IDs even if a failed prewarm has not been drawn.
+		keys.insert(keys.end(), binaryArchiveKeys_.begin(), binaryArchiveKeys_.end());
+		std::sort(keys.begin(), keys.end());
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+	}
+#endif
 	if (keys.size() > MAX_CACHED_PIPELINES) {
 		return;
 	}
-#if PPSSPP_PLATFORM(MAC)
-	// Capture a complete snapshot separately from live asynchronous compilation.
-	// Flushing a serializer clears it, so serializing only newly compiled states
-	// would lose earlier pipelines on the second save.
-	const Path archivePath = filename.WithExtraExtension(".metal4archive");
-	std::vector<PipelineKey> sortedKeys = keys;
-	std::sort(sortedKeys.begin(), sortedKeys.end());
-	if (!keys.empty() && (binaryArchiveKeys_ != sortedKeys || !File::Exists(archivePath))) {
-		const double archiveStart = time_now_d();
-		NSError *nativeError = nil;
-		MTL4PipelineDataSetSerializerDescriptor *serializerDesc = [[MTL4PipelineDataSetSerializerDescriptor alloc] init];
-		serializerDesc.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
-		id<MTL4PipelineDataSetSerializer> serializer = [manager_->Context().Device() newPipelineDataSetSerializerWithDescriptor:serializerDesc];
-		MTL4CompilerDescriptor *compilerDesc = [[MTL4CompilerDescriptor alloc] init];
-		compilerDesc.pipelineDataSetSerializer = serializer;
-		id<MTL4Compiler> compiler = [manager_->Context().Device() newCompilerWithDescriptor:compilerDesc error:&nativeError];
-		MTL4CompilerTaskOptions *options = [[MTL4CompilerTaskOptions alloc] init];
-		if (binaryArchive_) {
-			options.lookupArchives = @[binaryArchive_];
-		}
-		bool captured = serializer && compiler;
-		for (const auto &entry : pipelines_) {
-			captured = captured && entry.second.descriptor && [compiler newRenderPipelineStateWithDescriptor:entry.second.descriptor compilerTaskOptions:options error:&nativeError];
-		}
-		for (const auto &entry : pending_) {
-			std::lock_guard<std::mutex> lock(entry.second->mutex);
-			if (entry.second->complete && entry.second->pipeline.state) {
-				captured = captured && entry.second->pipeline.descriptor && [compiler newRenderPipelineStateWithDescriptor:entry.second->pipeline.descriptor compilerTaskOptions:options error:&nativeError];
-			}
-		}
-		const Path tempPath = archivePath.WithExtraExtension(".tmp");
-		File::Delete(tempPath, true);
-		NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:tempPath.c_str()]];
-		const bool archived = captured && [serializer serializeAsArchiveAndFlushToURL:url error:&nativeError] && File::Rename(tempPath, archivePath);
-		if (!archived) {
-			File::Delete(tempPath, true);
-			WARN_LOG(Log::G3D, "Could not save Metal 4 GE binary archive: %s", nativeError.localizedDescription.UTF8String ?: "unknown error");
-		} else {
-			INFO_LOG(Log::G3D, "Saved %zu Metal 4 GE pipeline binaries in %.1f ms", keys.size(), (time_now_d() - archiveStart) * 1000.0);
-			binaryArchiveKeys_ = std::move(sortedKeys);
-		}
-	} else if (keys.empty()) {
-		File::Delete(archivePath, true);
-		binaryArchiveKeys_.clear();
-	}
-#endif
 	MetalPipelineCacheHeader header{};
 	header.magic = METAL_PIPELINE_CACHE_MAGIC;
 	header.version = METAL_PIPELINE_CACHE_VERSION;
@@ -321,18 +389,146 @@ void PipelineManagerMetal::SaveCache(const Path &filename) const {
 	header.deviceHash = CacheStringHash(manager_->Context().DeviceName().c_str());
 	header.buildHash = CacheStringHash(PPSSPP_GIT_VERSION);
 	header.count = (uint32_t)keys.size();
-	FILE *file = File::OpenCFile(filename, "wb");
-	if (!file) {
+#if PPSSPP_PLATFORM(MAC)
+	std::vector<PipelineKey> additions;
+	if (haveArchives) {
+		std::set_difference(keys.begin(), keys.end(), binaryArchiveKeys_.begin(), binaryArchiveKeys_.end(), std::back_inserter(additions));
+	} else {
+		additions = keys;
+	}
+	const bool compact = !haveArchives || (!additions.empty() && binaryArchives_.count >= MAX_BINARY_ARCHIVES);
+	uint32_t bank = binaryArchiveBank_;
+	bool preservePreviousArchive = haveArchives;
+	NSMutableArray<id<MTL4Archive>> *archives = haveArchives ? [binaryArchives_ mutableCopy] : [NSMutableArray new];
+	header.archiveHashes = haveArchives ? binaryArchiveHashes_ : std::array<uint64_t, MAX_BINARY_ARCHIVES>{};
+	if (compact) {
+		// Write into the other bank, preserving the last complete cache on failure.
+		MetalPipelineCacheHeader previous{};
+		FILE *old = File::OpenCFile(filename, "rb");
+		if (old) {
+			if (fread(&previous, sizeof(previous), 1, old) == 1 && previous.magic == METAL_PIPELINE_CACHE_MAGIC &&
+				previous.version == METAL_PIPELINE_CACHE_VERSION && previous.archiveBank <= 1) {
+				bank = previous.archiveBank;
+				preservePreviousArchive |= previous.archiveCount > 0 && previous.archiveCount <= MAX_BINARY_ARCHIVES && VerifyShaderCacheChecksum(filename);
+			}
+			fclose(old);
+		}
+		bank = 1 - bank;
+		archives = [NSMutableArray new];
+		header.archiveHashes = {};
+		additions = keys;
+	}
+	Path createdArchive;
+	if (!additions.empty()) {
+		const double start = time_now_d();
+		NSError *nativeError = nil;
+		MTL4PipelineDataSetSerializerDescriptor *serializerDesc = [MTL4PipelineDataSetSerializerDescriptor new];
+		serializerDesc.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
+		id<MTL4PipelineDataSetSerializer> serializer = [manager_->Context().Device() newPipelineDataSetSerializerWithDescriptor:serializerDesc];
+		MTL4CompilerDescriptor *compilerDesc = [MTL4CompilerDescriptor new];
+		compilerDesc.pipelineDataSetSerializer = serializer;
+		id<MTL4Compiler> compiler = [manager_->Context().Device() newCompilerWithDescriptor:compilerDesc error:&nativeError];
+		MTL4CompilerTaskOptions *options = [MTL4CompilerTaskOptions new];
+		options.lookupArchives = haveArchives ? binaryArchives_ : nil;
+		bool captured = serializer && compiler;
+		uint64_t capturedPipelines = 0;
+		for (const auto &key : additions) {
+			if (!captured) {
+				break;
+			}
+			MTL4RenderPipelineDescriptor *descriptor = nil;
+			auto ready = pipelines_.find(key);
+			if (ready != pipelines_.end()) {
+				descriptor = ready->second.descriptor;
+			} else {
+				auto pending = pending_.find(key);
+				if (pending != pending_.end()) {
+					std::lock_guard<std::mutex> lock(pending->second->mutex);
+					descriptor = pending->second->pipeline.descriptor;
+				}
+			}
+			if (descriptor) {
+				++capturedPipelines;
+				captured = [compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:options error:&nativeError] != nil;
+			} else {
+				captured = false;
+			}
+		}
+		const Path archivePath = BinaryArchivePath(filename, bank, (uint32_t)archives.count);
+		const Path temporary = archivePath.WithExtraExtension(".tmp");
+		NSURL *tempURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:temporary.c_str()]];
+		bool archived = captured && !(File::Exists(temporary) && File::IsDirectory(temporary)) && [serializer serializeAsArchiveAndFlushToURL:tempURL error:&nativeError] &&
+			BinaryArchiveHash(temporary, &header.archiveHashes[archives.count]) && File::Rename(temporary, archivePath);
+		id<MTL4Archive> archive = nil;
+		if (archived) {
+			NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:archivePath.c_str()]];
+			archive = [manager_->Context().Device() newArchiveWithURL:url error:&nativeError];
+			archived = archive != nil;
+			if (!archived) {
+				File::Delete(archivePath, true);
+			}
+		}
+		{
+			std::lock_guard<std::mutex> lock(metrics_->mutex);
+			metrics_->value.archiveSeconds += time_now_d() - start;
+			++metrics_->value.archiveSaves;
+			metrics_->value.archivePipelines += capturedPipelines;
+			metrics_->value.archiveFailures += !archived;
+		}
+		if (!archived) {
+			File::Delete(temporary, true);
+			WARN_LOG(Log::G3D, "Could not save Metal 4 GE binary archive: %s", nativeError.localizedDescription.UTF8String ?: "archive capture or file I/O failed");
+			if (preservePreviousArchive) {
+				return;
+			}
+			// Native archives are optional: retain IDs for compiler prewarming when
+			// the driver cannot create a usable archive and no complete bank exists.
+			archives = [NSMutableArray new];
+			header.archiveHashes = {};
+		} else {
+			createdArchive = archivePath;
+			[archives addObject:archive];
+		}
+	}
+	header.archiveBank = bank;
+	header.archiveCount = (uint32_t)archives.count;
+#endif
+	const Path temporary = filename.WithExtraExtension(".tmp");
+	FILE *file = File::OpenCFile(temporary, "wb");
+	bool valid = false;
+	if (file) {
+		valid = fwrite(&header, sizeof(header), 1, file) == 1;
+		for (const auto &key : keys) {
+			valid &= fwrite(key.data(), sizeof(uint64_t), key.size(), file) == key.size();
+		}
+		valid &= fclose(file) == 0;
+		valid = valid && AppendShaderCacheChecksum(temporary) && File::Rename(temporary, filename);
+	}
+	if (!valid) {
+		File::Delete(temporary, true);
+#if PPSSPP_PLATFORM(MAC)
+		if (createdArchive.Valid()) {
+			File::Delete(createdArchive, true);
+		}
+#endif
 		return;
 	}
-	bool valid = fwrite(&header, sizeof(header), 1, file) == 1;
-	for (const auto &key : keys) {
-		valid &= fwrite(key.data(), sizeof(uint64_t), key.size(), file) == key.size();
+#if PPSSPP_PLATFORM(MAC)
+	binaryArchives_ = archives;
+	binaryArchiveBank_ = bank;
+	binaryArchiveCachePath_ = filename;
+	binaryArchiveKeys_ = std::move(keys);
+	binaryArchiveHashes_ = header.archiveHashes;
+	// Metadata now refers only to the complete new bank and its published parts.
+	for (uint32_t oldBank = 0; oldBank < 2; ++oldBank) {
+		for (uint32_t i = 0; i < MAX_BINARY_ARCHIVES; ++i) {
+			if (oldBank != bank || i >= archives.count) {
+				File::Delete(BinaryArchivePath(filename, oldBank, i), true);
+			}
+		}
 	}
-	valid &= fclose(file) == 0;
-	if (!valid) {
-		File::Delete(filename);
-	}
+	File::Delete(filename.WithExtraExtension(".metal4archive"), true);
+#endif
 }
 
 const MetalGEPipeline *PipelineManagerMetal::GetOrCreate(ShaderManagerMetal &shaders, VShaderID vertexID, FShaderID fragmentID,
@@ -381,10 +577,11 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 	if (shaderOwner_ != &shaders || shaderGeneration_ != shaders.CacheGeneration()) {
 #if PPSSPP_PLATFORM(MAC)
 		if (shaderOwner_) {
-			binaryArchive_ = nil;
+			binaryArchives_ = nil;
 			binaryArchiveKeys_.clear();
 		}
 #endif
+		lastPipeline_ = nullptr;
 		pipelines_.clear();
 		pending_.clear();
 		shaderOwner_ = &shaders;
@@ -410,9 +607,18 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 		key[18] = decoded->w0fmt | (decoded->w0off << 8);
 		key[19] = decoded->w1fmt | (decoded->w1off << 8);
 	}
+	// All environment, generation, target and layout checks above still apply.
+	if (lastPipeline_ && lastKey_ == key) {
+		return lastPipeline_;
+	}
+	auto remember = [&](const MetalGEPipeline *pipeline) {
+		lastKey_ = key;
+		lastPipeline_ = pipeline;
+		return pipeline;
+	};
 	auto found = pipelines_.find(key);
 	if (found != pipelines_.end()) {
-		return &found->second;
+		return remember(&found->second);
 	}
 	auto pending = pending_.find(key);
 	if (pending != pending_.end()) {
@@ -421,13 +627,19 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 		}
 		auto request = pending->second;
 		std::unique_lock<std::mutex> lock(request->mutex);
-		request->ready.wait(lock, [&] { return request->complete; });
+		if (!request->complete) {
+			const double start = time_now_d();
+			request->ready.wait(lock, [&] { return request->complete; });
+			std::lock_guard<std::mutex> metricsLock(metrics_->mutex);
+			metrics_->value.waitSeconds += time_now_d() - start;
+			++metrics_->value.waits;
+		}
 		MetalGEPipeline result = request->pipeline;
 		*error = request->error;
 		lock.unlock();
 		pending_.erase(pending);
 		if (result.state) {
-			return &pipelines_.emplace(key, std::move(result)).first->second;
+			return remember(&pipelines_.emplace(key, std::move(result)).first->second);
 		}
 		// A failed asynchronous prewarm can be transient. Retry once on the draw
 		// thread, so the first draw does not silently disappear.
@@ -481,13 +693,17 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 
 #endif
 	MTL4CompilerTaskOptions *taskOptions = [[MTL4CompilerTaskOptions alloc] init];
-	if (binaryArchive_) {
-		taskOptions.lookupArchives = @[binaryArchive_];
-	}
+	taskOptions.lookupArchives = binaryArchives_;
 	if (async) {
 		auto request = std::make_shared<PendingPipeline>();
 		request->pipeline = result;
 		pending_.emplace(key, request);
+		const auto metrics = metrics_;
+		{
+			std::lock_guard<std::mutex> lock(metrics->mutex);
+			++metrics->activeCompiles;
+		}
+		const double start = time_now_d();
 		[manager_->Context().Compiler() newRenderPipelineStateWithDescriptor:desc compilerTaskOptions:taskOptions completionHandler:^(id<MTLRenderPipelineState> state, NSError *nativeError) {
 			@autoreleasepool {
 				std::lock_guard<std::mutex> lock(request->mutex);
@@ -496,6 +712,12 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 					const char *description = nativeError.localizedDescription.UTF8String;
 					request->error = description ? description : "Failed to create Metal GE pipeline";
 				}
+				{
+					std::lock_guard<std::mutex> metricsLock(metrics->mutex);
+					metrics->value.asyncSeconds += time_now_d() - start;
+					++metrics->value.asyncCompiles;
+					--metrics->activeCompiles;
+				}
 				request->complete = true;
 			}
 			request->ready.notify_all();
@@ -503,12 +725,18 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 		return nullptr;
 	}
 	NSError *nativeError = nil;
+	const double start = time_now_d();
 	result.state = [manager_->Context().Compiler() newRenderPipelineStateWithDescriptor:desc compilerTaskOptions:taskOptions error:&nativeError];
+	{
+		std::lock_guard<std::mutex> lock(metrics_->mutex);
+		metrics_->value.syncSeconds += time_now_d() - start;
+		++metrics_->value.syncCompiles;
+	}
 	if (!result.state) {
 		*error = nativeError ? nativeError.localizedDescription.UTF8String : "Failed to create Metal GE pipeline";
 		return nullptr;
 	}
-	return &pipelines_.emplace(key, std::move(result)).first->second;
+	return remember(&pipelines_.emplace(key, std::move(result)).first->second);
 }
 
 id<MTLDepthStencilState> PipelineManagerMetal::GetDepthStencil(const MetalGEDepthStencilState &state, std::string *error) {

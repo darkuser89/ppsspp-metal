@@ -51,12 +51,22 @@ add_library(xxhash STATIC
 	xxhash.h
 )
 
+# Only the deflate encoder, for writing CSO files (Core/FileSystems/CSOCompress.cpp).
+add_library(libdeflate STATIC
+	libdeflate/lib/deflate_compress.c
+	libdeflate/lib/utils.c
+)
+
 set(aemu_postoffice_client_obj
 	aemu_postoffice/client/postoffice.c
 	aemu_postoffice/client/postoffice_mem_stdc.c
 	aemu_postoffice/client/mutex_impl_cpp.cpp
 	aemu_postoffice/client/delay_impl_cpp.cpp
 	aemu_postoffice/client/log_impl_ppsspp.cpp
+	aemu_postoffice/client/list.c
+	aemu_postoffice/client/enet.c
+	aemu_postoffice/adhocctl/client/adhocctl.c
+	aemu_postoffice/adhocctl/client/adhocctl_mem.c
 )
 
 if(WIN32)

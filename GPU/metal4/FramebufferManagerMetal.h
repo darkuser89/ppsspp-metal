@@ -174,7 +174,7 @@ public:
 	virtual void DeviceLost();
 	virtual void DeviceRestore(Draw::DrawContext *draw);
 
-	Draw::Framebuffer *GetTempFBO(TempFBO reason, u16 w, u16 h);
+	Draw::Framebuffer *GetTempFBO(TempFBO reason, u16 w, u16 h, int msaaLevel = 0);
 	// A single-sampled copy of the first sample of each pixel of a multisampled framebuffer, or null if it isn't
 	// multisampled or the backend can't. For reading colors as values, which averaging the samples would corrupt.
 	Draw::Framebuffer *CopyColorSample0(VirtualFramebuffer *vfb);

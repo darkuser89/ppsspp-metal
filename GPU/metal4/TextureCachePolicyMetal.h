@@ -62,6 +62,8 @@ struct MetalTexCacheEntry {
 #endif
 	int lastFrame;
 	int lastSyncDomain;
+	// Bytes of host memory the texture takes, set when it's built. See EstimateTexMemoryUsage.
+	u32 hostMemorySize = 0;
 
 	TextureAlpha GetAlphaStatus() const {
 		return (status & MetalTexStatus::ALPHA_SOLID) ? TextureAlpha::Solid : TextureAlpha::Any;
@@ -91,6 +93,8 @@ struct MetalTexCacheEntry {
 	u64 CacheKey() const;
 	static u64 CacheKey(u32 addr, u8 format, u16 dim, u32 cluthash);
 	u32 EstimateTexMemoryUsage() const;
+	// The size of the texture's level 0 at the PSP's size, in 32 bits for the CLUT formats.
+	u32 EstimatePSPSizeMemoryUsage() const;
 };
 
 // TODO: Work on shrinking it further.
@@ -127,7 +131,7 @@ struct MetalBuildTexturePlan {
 	int maxPossibleLevels;
 
 	// Load the 0-mip from this PSP texture level instead of 0.
-	// If non-zero, we are only loading one level.
+	// If non-zero, we are only loading one level. Replacements and dumps still treat it as level 0.
 	int baseLevelSrc;
 
 	// The scale factor of the final texture.
@@ -208,6 +212,8 @@ public:
 
 	virtual void ForgetLastTexture() override = 0;
 	virtual void Clear(bool delete_them) override;
+	void RecheckAllAfterLoad();
+	void ReleaseDynamicClut();
 	virtual void NotifyConfigChanged() override;
 
 	// FramebufferManager keeps TextureCache updated about what regions of memory are being rendered to,
@@ -268,7 +274,7 @@ protected:
 	// Unswizzles into tmpTexBuf32_, sized for what the decode will read. bytesPerPixel 0 means
 	// 4-bit indices. Returns the buffer and its row stride in bufw.
 	const u8 *UnswizzleToTemp(const u8 *texptr, int w, int h, int &bufw, int bytesPerPixel);
-	TextureAlpha ReadIndexedTex(u8 *out, int outPitch, int w, int h, int level, const u8 *texptr, int bytesPerIndex, int bufw, bool reverseColors, bool expandTo32Bit);
+	TextureAlpha ReadIndexedTex(u8 *out, int outPitch, int w, int h, int level, const u8 *texptr, int bytesPerIndex, int bufw, bool swizzled, bool reverseColors, bool expandTo32Bit);
 	MetalReplacedTexture *FindReplacement(MetalTexCacheEntry *entry, int *w, int *h, int *d);
 	void PollReplacement(MetalTexCacheEntry *entry, int *w, int *h, int *d);
 

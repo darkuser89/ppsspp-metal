@@ -219,8 +219,8 @@ static int GameBrowserViewFromGridView(int legacyGridView, GameBrowserViewMode d
 	return (int)(legacyGridView ? GameBrowserViewMode::GRID : GameBrowserViewMode::LIST);
 }
 
-// Games and Homebrew switch everyone to the large list, ignoring the old setting. The others keep it.
-static int DefaultGameBrowserView1() { return GameBrowserViewFromGridView(g_Config.iLegacyGridView1, GameBrowserViewMode::GRID); }
+// Recent, Games and Homebrew switch everyone to the large list, ignoring the old setting. Remote keeps it.
+static int DefaultGameBrowserView1() { return (int)GameBrowserViewMode::LARGE_LIST; }
 static int DefaultGameBrowserView2() { return (int)GameBrowserViewMode::LARGE_LIST; }
 static int DefaultGameBrowserView3() { return (int)GameBrowserViewMode::LARGE_LIST; }
 static int DefaultGameBrowserView4() { return GameBrowserViewFromGridView(g_Config.iLegacyGridView4, GameBrowserViewMode::LIST); }
@@ -313,7 +313,6 @@ static const ConfigSetting generalSettings[] = {
 	ConfigSetting("ShowRegionOnGameIcon", SETTING(g_Config, bShowRegionOnGameIcon), false, CfgFlag::DEFAULT),
 	ConfigSetting("ShowIDOnGameIcon", SETTING(g_Config, bShowIDOnGameIcon), false, CfgFlag::DEFAULT),
 	ConfigSetting("GameGridScale", SETTING(g_Config, fGameGridScale), &DefaultGameGridScale, CfgFlag::DEFAULT),
-	ConfigSetting("GridView1", SETTING(g_Config, iLegacyGridView1), -1, &LegacyGridViewToString, &LegacyGridViewFromString, CfgFlag::DONT_SAVE),
 	ConfigSetting("GridView4", SETTING(g_Config, iLegacyGridView4), -1, &LegacyGridViewToString, &LegacyGridViewFromString, CfgFlag::DONT_SAVE),
 	// These must come after GridView*, which their defaults are taken from.
 	ConfigSetting("GameBrowserView1", SETTING(g_Config, iGameBrowserView1), &DefaultGameBrowserView1, CfgFlag::DEFAULT),
@@ -336,6 +335,8 @@ static const ConfigSetting generalSettings[] = {
 	ConfigSetting("CompressSymbols", SETTING(g_Config, bCompressSymbols), true, CfgFlag::DEFAULT),
 	ConfigSetting("CacheFullIsoInRam", SETTING(g_Config, bCacheFullIsoInRam), false, CfgFlag::PER_GAME),
 	ConfigSetting("AutoUpgradeFirmware", SETTING(g_Config, bAutoUpgradeFirmware), true, CfgFlag::DEFAULT),
+	ConfigSetting("CSOPreset", SETTING(g_Config, iCSOPreset), 0, CfgFlag::DEFAULT),
+	ConfigSetting("PackKeepOriginal", SETTING(g_Config, bPackKeepOriginal), false, CfgFlag::DEFAULT),
 	ConfigSetting("RemoteISOPort", SETTING(g_Config, iRemoteISOPort), 0, CfgFlag::DEFAULT),
 	ConfigSetting("LastRemoteISOServer", SETTING(g_Config, sLastRemoteISOServer), "", CfgFlag::DEFAULT),
 	ConfigSetting("LastRemoteISOPort", SETTING(g_Config, iLastRemoteISOPort), 0, CfgFlag::DEFAULT),
@@ -443,8 +444,8 @@ static const ConfigSetting cpuSettings[] = {
 	ConfigSetting("SeparateSASThread", SETTING(g_Config, bSeparateSASThread), &DefaultSasThread, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("IOTimingMethod", SETTING(g_Config, iIOTimingMethod), IOTIMING_FAST, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("FastMemoryAccess", SETTING(g_Config, bFastMemory), true, CfgFlag::PER_GAME),
+	ConfigSetting("EmulateMediaEngine", SETTING(g_Config, bEmulateMediaEngine), false, CfgFlag::REPORT),
 	ConfigSetting("FunctionReplacements", SETTING(g_Config, bFuncReplacements), true, CfgFlag::PER_GAME | CfgFlag::REPORT),
-	ConfigSetting("AccurateVdot", SETTING(g_Config, bAccurateVdot), true, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("HideSlowWarnings", SETTING(g_Config, bHideSlowWarnings), false, CfgFlag::DEFAULT),
 	ConfigSetting("HideStateWarnings", SETTING(g_Config, bHideStateWarnings), false, CfgFlag::DEFAULT),
 	ConfigSetting("JitDisableFlags", SETTING(g_Config, uJitDisableFlags), (uint32_t)0, CfgFlag::PER_GAME),
@@ -590,11 +591,7 @@ int Config::NextValidBackend() {
 }
 
 bool Config::IsBackendEnabled(GPUBackend backend) {
-#ifndef PPSSPP_HAS_METAL
-	if (backend == GPUBackend::METAL) {
-		return false;
-	}
-#else
+#ifdef PPSSPP_HAS_METAL
 	if (backend == GPUBackend::METAL && !MetalIsAvailable()) {
 		return false;
 	}
@@ -621,6 +618,11 @@ bool Config::IsBackendEnabled(GPUBackend backend) {
 		return false;
 #else
 	if (backend == GPUBackend::DIRECT3D11)
+		return false;
+#endif
+
+#if !PPSSPP_API(METAL)
+	if (backend == GPUBackend::METAL)
 		return false;
 #endif
 
@@ -1031,6 +1033,7 @@ static const ConfigSetting controlSettings[] = {
 	ConfigSetting("TiltCircularDeadzone", SETTING(g_Config, bTiltCircularDeadzone), true, CfgFlag::PER_GAME),
 	ConfigSetting("TiltInputType", SETTING(g_Config, iTiltInputType), 1, CfgFlag::PER_GAME),
 	ConfigSetting("TiltInputEnabled", SETTING(g_Config, bTiltInputEnabled), false, CfgFlag::PER_GAME),
+	ConfigSetting("TiltUseGyro", SETTING(g_Config, bTiltUseGyro), true, CfgFlag::PER_GAME),
 
 	ConfigSetting("DisableDpadDiagonals", SETTING(g_Config, bDisableDpadDiagonals), false, CfgFlag::PER_GAME),
 	ConfigSetting("GamepadOnlyFocused", SETTING(g_Config, bGamepadOnlyFocused), false, CfgFlag::PER_GAME),
@@ -1085,6 +1088,8 @@ static const ConfigSetting networkSettings[] = {
 	ConfigSetting("EnableAdhocServer", SETTING(g_Config, bEnableAdhocServer), false, CfgFlag::PER_GAME),
 	ConfigSetting("proAdhocServer", SETTING(g_Config, sProAdhocServer), &DefaultProAdhocServer, CfgFlag::PER_GAME),
 	ConfigSetting("AdhocServerRelayMode", SETTING(g_Config, iAdhocServerRelayMode), (int)AdhocServerRelayMode::Auto, CfgFlag::PER_GAME),
+	ConfigSetting("AdhocUseUdp", SETTING(g_Config, bAdhocUseUdp), false, CfgFlag::PER_GAME),
+	ConfigSetting("AdhocRelayModeEnetPdpReliable", SETTING(g_Config, bAdhocRelayModeEnetPdpReliable), true, CfgFlag::PER_GAME),
 	ConfigSetting("AdhocServerShowPlayerPorts", SETTING(g_Config, bAdhocServerShowPlayerPorts), false, CfgFlag::PER_GAME),
 	ConfigSetting("PortOffset", SETTING(g_Config, iPortOffset), 10000, CfgFlag::PER_GAME),
 	ConfigSetting("PrimaryDNSServer", SETTING(g_Config, sInfrastructureDNSServer), "67.222.156.250", CfgFlag::PER_GAME),
@@ -1128,6 +1133,7 @@ static const ConfigSetting systemParamSettings[] = {
 	ConfigSetting("BypassOSKWithKeyboard", SETTING(g_Config, bBypassOSKWithKeyboard), false, CfgFlag::PER_GAME),
 	ConfigSetting("WlanPowerSave", SETTING(g_Config, bWlanPowerSave), (bool) PSP_SYSTEMPARAM_WLAN_POWERSAVE_OFF, CfgFlag::PER_GAME),
 	ConfigSetting("EncryptSave", SETTING(g_Config, bEncryptSave), true, CfgFlag::PER_GAME | CfgFlag::REPORT),
+	ConfigSetting("VshUmdAutoboot", SETTING(g_Config, bVshUmdAutoboot), false, CfgFlag::DEFAULT),
 	ConfigSetting("MemStickSize", SETTING(g_Config, iMemStickSizeGB), 16, CfgFlag::DEFAULT),
 	ConfigSetting("FuseID", SETTING(g_Config, sFuseID), "", CfgFlag::DEFAULT),
 };

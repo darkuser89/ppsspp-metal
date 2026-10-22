@@ -357,6 +357,8 @@ add_library(Core STATIC
 	FileSystems/BlobFileSystem.h
 	FileSystems/BlockDevices.cpp
 	FileSystems/BlockDevices.h
+	FileSystems/CSOCompress.cpp
+	FileSystems/CSOCompress.h
 	FileSystems/DirectoryFileSystem.cpp
 	FileSystems/DirectoryFileSystem.h
 	FileSystems/FileSystem.h
@@ -385,13 +387,19 @@ add_library(Core STATIC
 	HLE/PSPThreadContext.h
 	HLE/KUBridge.h
 	HLE/KUBridge.cpp
+	HLE/sceSysreg.h
+	HLE/sceSysreg.cpp
 	HLE/Plugins.h
 	HLE/Plugins.cpp
+	HLE/PopsBoot.cpp
+	HLE/PopsBoot.h
 	HLE/ThreadQueueList.h
 	HLE/__sceAudio.cpp
 	HLE/__sceAudio.h
 	HLE/sceAdler.cpp
 	HLE/sceAdler.h
+	HLE/sceAmctrl.cpp
+	HLE/sceAmctrl.h
 	HLE/AtracBase.h
 	HLE/AtracCtx.cpp
 	HLE/AtracCtx.h
@@ -576,6 +584,12 @@ add_library(Core STATIC
 	HW/Display.h
 	HW/GpioMMIO.cpp
 	HW/GpioMMIO.h
+	HW/MeMMIO.cpp
+	HW/MeMMIO.h
+	HW/MMIO.cpp
+	HW/MMIO.h
+	HW/PopsMMIO.cpp
+	HW/PopsMMIO.h
 	HW/AvcDecoder.cpp
 	HW/AvcDecoder.h
 	HW/MediaEngine.cpp
@@ -630,6 +644,8 @@ add_library(Core STATIC
 	MIPS/MIPSVFPUUtils.h
 	MIPS/MIPSTracer.cpp
 	MIPS/MIPSTracer.h
+	MIPS/MeCore.cpp
+	MIPS/MeCore.h
 	MIPS/JitCommon/JitCommon.cpp
 	MIPS/JitCommon/JitCommon.h
 	MIPS/JitCommon/JitProfiler.cpp
@@ -713,7 +729,7 @@ endif()
 
 list(APPEND CoreExtraLibs armips)
 
-target_link_libraries(Core GPU Common chdr kirk cityhash sfmt19937 xbrz xxhash rcheevos at3_standalone lua
+target_link_libraries(Core GPU Common chdr kirk cityhash sfmt19937 xbrz xxhash libdeflate rcheevos at3_standalone lua
 	aemu_postoffice_client ${CoreExtraLibs} ${CMAKE_DL_LIBS})
 
 # Winsock

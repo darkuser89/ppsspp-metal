@@ -183,7 +183,7 @@ bool CwCheatScreen::TryLoadCheatInfo() {
 	}
 	fileCheckCounter_ = 0;
 
-	fileInfo_ = engine_->FileInfo();
+	fileInfo_ = engine_->FileInfo(&parseErrors_);
 
 	// Let's also trigger a reload, in case it changed.
 	g_Config.bReloadCheats = true;
@@ -286,6 +286,23 @@ void CwCheatScreen::CreateContentViews(UI::ViewGroup *parent) {
 		rightColumn->Add(new Spacer(8.0f));
 	}
 
+	if (!parseErrors_.empty()) {
+		// Cheats with a bad line are left out of the list, so say why.
+		const size_t maxShown = 5;
+		std::string details;
+		for (size_t i = 0; i < parseErrors_.size() && i < maxShown; i++) {
+			if (i > 0) {
+				details += '\n';
+			}
+			details += parseErrors_[i];
+		}
+		if (parseErrors_.size() > maxShown) {
+			details += "\n...";
+		}
+		rightColumn->Add(new NoticeView(NoticeLevel::WARN, cw->T("Some lines in the cheat file could not be read"), details));
+		rightColumn->Add(new Spacer(8.0f));
+	}
+
 	rightColumn->Add(new ItemHeader(cw->T("Cheats")));
 
 	bool prevIsTitle = false;
@@ -359,8 +376,8 @@ void CwCheatScreen::onFinish(DialogResult result) {
 	if (result != DR_BACK) // This only works for BACK here.
 		return;
 
-	if (MIPSComp::jit) {
-		MIPSComp::jit->ClearCache();
+	if (mipsr4k.jit) {
+		mipsr4k.jit->ClearCache();
 	}
 }
 
@@ -384,8 +401,8 @@ void CwCheatScreen::OnAddCheat(UI::EventParams &params) {
 
 void CwCheatScreen::OnEditCheatFile(UI::EventParams &params) {
 	g_Config.bReloadCheats = true;
-	if (MIPSComp::jit) {
-		MIPSComp::jit->ClearCache();
+	if (mipsr4k.jit) {
+		mipsr4k.jit->ClearCache();
 	}
 	if (engine_) {
 		File::OpenFileInEditor(engine_->CheatFilename());

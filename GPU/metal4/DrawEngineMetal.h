@@ -9,6 +9,15 @@
 
 class FramebufferManagerMetal;
 
+struct MetalTransformMetrics {
+	uint64_t flatDraws = 0;
+	uint64_t flatHardwareEligible = 0;
+	uint64_t flatHardwareDraws = 0;
+	uint64_t flatLightingFallbacks = 0;
+	uint64_t flatVertices = 0;
+	double flatPreparationSeconds = 0.0;
+};
+
 class DrawEngineMetal : public DrawEngineCommon {
 public:
 	explicit DrawEngineMetal(Draw::DrawContext *draw);
@@ -27,8 +36,11 @@ public:
 		}
 	}
 	void SavePipelineCache(const Path &filename) const { pipelines_.SaveCache(filename); }
+	bool PipelinesPending() const { return pipelines_.PipelinesPending(); }
 	int GetNumPipelines() const { return pipelines_.GetNumPipelines(); }
+	MetalPipelineMetrics PipelineMetrics() const { return pipelines_.Metrics(); }
 	const std::string &LastError() const { return lastError_; }
+	const MetalTransformMetrics &TransformMetrics() const { return transformMetrics_; }
 
 private:
 	struct EncoderState {
@@ -49,13 +61,14 @@ private:
 	Draw::DrawContext *draw_ = nullptr;
 	Metal::RenderManager *manager_ = nullptr;
 	PipelineManagerMetal pipelines_{nullptr};
-	SamplerCacheMetal samplers_;
 	ShaderManagerMetal *shaderManager_ = nullptr;
 	TextureCacheMetal *textureCache_ = nullptr;
 	FramebufferManagerMetal *framebufferManager_ = nullptr;
 	std::string lastError_;
 #if PPSSPP_PLATFORM(MAC)
 	std::vector<uint16_t> softwareIndices_;
+	std::vector<std::array<int, 4>> samplingRegions_;
 #endif
 	EncoderState encoderState_;
+	MetalTransformMetrics transformMetrics_;
 };

@@ -398,6 +398,8 @@ SOURCES_CXX += \
 
 SOURCES_C += $(EXTDIR)/sfmt19937/SFMT.c
 SOURCES_C   += $(EXTDIR)/xxhash.c
+SOURCES_C   += $(EXTDIR)/libdeflate/lib/deflate_compress.c \
+               $(EXTDIR)/libdeflate/lib/utils.c
 
 SOURCES_CXX += \
 	$(EXTDIR)/snappy/snappy-c.cpp \
@@ -682,7 +684,11 @@ endif
 
 SOURCES_C += \
 	       $(EXTDIR)/aemu_postoffice/client/postoffice.c \
-	       $(EXTDIR)/aemu_postoffice/client/postoffice_mem_stdc.c
+	       $(EXTDIR)/aemu_postoffice/client/postoffice_mem_stdc.c \
+	       $(EXTDIR)/aemu_postoffice/client/list.c \
+	       $(EXTDIR)/aemu_postoffice/client/enet.c \
+	       $(EXTDIR)/aemu_postoffice/adhocctl/client/adhocctl.c \
+	       $(EXTDIR)/aemu_postoffice/adhocctl/client/adhocctl_mem.c
 
 SOURCES_CXX += \
 	       $(EXTDIR)/aemu_postoffice/client/mutex_impl_cpp.cpp \
@@ -743,6 +749,7 @@ SOURCES_CXX += \
 	       $(COREDIR)/ELF/ParamSFO.cpp \
 	       $(COREDIR)/FileSystems/tlzrc.cpp \
 	       $(COREDIR)/FileSystems/BlockDevices.cpp \
+	       $(COREDIR)/FileSystems/CSOCompress.cpp \
 	       $(COREDIR)/FileSystems/BlobFileSystem.cpp \
 	       $(COREDIR)/FileSystems/DirectoryFileSystem.cpp \
 	       $(COREDIR)/FileSystems/FileSystem.cpp \
@@ -752,9 +759,11 @@ SOURCES_CXX += \
 	       $(COREDIR)/Font/PGF.cpp \
 	       $(COREDIR)/HLE/HLE.cpp \
 	       $(COREDIR)/HLE/KUBridge.cpp \
+	       $(COREDIR)/HLE/sceSysreg.cpp \
 	       $(COREDIR)/HLE/NetInetConstants.cpp \
 	       $(COREDIR)/HLE/SocketManager.cpp \
 	       $(COREDIR)/HLE/Plugins.cpp \
+	       $(COREDIR)/HLE/PopsBoot.cpp \
 	       $(COREDIR)/HLE/sceSha256.cpp \
 	       $(COREDIR)/HLE/sceSircs.cpp \
 	       $(COREDIR)/HLE/sceG729.cpp \
@@ -765,6 +774,7 @@ SOURCES_CXX += \
 	       $(COREDIR)/HLE/AtracCtx.cpp \
 	       $(COREDIR)/HLE/AtracCtx2.cpp \
 	       $(COREDIR)/HLE/sceAdler.cpp \
+	       $(COREDIR)/HLE/sceAmctrl.cpp \
 	       $(COREDIR)/HLE/sceAtrac.cpp \
 	       $(COREDIR)/HLE/sceAudio.cpp \
 	       $(COREDIR)/HLE/sceAudiocodec.cpp \
@@ -845,6 +855,9 @@ SOURCES_CXX += \
 	       $(COREDIR)/HW/Camera.cpp \
 	       $(COREDIR)/HW/Display.cpp \
 	       $(COREDIR)/HW/GpioMMIO.cpp \
+	       $(COREDIR)/HW/MMIO.cpp \
+	       $(COREDIR)/HW/MeMMIO.cpp \
+	       $(COREDIR)/HW/PopsMMIO.cpp \
 	       $(COREDIR)/HW/SimpleAudioDec.cpp \
 	       $(COREDIR)/HW/Atrac3Standalone.cpp \
 	       $(COREDIR)/HW/AsyncIOManager.cpp \
@@ -886,6 +899,7 @@ SOURCES_CXX += \
 	       $(COREDIR)/MIPS/MIPSStackWalk.cpp \
 	       $(COREDIR)/MIPS/MIPSVFPUUtils.cpp \
 	       $(COREDIR)/MIPS/MIPSTracer.cpp \
+	       $(COREDIR)/MIPS/MeCore.cpp \
 	       $(COREDIR)/MemFault.cpp \
 	       $(COREDIR)/MemMap.cpp \
 	       $(COREDIR)/MemMapFunctions.cpp \

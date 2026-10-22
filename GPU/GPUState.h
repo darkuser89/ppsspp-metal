@@ -620,6 +620,10 @@ public:
 	bool textureIsArray;
 	bool textureIsFramebuffer;
 	bool textureIsVideo;
+	// For a video texture, how many of its rows hold the frame (see CalcTexClamp).
+	int videoRows;
+	// And how many of its columns, 0 if not known.
+	int videoColumns;
 	bool useFlagsChanged;
 
 	float morphWeights[8];
@@ -640,6 +644,9 @@ public:
 	float worldviewproj[16];
 	float cullMatrix[16];
 	bool viewportNearPlaneMatchesOutput;
+	// The viewport's near and far planes both fall on min or max Z where those are clipped (above 0, below 65535),
+	// so the min/max clip planes clip exactly where the GE does.
+	bool viewportZPlanesOnClipPlanes;
 
 	KnownVertexBounds vertBounds;
 

@@ -110,6 +110,17 @@ enum class IROp : uint8_t {
 	StoreFloat,
 	StoreVec4,
 
+	// Kernel code's loads and stores, which may reach hardware registers (MMIO). See
+	// ResolveKernelMemory.
+	LoadKernel8,
+	LoadKernel8Ext,
+	LoadKernel16,
+	LoadKernel16Ext,
+	LoadKernel32,
+	StoreKernel8,
+	StoreKernel16,
+	StoreKernel32,
+
 	Ext8to32,
 	Ext16to32,
 	ReverseBits,
@@ -186,7 +197,6 @@ enum class IROp : uint8_t {
 	Vec4Mul,
 	Vec4Div,
 	Vec4Scale,
-	Vec4Dot,
 	Vec4VfpuDot,  // The VFPU's own dot product, bit-exact (vfpu_dot).
 	Vec4VfpuMultiDot,  // Four of them against one vector, see IRMultiDot.
 	Vec4Neg,
@@ -456,7 +466,6 @@ struct IROptions {
 	bool unalignedLoadStore;
 	bool unalignedLoadStoreVec4;
 	bool preferVec4;
-	bool preferVec4Dot;
 	bool optimizeForInterpreter;
 	// The backend has Vec4VfpuMultiDot.
 	bool vfpuMultiDot;

@@ -184,6 +184,7 @@ public:
 	int SampleCount() const override { return target_ ? target_->SampleCount() : 1; }
 	bool SetSurface(CAMetalLayer *layer, std::string *error) override;
 	void ResizeSurface() override;
+	bool WriteStencilFromAlpha(Framebuffer *framebuffer);
 
 private:
 	struct Thin3DEncoderState {
@@ -214,6 +215,7 @@ private:
 	bool ReadbackDelayedColor(id<MTLTexture> source, int x, int y, int w, int h, DataFormat format,
 		void *pixels, int stride, std::string *error);
 	void DrawFan(id<MTLBuffer> vertices, size_t vertexOffset, const uint16_t *indices, int count, int firstVertex);
+	void DrawIndexedUploaded(Metal::UploadSlice vertices, const void *indices, int indexCount);
 	Metal::RenderContext context_;
 	Metal::FramebufferCopy framebufferCopy_;
 	std::map<std::array<uintptr_t, 5>, MetalDelayedReadback> delayedReadbacks_;
@@ -431,6 +433,7 @@ bool MetalDrawContext::UpscaleBoundTexture(int binding, int width, int height, M
 		spatialScaler_.inputContentHeight = sh;
 		context_.Keep({spatialScaler_, spatialFence_, spatialInput_, spatialOutput_});
 		[spatialScaler_ encodeToCommandBuffer:context_.Commands()];
+		context_.ProfileExternalCommands();
 		auto complete = context_.BlitEncoder(context_.Commands(), "MetalFX output synchronization");
 		[complete waitForFence:spatialFence_ beforeEncoderStages:MTLStageBlit];
 		[complete barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
@@ -465,6 +468,11 @@ bool MetalDrawContext::Commands() {
 }
 
 void MetalDrawContext::EndPass() {
+	// Transfers, target changes and submission all finish through this path.
+	// Materialize a deferred clear even when no draw consumed the pass.
+	if (!encoder_ && target_ && (pass_.color == RPAction::CLEAR || pass_.depth == RPAction::CLEAR || pass_.stencil == RPAction::CLEAR)) {
+		BeginPass();
+	}
 	if (encoder_) {
 		const bool multisample = target_ && target_->MultiSampleLevel() > 0;
 		const bool discardColor = discardStoreAspects_ & Aspect::COLOR_BIT;
@@ -825,6 +833,25 @@ void MetalDrawContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h
 }
 
 void MetalDrawContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	if (!encoder_ && fbo && target_.ptr == fbo && discardStoreAspects_ == Aspect::NO_BIT) {
+		// A later KEEP preserves the pending clear; another clear replaces only
+		// that attachment. No resource consumer has executed between these binds.
+		if (rp.color != RPAction::KEEP) {
+			pass_.color = rp.color;
+			pass_.clearColor = rp.clearColor;
+		}
+		if (rp.depth != RPAction::KEEP) {
+			pass_.depth = rp.depth;
+			pass_.clearDepth = rp.clearDepth;
+		}
+		if (rp.stencil != RPAction::KEEP) {
+			pass_.stencil = rp.stencil;
+			pass_.clearStencil = rp.clearStencil;
+		}
+		pass_.tag = tag;
+		RequestPipeline();
+		return;
+	}
 	// A KEEP rebind of the active target does not need another MSAA resolve.
 	// Keep the split when a bound texture aliases the target or a store discard is pending.
 	if (encoder_ && fbo && target_.ptr == fbo &&
@@ -847,10 +874,7 @@ void MetalDrawContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const Ren
 	pass_.tag = tag;
 	discardStoreAspects_ = Aspect::NO_BIT;
 	RequestPipeline();
-	// Execute a clear even when this pass has no draws or is immediately rebound.
-	if (rp.color == RPAction::CLEAR || rp.depth == RPAction::CLEAR || rp.stencil == RPAction::CLEAR) {
-		BeginPass();
-	} else if (target_ && invalidation_) {
+	if (target_ && invalidation_) {
 		// GE state must be dirtied when the target changes, even if encoding waits for a draw.
 		invalidation_(InvalidationCallbackFlags::RENDER_PASS_STATE);
 	}
@@ -941,13 +965,16 @@ void MetalDrawContext::BindFramebufferSamplesAsTexture(Framebuffer *fbo, int bin
 		Error("Failed to allocate Metal framebuffer sample layer");
 		return;
 	}
-	auto blit = context_.BlitEncoder(context_.Commands(), "Framebuffer sample layer");
+	context_.RecordTransientAllocation(Metal::TransientKind::SAMPLE_LAYER, snapshot.allocatedSize);
+	auto blit = context_.BlitEncoder(context_.Commands(), "Framebuffer sample layer", true);
 	if (!blit) {
 		Error("Failed to encode Metal framebuffer sample layer");
 		return;
 	}
 	context_.Keep(source->ColorAttachment());
 	context_.Keep(snapshot);
+	context_.UseResource(blit, source->ColorAttachment(), MTLStageBlit, (MTLStages)0);
+	context_.UseResource(blit, snapshot, (MTLStages)0, MTLStageBlit);
 	[blit copyFromTexture:source->ColorAttachment() sourceSlice:layer sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
 		sourceSize:MTLSizeMake(source->Width(), source->Height(), 1) toTexture:snapshot
 		destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -966,8 +993,11 @@ void MetalDrawContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, A
 		Error("Metal framebuffer texture binding requires color or depth");
 		return;
 	}
-	if (aspect == Aspect::DEPTH_BIT && source->MultiSampleLevel() > 0 &&
-		(source->NeedsDepthStencilResolve() || (source == target_.ptr && encoder_))) {
+	// Complete pending clears before checking whether the sampled resolve is current.
+	if (source->MultiSampleLevel() > 0 && target_.ptr == source) {
+		EndPass();
+	}
+	if (aspect == Aspect::DEPTH_BIT && source->MultiSampleLevel() > 0 && source->NeedsDepthStencilResolve()) {
 		EndPass();
 		std::string error;
 		if (!source->ResolveDepthStencil(context_, &error)) {
@@ -982,11 +1012,6 @@ void MetalDrawContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, A
 			source->ColorArray();
 	} else {
 		textures_[binding] = aspect == Aspect::DEPTH_BIT ? source->DepthStencilLayer(layer) : source->ColorLayer(layer);
-	}
-	// A different MSAA target was resolved when its own pass ended. Only the
-	// current target needs its active pass closed before sampling its resolve.
-	if (source->MultiSampleLevel() > 0 && target_.ptr == source) {
-		EndPass();
 	}
 	if (!textures_[binding]) {
 		Error("Missing Metal framebuffer texture attachment");
@@ -1034,6 +1059,32 @@ bool MetalDrawContext::Copy(Framebuffer *src, int sx, int sy, Framebuffer *dst, 
 		return false;
 	}
 	return true;
+}
+
+bool MetalDrawContext::WriteStencilFromAlpha(Framebuffer *framebuffer) {
+	auto *target = static_cast<Metal::Framebuffer *>(framebuffer);
+	if (!caps_.framebufferFetchSupported || !target || !target->DepthStencil() || target->SampleCount() != 1 || target->Layers() != 1) {
+		return false;
+	}
+	id<MTL4RenderCommandEncoder> activeEncoder = nil;
+	if (target_.ptr == target) {
+		if (!BeginPass()) {
+			return false;
+		}
+		activeEncoder = encoder_;
+	} else {
+		EndPass();
+	}
+	std::string error;
+	const bool success = framebufferCopy_.StencilFromAlpha(context_, target, &error, activeEncoder);
+	Invalidate(InvalidationFlags::CACHED_RENDER_STATE);
+	if (invalidation_) {
+		invalidation_(InvalidationCallbackFlags::RENDER_PASS_STATE);
+	}
+	if (!success) {
+		Error(error);
+	}
+	return success;
 }
 
 void MetalDrawContext::CopyFramebufferImage(Framebuffer *src, int level, int x, int y, int z, Framebuffer *dst, int dstLevel, int dx, int dy, int dz, int w, int h, int depth, Aspect aspects, const char *tag) {
@@ -1133,13 +1184,15 @@ bool MetalDrawContext::ReadbackDelayedColor(id<MTLTexture> source, int x, int y,
 			*error = "Failed to allocate delayed Metal readback buffer";
 			return false;
 		}
-		id<MTL4ComputeCommandEncoder> blit = context_.BlitEncoder(context_.Commands(), "Delayed framebuffer readback");
+		id<MTL4ComputeCommandEncoder> blit = context_.BlitEncoder(context_.Commands(), "Delayed framebuffer readback", true);
 		if (!blit) {
 			*error = "Failed to encode delayed Metal readback";
 			return false;
 		}
 		context_.Keep(source);
 		context_.Keep(buffer);
+		context_.UseResource(blit, source, MTLStageBlit, (MTLStages)0);
+		context_.UseResource(blit, buffer, (MTLStages)0, MTLStageBlit);
 		[blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
 			sourceSize:MTLSizeMake(w, h, 1) toBuffer:buffer destinationOffset:0
 			destinationBytesPerRow:pitch destinationBytesPerImage:pitch * h options:MTLBlitOptionNone];
@@ -1290,6 +1343,7 @@ bool MetalDrawContext::SnapshotBackbufferColor(int slot, std::string *error) {
 		*error = "Failed to allocate Metal backbuffer snapshot";
 		return false;
 	}
+	context_.RecordTransientAllocation(Metal::TransientKind::BACKBUFFER, snapshot.allocatedSize);
 	if (!Metal::CopyImage(context_, source, 0, 0, snapshot, 0, 0, (int)source.width, (int)source.height, error)) {
 		return false;
 	}
@@ -1539,9 +1593,11 @@ bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
 		bound.uniformOffset = uniform_.offset;
 	}
 	if (pipeline_->multiview && (!valid || !bound.viewMaskBound)) {
-		const uint32_t viewMask[] = { 0, 2 };
-		context_.SetBytes(encoder_, MTLRenderStageVertex, viewMask, sizeof(viewMask), Metal::VIEW_MASK_BUFFER_SLOT);
-		context_.SetBytes(encoder_, MTLRenderStageFragment, viewMask, sizeof(viewMask), Metal::VIEW_MASK_BUFFER_SLOT);
+		std::string error;
+		if (!context_.BindViewMask(encoder_, &error)) {
+			Error(error);
+			return false;
+		}
 		bound.viewMaskBound = true;
 	}
 	const uint32_t vertexSlots = pipeline_->vertexTextureMask | vertexTextureMask_;
@@ -1598,7 +1654,7 @@ void MetalDrawContext::DrawFan(id<MTLBuffer> vertices, size_t vertexOffset, cons
 		return;
 	}
 	std::string error;
-	auto uploaded = context_.ReserveUpload(indexCount * sizeof(uint32_t), &error);
+	auto uploaded = context_.ReserveUpload(indexCount * sizeof(uint32_t), &error, 4);
 	if (!uploaded) {
 		Error(error);
 		return;
@@ -1612,6 +1668,7 @@ void MetalDrawContext::DrawFan(id<MTLBuffer> vertices, size_t vertexOffset, cons
 		fan[out + 2] = indices ? indices[i + 1] : (uint32_t)firstVertex + (uint32_t)i + 1;
 	}
 	if (Apply(vertices, vertexOffset)) {
+		context_.UseResource(encoder_, uploaded.buffer, MTLStageVertex, (MTLStages)0);
 		[encoder_ drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:indexCount indexType:MTLIndexTypeUInt32
 			indexBuffer:uploaded.buffer.gpuAddress + (uploaded.offset) indexBufferLength:uploaded.buffer.length - (uploaded.offset) instanceCount:InstanceCount()];
 	}
@@ -1677,6 +1734,7 @@ void MetalDrawContext::DrawIndexed(int count, int offset) {
 		return;
 	}
 	if (Apply(vertices.buffer, vertexOffset)) {
+		context_.UseResource(encoder_, indices.buffer, MTLStageVertex, (MTLStages)0);
 		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:count indexType:MTLIndexTypeUInt16
 			indexBuffer:indices.buffer.gpuAddress + (indices.offset + start) indexBufferLength:indices.buffer.length - (indices.offset + start) instanceCount:InstanceCount()];
 	}
@@ -1717,22 +1775,30 @@ void MetalDrawContext::DrawIndexedUP(const void *data, int count, const void *in
 		Error(error);
 		return;
 	}
+	DrawIndexedUploaded(vertices, indices, indexCount);
+}
+
+void MetalDrawContext::DrawIndexedUploaded(Metal::UploadSlice vertices, const void *indices, int indexCount) {
 	if (pipeline_->fan) {
 		DrawFan(vertices.buffer, vertices.offset, (const uint16_t *)indices, indexCount, 0);
 		return;
 	}
-	auto index = context_.Upload(indices, (size_t)indexCount * 2, &error);
+	std::string error;
+	auto index = context_.Upload(indices, (size_t)indexCount * sizeof(uint16_t), &error, 4);
 	if (!index) {
 		Error(error);
 		return;
 	}
 	if (Apply(vertices.buffer, vertices.offset)) {
+		context_.UseResource(encoder_, index.buffer, MTLStageVertex, (MTLStages)0);
 		[encoder_ drawIndexedPrimitives:pipeline_->primitive indexCount:indexCount indexType:MTLIndexTypeUInt16 indexBuffer:index.buffer.gpuAddress + (index.offset) indexBufferLength:index.buffer.length - (index.offset) instanceCount:InstanceCount()];
 	}
 }
 
 void MetalDrawContext::DrawIndexedClippedBatchUP(const void *data, int count, const void *indices, int indexCount, Slice<ClippedDraw> draws, const void *uniforms, size_t size) {
 	UpdateDynamicUniformBuffer(uniforms, size);
+	std::map<size_t, Metal::UploadSlice> vertexUploads;
+	uint64_t generation = 0;
 	for (const auto &draw : draws) {
 		if (draw.indexOffset < 0 || draw.indexCount <= 0 || draw.indexOffset > indexCount - draw.indexCount) {
 			continue;
@@ -1748,7 +1814,24 @@ void MetalDrawContext::DrawIndexedClippedBatchUP(const void *data, int count, co
 		} else {
 			BindTexture(0, draw.bindTexture);
 		}
-		DrawIndexedUP(data, count, (const uint16_t *)indices + draw.indexOffset, draw.indexCount);
+		if (!pipeline_ || count <= 0 || !indices || pipeline_->stride <= 0 || !Commands()) {
+			continue;
+		}
+		if (generation != context_.CommandGeneration()) {
+			vertexUploads.clear();
+			generation = context_.CommandGeneration();
+		}
+		std::string error;
+		const size_t bytes = (size_t)count * pipeline_->stride;
+		auto &vertices = vertexUploads[bytes];
+		if (!vertices) {
+			vertices = context_.Upload(data, bytes, &error);
+			if (!vertices) {
+				Error(error);
+				return;
+			}
+		}
+		DrawIndexedUploaded(vertices, (const uint16_t *)indices + draw.indexOffset, draw.indexCount);
 	}
 }
 
@@ -1759,7 +1842,8 @@ void MetalDrawContext::BeginFrame(DebugFlags flags) {
 	attemptedDrawable_ = false;
 	passCount_ = 0;
 	++frameCount_;
-	Commands();
+	// Recycle submission storage at the first GPU operation so CPU emulation
+	// can overlap the previous frame even with a single in-flight slot.
 }
 
 void MetalDrawContext::Present(PresentMode mode) {
@@ -1855,12 +1939,22 @@ void MetalDrawContext::Clear(Aspect aspects, uint32_t color, float depth, int st
 	if (aspects == Aspect::NO_BIT) {
 		return;
 	}
-	EndPass();
-	pass_ = {(aspects & Aspect::COLOR_BIT) ? RPAction::CLEAR : RPAction::KEEP,
-		(aspects & Aspect::DEPTH_BIT) ? RPAction::CLEAR : RPAction::KEEP,
-		(aspects & Aspect::STENCIL_BIT) ? RPAction::CLEAR : RPAction::KEEP,
-		color, depth, (uint8_t)stencil, "Metal clear"};
-	BeginPass();
+	if (encoder_ || discardStoreAspects_ != Aspect::NO_BIT) {
+		EndPass();
+	}
+	if (aspects & Aspect::COLOR_BIT) {
+		pass_.color = RPAction::CLEAR;
+		pass_.clearColor = color;
+	}
+	if (aspects & Aspect::DEPTH_BIT) {
+		pass_.depth = RPAction::CLEAR;
+		pass_.clearDepth = depth;
+	}
+	if (aspects & Aspect::STENCIL_BIT) {
+		pass_.stencil = RPAction::CLEAR;
+		pass_.clearStencil = (uint8_t)stencil;
+	}
+	pass_.tag = "Metal clear";
 }
 
 void MetalDrawContext::InvalidateFramebuffer(FBInvalidationStage stage, Aspect aspects) {
@@ -1924,6 +2018,10 @@ void MetalDrawContext::HandleEvent(Event event, int w, int h, void *p1, void *p2
 }
 
 }  // namespace
+
+bool T3DMetalWriteStencilFromAlpha(DrawContext *draw, Framebuffer *framebuffer) {
+	return static_cast<MetalDrawContext *>(draw)->WriteStencilFromAlpha(framebuffer);
+}
 
 DrawContext *T3DCreateMetalContext(std::string *error) {
 	auto context = std::make_unique<MetalDrawContext>();

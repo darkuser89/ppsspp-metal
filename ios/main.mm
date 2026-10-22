@@ -34,11 +34,16 @@
 #include "Common/StringUtils.h"
 #include "Common/Profiler/Profiler.h"
 #include "Common/Thread/ThreadUtil.h"
+#include "Common/TimeUtil.h"
 #include "Common/System/Display.h"
 #include "Core/Config.h"
 #include "Common/Log.h"
 #include "Common/Log/LogManager.h"
 #include "Core/Util/DarwinFileSystemServices.h"
+
+#if !PPSSPP_PLATFORM(TVOS)
+#import <CoreMotion/CoreMotion.h>
+#endif
 
 // Compile out all the hackery in app store builds. tvOS doesn't have posix_spawn, and there's no
 // jailbreak scene to speak of.
@@ -323,6 +328,7 @@ bool System_GetPropertyBool(SystemProperty prop) {
 	case SYSPROP_HAS_FOLDER_BROWSER:
 	case SYSPROP_HAS_IMAGE_BROWSER:
 	case SYSPROP_HAS_ACCELEROMETER:
+	case SYSPROP_HAS_GYRO:
 	case SYSPROP_HAS_KEYBOARD:
 	case SYSPROP_KEYBOARD_IS_SOFT:
 	case SYSPROP_SUPPORTS_SHARE_TEXT:
@@ -362,6 +368,13 @@ bool System_GetPropertyBool(SystemProperty prop) {
 			return false;
 		case SYSPROP_HAS_ACCELEROMETER:
 			return true;
+#if !PPSSPP_PLATFORM(TVOS)
+		case SYSPROP_HAS_GYRO:
+		{
+			static const bool hasGyro = [[CMMotionManager alloc] init].gyroAvailable;
+			return hasGyro;
+		}
+#endif
 		case SYSPROP_HAS_KEYBOARD:
 			return true;
 		case SYSPROP_SUPPORTS_SHARE_TEXT:
@@ -722,6 +735,8 @@ AudioBackend *System_CreateAudioBackend() {
 }
 
 int main(int argc, char *argv[]) {
+	TimeInit();
+
 	version = [[[UIDevice currentDevice] systemVersion] UTF8String];
 	if (1 != sscanf(version.c_str(), "%d", &g_iosVersionMajor)) {
 		// Just set it to 15 (the minimum) if the parsing fails for whatever reason.

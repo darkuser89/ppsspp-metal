@@ -78,11 +78,6 @@
 // The VFPU's own handling of NaN and denormal results in vadd, vsub, vmul and vdiv (see Int_VecDo3).
 static const bool USE_VFPU_RESULT_FIXUP = false;
 
-// The dot products (vdot, vmmul, vtfm and the rest) through vfpu_dot(), bit-exact with the PSP.
-static inline bool AccurateVdot() {
-	return g_Config.bAccurateVdot || PSP_CoreParameter().compat.flags().ForceAccurateVdot;
-}
-
 union FloatBits {
 	float f[4];
 	u32 u[4];
@@ -260,14 +255,14 @@ namespace MIPSInt
 				float d[4];
 				ReadVector(mips, d, V_Quad, vt);
 				int offset = (addr >> 2) & 3;
-				const bool valid = Memory::IsValid4AlignedAddress(addr);
+				const bool valid = mips->space->IsValid4AlignedAddress(addr);
 				if ((op & 2) == 0) {
 					if (!valid) {
 						Core_MemoryException(addr, 16, PC, MemoryExceptionType::READ_WORD, "lvl.q");
 					}
 					// It's an LVL
 					for (int i = 0; i < offset + 1; i++) {
-						d[3 - i] = valid ? Memory::ReadUnchecked_Float(addr - 4 * i) : 0.0f;
+						d[3 - i] = valid ? mips->space->ReadUnchecked_Float(addr - 4 * i) : 0.0f;
 					}
 				} else {
 					if (!valid) {
@@ -275,7 +270,7 @@ namespace MIPSInt
 					}
 					// It's an LVR
 					for (int i = 0; i < (3 - offset) + 1; i++) {
-						d[i] = valid ? Memory::ReadUnchecked_Float(addr + 4 * i) : 0.0f;
+						d[i] = valid ? mips->space->ReadUnchecked_Float(addr + 4 * i) : 0.0f;
 					}
 				}
 				WriteLoadedVector(mips, d, vt);
@@ -285,7 +280,7 @@ namespace MIPSInt
 		case 54: //lv.q
 			// A quadword access has to be 16-byte aligned, so a misaligned one is simply
 			// rejected - we don't try to carry it out anyway, same as every other path here.
-			if ((addr & 0xF) || !Memory::IsValid4AlignedAddress(addr)) {
+			if ((addr & 0xF) || !mips->space->IsValid4AlignedAddress(addr)) {
 				Core_MemoryException(addr, 16, PC, MemoryExceptionType::READ_WORD, "lv.q");
 				const float zero[4]{};
 				WriteLoadedVector(mips, zero, vt);
@@ -293,15 +288,15 @@ namespace MIPSInt
 			}
 
 #ifndef COMMON_BIG_ENDIAN
-			cf = reinterpret_cast<const float *>(Memory::GetPointerUnchecked(addr));
+			cf = reinterpret_cast<const float *>(mips->space->GetPointerUnchecked(addr));
 			WriteLoadedVector(mips, cf, vt);
 #else
 			float lvqd[4];
 
-			lvqd[0] = Memory::ReadUnchecked_Float(addr);
-			lvqd[1] = Memory::ReadUnchecked_Float(addr + 4);
-			lvqd[2] = Memory::ReadUnchecked_Float(addr + 8);
-			lvqd[3] = Memory::ReadUnchecked_Float(addr + 12);
+			lvqd[0] = mips->space->ReadUnchecked_Float(addr);
+			lvqd[1] = mips->space->ReadUnchecked_Float(addr + 4);
+			lvqd[2] = mips->space->ReadUnchecked_Float(addr + 8);
+			lvqd[3] = mips->space->ReadUnchecked_Float(addr + 12);
 
 			WriteLoadedVector(mips, lvqd, vt);
 #endif
@@ -313,23 +308,23 @@ namespace MIPSInt
 				ReadVector(mips, d, V_Quad, vt);
 				int offset = (addr >> 2) & 3;
 				if ((op & 2) == 0) {
-					if (!Memory::IsValid4AlignedAddress(addr)) {
+					if (!mips->space->IsValid4AlignedAddress(addr)) {
 						Core_MemoryException(addr, 16, PC, MemoryExceptionType::WRITE_WORD, "svl.q");
 						break;
 					}
 					// It's an SVL
 					for (int i = 0; i < offset + 1; i++)
 					{
-						Memory::WriteUnchecked_Float(d[3 - i], addr - i * 4);
+						mips->space->WriteUnchecked_Float(d[3 - i], addr - i * 4);
 					}
 				} else {
-					if (!Memory::IsValid4AlignedAddress(addr)) {
+					if (!mips->space->IsValid4AlignedAddress(addr)) {
 						Core_MemoryException(addr, 16, PC, MemoryExceptionType::WRITE_WORD, "svr.q");
 						break;
 					}
 					// It's an SVR
 					for (int i = 0; i < (3 - offset) + 1; i++) {
-						Memory::WriteUnchecked_Float(d[i], addr + 4 * i);
+						mips->space->WriteUnchecked_Float(d[i], addr + 4 * i);
 					}
 				}
 				break;
@@ -337,12 +332,12 @@ namespace MIPSInt
 
 		case 62: //sv.q
 			// See lv.q above.
-			if ((addr & 0xF) || !Memory::IsValid4AlignedAddress(addr)) {
+			if ((addr & 0xF) || !mips->space->IsValid4AlignedAddress(addr)) {
 				Core_MemoryException(addr, 16, PC, MemoryExceptionType::WRITE_WORD, "sv.q");
 				break;
 			}
 #ifndef COMMON_BIG_ENDIAN
-			f = reinterpret_cast<float *>(Memory::GetPointerWriteUnchecked(addr));
+			f = reinterpret_cast<float *>(mips->space->GetPointerUnchecked(addr));
 			if (f) {
 				ReadVector(mips, f, V_Quad, vt);
 			}
@@ -350,10 +345,10 @@ namespace MIPSInt
 			float svqd[4];
 			ReadVector(mips, svqd, V_Quad, vt);
 
-			Memory::WriteUnchecked_Float(svqd[0], addr);
-			Memory::WriteUnchecked_Float(svqd[1], addr + 4);
-			Memory::WriteUnchecked_Float(svqd[2], addr + 8);
-			Memory::WriteUnchecked_Float(svqd[3], addr + 12);
+			mips->space->WriteUnchecked_Float(svqd[0], addr);
+			mips->space->WriteUnchecked_Float(svqd[1], addr + 4);
+			mips->space->WriteUnchecked_Float(svqd[2], addr + 8);
+			mips->space->WriteUnchecked_Float(svqd[3], addr + 12);
 #endif
 			break;
 
@@ -523,7 +518,6 @@ namespace MIPSInt
 		ReadMatrix(mips, s, sz, vs);
 		ReadMatrix(mips, t, sz, vt);
 
-		bool useAccurateDot = AccurateVdot();
 		for (int a = 0; a < n; a++) {
 			for (int b = 0; b < n; b++) {
 				union { float f; uint32_t u; } sum = { 0.0f };
@@ -533,23 +527,11 @@ namespace MIPSInt
 					ApplySwizzleT(mips, &t[a * 4], V_Quad);
 				}
 
-				if (useAccurateDot) {
-					sum.f = vfpu_dot(&s[b * 4], &t[a * 4]);
-					if (my_isnan(sum.f)) {
-						sum.u = 0x7f800001;
-					} else if ((sum.u & 0x7F800000) == 0) {
-						sum.u &= 0xFF800000;
-					}
-				} else {
-					if (a == n - 1 && b == n - 1) {
-						for (int c = 0; c < 4; c++) {
-							sum.f += s[b * 4 + c] * t[a * 4 + c];
-						}
-					} else {
-						for (int c = 0; c < n; c++) {
-							sum.f += s[b * 4 + c] * t[a * 4 + c];
-						}
-					}
+				sum.f = vfpu_dot(&s[b * 4], &t[a * 4]);
+				if (my_isnan(sum.f)) {
+					sum.u = 0x7f800001;
+				} else if ((sum.u & 0x7F800000) == 0) {
+					sum.u &= 0xFF800000;
 				}
 
 				d[a * 4 + b] = sum.f;
@@ -1225,18 +1207,11 @@ namespace MIPSInt
 		ReadVector(mips, t, sz, vt);
 		ApplySwizzleT(mips, t, V_Quad);
 
-		if (AccurateVdot()) {
-			d.f = vfpu_dot(s, t);
-			if (my_isnan(d.f)) {
-				d.u = 0x7f800001;
-			} else if ((d.u & 0x7F800000) == 0) {
-				d.u &= 0xFF800000;
-			}
-		} else {
-			d.f = 0.0f;
-			for (int i = 0; i < 4; i++) {
-				d.f += s[i] * t[i];
-			}
+		d.f = vfpu_dot(s, t);
+		if (my_isnan(d.f)) {
+			d.u = 0x7f800001;
+		} else if ((d.u & 0x7F800000) == 0) {
+			d.u &= 0xFF800000;
 		}
 
 		ApplyPrefixD(mips, &d.f, V_Single);
@@ -1275,14 +1250,7 @@ namespace MIPSInt
 		}
 		ApplyPrefixST(mips, s, VFPURewritePrefix(mips, VFPU_CTRL_SPREFIX, sprefixRemove, sprefixAdd), V_Quad);
 
-		float sum = 0.0f;
-		if (AccurateVdot()) {
-			sum = vfpu_dot(s, t);
-		} else {
-			for (int i = 0; i < 4; i++) {
-				sum += s[i] * t[i];
-			}
-		}
+		float sum = vfpu_dot(s, t);
 		d = my_isnan(sum) ? fabsf(sum) : sum;
 		ApplyPrefixD(mips, &d, V_Single);
 		WriteVector(mips, &d, V_Single, vd);
@@ -1496,13 +1464,8 @@ namespace MIPSInt
 		u32 tprefixAdd = VFPU_SWIZZLE(1, 0, 0, 0);
 		ApplyPrefixST(mips, t, VFPURewritePrefix(mips, VFPU_CTRL_TPREFIX, tprefixRemove, tprefixAdd), V_Quad);
 
-		if (AccurateVdot()) {
-			s[1] = -s[1];
-			d[0] = vfpu_dot(s, t);
-		} else {
-			d[0] = s[0] * t[0] - s[1] * t[1];
-			d[0] += s[2] * t[2] + s[3] * t[3];
-		}
+		s[1] = -s[1];
+		d[0] = vfpu_dot(s, t);
 
 		ApplyPrefixD(mips, d, V_Single);
 		WriteVector(mips, d, V_Single, vd);
@@ -1524,14 +1487,7 @@ namespace MIPSInt
 		u32 tprefixAdd = VFPU_MAKE_CONSTANTS(VFPUConst::ONE, VFPUConst::ONE, VFPUConst::ONE, VFPUConst::ONE);
 		ApplyPrefixST(mips, t, VFPURewritePrefix(mips, VFPU_CTRL_TPREFIX, tprefixRemove, tprefixAdd), V_Quad);
 
-		if (AccurateVdot()) {
-			d = vfpu_dot(s, t);
-		} else {
-			d = 0.0f;
-			for (int i = 0; i < 4; i++) {
-				d += s[i] * t[i];
-			}
-		}
+		d = vfpu_dot(s, t);
 		ApplyPrefixD(mips, &d, V_Single);
 		WriteVector(mips, &d, V_Single, vd);
 		PC += 4;
@@ -1562,14 +1518,7 @@ namespace MIPSInt
 			tprefixAdd = 0;
 		ApplyPrefixST(mips, t, VFPURewritePrefix(mips, VFPU_CTRL_TPREFIX, tprefixRemove, tprefixAdd), V_Quad);
 
-		if (AccurateVdot()) {
-			d = vfpu_dot(s, t);
-		} else {
-			d = 0.0f;
-			for (int i = 0; i < 4; i++) {
-				d += s[i] * t[i];
-			}
-		}
+		d = vfpu_dot(s, t);
 		ApplyPrefixD(mips, &d, V_Single);
 		WriteVector(mips, &d, V_Single, vd);
 		PC += 4;
@@ -1726,36 +1675,24 @@ namespace MIPSInt
 		ReadMatrix(mips, s, msz, vs);
 		ReadVector(mips, t, sz, vt);
 
-		if (AccurateVdot()) {
-			float t2[4];
-			for (int i = 0; i < 4; i++) {
-				if (i < tn) {
-					t2[i] = t[i];
-				} else if (i == ins) {
-					t2[i] = 1.0f;
-				} else {
-					t2[i] = 0.0f;
-				}
+		float t2[4];
+		for (int i = 0; i < 4; i++) {
+			if (i < tn) {
+				t2[i] = t[i];
+			} else if (i == ins) {
+				t2[i] = 1.0f;
+			} else {
+				t2[i] = 0.0f;
 			}
+		}
 
-			for (int i = 0; i < ins; i++) {
-				d.f[i] = vfpu_dot(&s[i * 4], t2);
+		for (int i = 0; i < ins; i++) {
+			d.f[i] = vfpu_dot(&s[i * 4], t2);
 
-				if (my_isnan(d.f[i])) {
-					d.u[i] = 0x7f800001;
-				} else if ((d.u[i] & 0x7F800000) == 0) {
-					d.u[i] &= 0xFF800000;
-				}
-			}
-		} else {
-			for (int i = 0; i < ins; i++) {
-				d.f[i] = s[i * 4] * t[0];
-				for (int k = 1; k < tn; k++) {
-					d.f[i] += s[i * 4 + k] * t[k];
-				}
-				if (ins >= n) {
-					d.f[i] += s[i * 4 + ins];
-				}
+			if (my_isnan(d.f[i])) {
+				d.u[i] = 0x7f800001;
+			} else if ((d.u[i] & 0x7F800000) == 0) {
+				d.u[i] &= 0xFF800000;
 			}
 		}
 
@@ -1780,19 +1717,12 @@ namespace MIPSInt
 		ApplyPrefixST(mips, t, VFPURewritePrefix(mips, VFPU_CTRL_TPREFIX, tprefixRemove, tprefixAdd), V_Quad);
 
 		// Really this is the operation all rows probably use (with constant wiring.)
-		if (AccurateVdot()) {
-			d.f[ins] = vfpu_dot(&s[ins * 4], t);
+		d.f[ins] = vfpu_dot(&s[ins * 4], t);
 
-			if (my_isnan(d.f[ins])) {
-				d.u[ins] = 0x7f800001;
-			} else if ((d.u[ins] & 0x7F800000) == 0) {
-				d.u[ins] &= 0xFF800000;
-			}
-		} else {
-			d.f[ins] = s[ins * 4] * t[0];
-			for (int k = 1; k < 4; k++) {
-				d.f[ins] += s[ins * 4 + k] * t[k];
-			}
+		if (my_isnan(d.f[ins])) {
+			d.u[ins] = 0x7f800001;
+		} else if ((d.u[ins] & 0x7F800000) == 0) {
+			d.u[ins] &= 0xFF800000;
 		}
 
 		// D prefix applies to the last element only.
@@ -1815,19 +1745,19 @@ namespace MIPSInt
 		switch (op >> 26)
 		{
 		case 50: //lv.s
-			if (!Memory::IsValid4AlignedAddress(addr)) {
+			if (!mips->space->IsValid4AlignedAddress(addr)) {
 				Core_MemoryException(addr, 4, PC, MemoryExceptionType::READ_WORD, "lv.s");
 				VI(vt) = 0;
 				break;
 			}
-			VI(vt) = Memory::ReadUnchecked_U32(addr);
+			VI(vt) = mips->space->ReadUnchecked_U32(addr);
 			break;
 		case 58: //sv.s
-			if (!Memory::IsValid4AlignedAddress(addr)) {
+			if (!mips->space->IsValid4AlignedAddress(addr)) {
 				Core_MemoryException(addr, 4, PC, MemoryExceptionType::WRITE_WORD, "sv.s");
 				break;
 			}
-			Memory::WriteUnchecked_U32(VI(vt), addr);
+			mips->space->WriteUnchecked_U32(VI(vt), addr);
 			break;
 		default:
 			_dbg_assert_msg_(false,"Trying to interpret instruction that can't be interpreted");
@@ -2224,52 +2154,34 @@ namespace MIPSInt
 		switch (sz) {
 		case V_Triple:  // vcrsp.t
 		{
-			if (AccurateVdot()) {
-				float t0[4] = { 0.0f, t[2], -t[1], 0.0f };
-				float t1[4] = { -t[2], 0.0f, t[0], 0.0f };
-				d[0] = vfpu_dot(s, t0);
-				d[1] = vfpu_dot(s, t1);
-			} else {
-				d[0] = s[1] * t[2] - s[2] * t[1];
-				d[1] = s[2] * t[0] - s[0] * t[2];
-			}
+			float t0[4] = { 0.0f, t[2], -t[1], 0.0f };
+			float t1[4] = { -t[2], 0.0f, t[0], 0.0f };
+			d[0] = vfpu_dot(s, t0);
+			d[1] = vfpu_dot(s, t1);
 
 			// T prefix forces swizzle and negate, can be used to have weird constants.
 			tprefixAdd = VFPU_SWIZZLE(1, 0, 3, 2) | VFPU_NEGATE(0, 1, 0, 0);
 			ApplyPrefixST(mips, t, VFPURewritePrefix(mips, VFPU_CTRL_TPREFIX, tprefixRemove, tprefixAdd), V_Quad);
 			ApplySwizzleS(mips, s, V_Quad);
-			if (AccurateVdot()) {
-				// Infinities stay: inf * 0 gives the VFPU's NaN here (cpu/vfpu/nan_gen).
-				d[2] = vfpu_dot(s, t);
-			} else {
-				d[2] = s[0] * t[0] + s[1] * t[1] + s[2] * t[2] + s[3] * t[3];
-			}
+			// Infinities stay: inf * 0 gives the VFPU's NaN here (cpu/vfpu/nan_gen).
+			d[2] = vfpu_dot(s, t);
 			break;
 		}
 
 		case V_Quad:   // vqmul.q
 		{
-			if (AccurateVdot()) {
-				float t0[4] = { t[3], t[2], -t[1], t[0] };
-				float t1[4] = { -t[2], t[3], t[0], t[1] };
-				float t2[4] = { t[1], -t[0], t[3], t[2] };
-				d[0] = vfpu_dot(s, t0);
-				d[1] = vfpu_dot(s, t1);
-				d[2] = vfpu_dot(s, t2);
-			} else {
-				d[0] = s[0] * t[3] + s[1] * t[2] - s[2] * t[1] + s[3] * t[0];
-				d[1] = -s[0] * t[2] + s[1] * t[3] + s[2] * t[0] + s[3] * t[1];
-				d[2] = s[0] * t[1] - s[1] * t[0] + s[2] * t[3] + s[3] * t[2];
-			}
+			float t0[4] = { t[3], t[2], -t[1], t[0] };
+			float t1[4] = { -t[2], t[3], t[0], t[1] };
+			float t2[4] = { t[1], -t[0], t[3], t[2] };
+			d[0] = vfpu_dot(s, t0);
+			d[1] = vfpu_dot(s, t1);
+			d[2] = vfpu_dot(s, t2);
 
 			// T prefix forces swizzle and negate, can be used to have weird constants.
 			tprefixAdd = VFPU_SWIZZLE(0, 1, 2, 3) | VFPU_NEGATE(1, 1, 1, 0);
 			ApplyPrefixST(mips, t, VFPURewritePrefix(mips, VFPU_CTRL_TPREFIX, tprefixRemove, tprefixAdd), V_Quad);
 			ApplySwizzleS(mips, s, sz);
-			if (AccurateVdot())
-				d[3] = vfpu_dot(s, t);
-			else
-				d[3] = s[0] * t[0] + s[1] * t[1] + s[2] * t[2] + s[3] * t[3];
+			d[3] = vfpu_dot(s, t);
 			break;
 		}
 

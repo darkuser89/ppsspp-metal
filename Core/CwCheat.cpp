@@ -1,3 +1,13 @@
+#ifdef PPSSPP_HAS_METAL
+#include "GPU/metal4/PostShaderMetal.h"
+namespace PostShaders = Metal::PostShaders;
+#else
+#include "GPU/Common/PostShader.h"
+namespace PostShaders {
+using ::GetFullPostShadersChain;
+}
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -68,10 +78,9 @@ bool CheatFileParser::Parse() {
 		if (!tempLine)
 			continue;
 
-		// Detect UTF-8 BOM sequence, and ignore it.
-		if (lineNumber == 1 && memcmp(tempLine, "\xEF\xBB\xBF", 3) == 0)
-			tempLine += 3;
-		std::string line = TrimString(tempLine);
+		// Cheats copied from websites can carry invisible characters (like direction marks) that would
+		// break the hex values. This also drops the UTF-8 BOM.
+		std::string line = TrimString(SanitizeString(tempLine, StringRestriction::NoInvisibleFormatting));
 
 		// Minimum length 5 is shortest possible _ lines name of the game "_G N+"
 		// and a minimum of 1 displayable character in cheat name string "_C0 1"
@@ -351,9 +360,12 @@ void CWCheatEngine::ParseCheats() {
 	cheats_ = parser.GetCheats();
 }
 
-std::vector<CheatFileInfo> CWCheatEngine::FileInfo() const {
+std::vector<CheatFileInfo> CWCheatEngine::FileInfo(std::vector<std::string> *errors) const {
 	CheatFileParser parser(filename_, gameID_);
 	parser.Parse();
+	if (errors) {
+		*errors = parser.GetErrors();
+	}
 	return parser.GetFileInfo();
 }
 
@@ -894,7 +906,7 @@ void CWCheatEngine::ExecuteOp(const CheatOperation &op, const CheatCode &cheat, 
 
 	case CheatOp::PostShader:
 		{
-			auto shaderChain = GetFullPostShadersChain(g_Config.vPostShaderNames);
+			auto shaderChain = PostShaders::GetFullPostShadersChain(g_Config.vPostShaderNames);
 			if (op.PostShaderUniform.shader < shaderChain.size()) {
 				std::string shaderName = shaderChain[op.PostShaderUniform.shader]->section;
 				g_Config.mPostShaderSetting[StringFromFormat("%sSettingCurrentValue%d", shaderName.c_str(), op.PostShaderUniform.uniform + 1)] = op.PostShaderUniform.value.f;
@@ -904,7 +916,7 @@ void CWCheatEngine::ExecuteOp(const CheatOperation &op, const CheatCode &cheat, 
 
 	case CheatOp::PostShaderFromMemory:
 		{
-			auto shaderChain = GetFullPostShadersChain(g_Config.vPostShaderNames);
+			auto shaderChain = PostShaders::GetFullPostShadersChain(g_Config.vPostShaderNames);
 			if (Memory::IsValidRange(op.addr, 4) && op.PostShaderUniform.shader < shaderChain.size()) {
 				union {
 					float f;

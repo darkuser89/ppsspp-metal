@@ -55,11 +55,17 @@ struct CompiledShader {
 	bool needsViewMaskBuffer = false;
 };
 
+struct ShaderCompileTimings {
+	double glslSeconds = 0.0;
+	double spirvSeconds = 0.0;
+	double mslSeconds = 0.0;
+};
+
 // Consumes the GLSL 450 produced by the shared shader generators, not arbitrary
 // SPIR-V. ShaderTranslationInit must precede calls, and ShaderTranslationShutdown
 // must follow completion of all shader compilation jobs.
 // Does not create a Vulkan instance or use Vulkan types.
 bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompileOptions &options,
-	CompiledShader *result, std::string *error);
+	CompiledShader *result, std::string *error, ShaderCompileTimings *timings = nullptr);
 
 }  // namespace Metal

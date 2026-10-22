@@ -102,6 +102,8 @@ public:
 	bool Blit(RenderContext &context, Framebuffer *src, int sx, int sy, int srcWidth, int srcHeight,
 		Framebuffer *dst, int dx, int dy, int dstWidth, int dstHeight, Draw::Aspect aspects,
 		Draw::FBBlitFilter filter, std::string *error);
+	bool StencilFromAlpha(RenderContext &context, Framebuffer *dst, std::string *error,
+		id<MTL4RenderCommandEncoder> activeEncoder = nil);
 
 private:
 	struct Pipeline {

@@ -332,13 +332,14 @@ Texture *Texture::Create(RenderContext &context, const Draw::TextureDesc &desc, 
 				return nullptr;
 			}
 		}
-		id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(commands, "Mipmap generation");
+		id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(commands, "Mipmap generation", true);
 		if (!blit) {
 			*error = "Failed to encode Metal mipmap generation";
 			texture->Release();
 			return nullptr;
 		}
 		context.Keep(mipTarget);
+		context.UseResource(blit, mipTarget, MTLStageBlit, MTLStageBlit);
 		[blit generateMipmapsForTexture:mipTarget];
 		context.EndEncoder(blit);
 	}
@@ -393,7 +394,7 @@ bool Texture::UpdateRegions(RenderContext &context, int level, const Draw::Textu
 		}
 		pending.push_back({upload, pitch});
 	}
-	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Texture region update");
+	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Texture region update", true);
 	if (!blit) {
 		*error = "Failed to start Metal texture update";
 		return false;
@@ -403,6 +404,8 @@ bool Texture::UpdateRegions(RenderContext &context, int level, const Draw::Textu
 		const auto &staged = pending[i];
 		context.Keep(staged.upload.buffer);
 		context.Keep(texture_);
+		context.UseResource(blit, staged.upload.buffer, MTLStageBlit, (MTLStages)0);
+		context.UseResource(blit, texture_, (MTLStages)0, MTLStageBlit);
 		[blit copyFromBuffer:staged.upload.buffer sourceOffset:staged.upload.offset sourceBytesPerRow:staged.pitch
 			sourceBytesPerImage:staged.pitch * region.h sourceSize:MTLSizeMake(region.w, region.h, 1)
 			toTexture:texture_ destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(region.x, region.y, 0)];
@@ -477,7 +480,7 @@ bool Texture::Upload(RenderContext &context, const uint8_t *const *data, Draw::T
 		}
 		staging[level] = upload;
 	}
-	id<MTL4ComputeCommandEncoder> blit = initialize ? context.InitializationBlitEncoder(error) : context.BlitEncoder(context.Commands(), "Texture upload");
+	id<MTL4ComputeCommandEncoder> blit = initialize ? context.InitializationBlitEncoder(error) : context.BlitEncoder(context.Commands(), "Texture upload", true);
 	if (!blit) {
 		if (error->empty()) {
 			*error = "Failed to encode Metal texture upload";
@@ -492,6 +495,8 @@ bool Texture::Upload(RenderContext &context, const uint8_t *const *data, Draw::T
 		const size_t rows = compressed ? (h + 3) / 4 : h;
 		context.Keep(staging[level].buffer);
 		context.Keep(texture_);
+		context.UseResource(blit, staging[level].buffer, MTLStageBlit, (MTLStages)0);
+		context.UseResource(blit, texture_, (MTLStages)0, MTLStageBlit);
 		[blit copyFromBuffer:staging[level].buffer sourceOffset:staging[level].offset sourceBytesPerRow:pitch sourceBytesPerImage:pitch * rows
 			sourceSize:MTLSizeMake(w, h, std::max(1, depth_ >> level)) toTexture:texture_ destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(0, 0, 0)];
 	}
@@ -769,7 +774,7 @@ bool CopyImage(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
 			return false;
 		}
 	}
-	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Image copy");
+	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Image copy", true);
 	if (!blit) {
 		*error = "Failed to encode Metal image copy";
 		return false;
@@ -779,6 +784,8 @@ bool CopyImage(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
 		for (NSUInteger layer = 0; layer < layers; ++layer) {
 			context.Keep(src);
 			context.Keep(temporary);
+			context.UseResource(blit, src, MTLStageBlit, (MTLStages)0);
+			context.UseResource(blit, temporary, (MTLStages)0, MTLStageBlit);
 			[blit copyFromTexture:src sourceSlice:layer sourceLevel:0 sourceOrigin:MTLOriginMake(srcX, srcY, 0)
 				sourceSize:MTLSizeMake(width, height, 1) toTexture:temporary destinationSlice:layer destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
 		}
@@ -789,6 +796,8 @@ bool CopyImage(RenderContext &context, id<MTLTexture> src, int srcX, int srcY,
 	for (NSUInteger layer = 0; layer < layers; ++layer) {
 		context.Keep(src);
 		context.Keep(dst);
+		context.UseResource(blit, src, MTLStageBlit, (MTLStages)0);
+		context.UseResource(blit, dst, (MTLStages)0, MTLStageBlit);
 		[blit copyFromTexture:src sourceSlice:layer sourceLevel:0 sourceOrigin:MTLOriginMake(srcX, srcY, 0)
 			sourceSize:MTLSizeMake(width, height, 1) toTexture:dst destinationSlice:layer destinationLevel:0 destinationOrigin:MTLOriginMake(dstX, dstY, 0)];
 	}
@@ -819,14 +828,14 @@ bool CopyDepthStencil(RenderContext &context, id<MTLTexture> src, int srcX, int 
 	const bool depth = aspects == Draw::Aspect::DEPTH_BIT;
 	const MTLBlitOption option = depth ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionStencilFromDepthStencil;
 	const size_t pitch = ((size_t)width * (depth ? 4 : 1) + 255) & ~size_t(255);
-	id<MTLBuffer> plane = [context.Device() newBufferWithLength:pitch * height options:MTLResourceStorageModePrivate];
-	if (!plane || !EnsureCommands(context, error)) {
-		if (error->empty()) {
-			*error = "Failed to allocate Metal depth/stencil copy buffer";
-		}
+	if (!EnsureCommands(context, error)) {
 		return false;
 	}
-	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Depth/stencil copy");
+	id<MTLBuffer> plane = context.AcquireCopyPlane(pitch * height, error);
+	if (!plane) {
+		return false;
+	}
+	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Depth/stencil copy", true);
 	if (!blit) {
 		*error = "Failed to encode Metal depth/stencil copy";
 		return false;
@@ -834,6 +843,9 @@ bool CopyDepthStencil(RenderContext &context, id<MTLTexture> src, int srcX, int 
 	for (NSUInteger layer = 0; layer < std::min(src.arrayLength, dst.arrayLength); ++layer) {
 		context.Keep(src);
 		context.Keep(plane);
+		context.UseResource(blit, src, MTLStageBlit, (MTLStages)0);
+		context.UseResource(blit, plane, MTLStageBlit, MTLStageBlit);
+		context.UseResource(blit, dst, (MTLStages)0, MTLStageBlit);
 		[blit copyFromTexture:src sourceSlice:layer sourceLevel:0 sourceOrigin:MTLOriginMake(srcX, srcY, 0)
 			sourceSize:MTLSizeMake(width, height, 1) toBuffer:plane destinationOffset:0
 			destinationBytesPerRow:pitch destinationBytesPerImage:pitch * height options:option];
@@ -846,6 +858,103 @@ bool CopyDepthStencil(RenderContext &context, id<MTLTexture> src, int srcX, int 
 		[blit barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
 	}
 	context.EndEncoder(blit);
+	return true;
+}
+
+bool FramebufferCopy::StencilFromAlpha(RenderContext &context, Framebuffer *dst, std::string *error,
+	id<MTL4RenderCommandEncoder> activeEncoder) {
+	error->clear();
+	if (!dst || !dst->DepthStencil() || dst->SampleCount() != 1 || dst->Layers() != 1 ||
+		(dst->Color().pixelFormat != MTLPixelFormatRGBA8Unorm && dst->Color().pixelFormat != MTLPixelFormatBGRA8Unorm)) {
+		*error = "Invalid Metal alpha-to-stencil framebuffer";
+		return false;
+	}
+	const std::array<uint64_t, 7> key{1ull << 32, 0, 0, 0, 1, (uint64_t)dst->Color().pixelFormat,
+		(uint64_t)MTLPixelFormatDepth32Float_Stencil8};
+	auto found = pipelines_.find(key);
+	if (found == pipelines_.end()) {
+		CompiledShader vertex;
+		vertex.entryPoint = "stencilVertex";
+		vertex.source = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 stencilVertex(uint id [[vertex_id]]) {
+	float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+	return float4(p[id], 0, 1);
+}
+)";
+		CompiledShader fragment;
+		fragment.entryPoint = "stencilFragment";
+		fragment.source = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct StencilOut {
+	float4 color [[color(0)]];
+	uint stencil [[stencil]];
+};
+fragment StencilOut stencilFragment(float4 color [[color(0)]]) {
+	return {color, uint(floor(color.a * 255.99f))};
+}
+)";
+		auto vs = context.CreateShader(vertex, "Metal alpha-to-stencil vertex", error);
+		auto fs = context.CreateShader(fragment, "Metal alpha-to-stencil fragment", error);
+		if (!vs || !fs) {
+			return false;
+		}
+		MTL4RenderPipelineDescriptor *pd = [MTL4RenderPipelineDescriptor new];
+		pd.vertexFunctionDescriptor = context.FunctionDescriptor(vs);
+		pd.fragmentFunctionDescriptor = context.FunctionDescriptor(fs);
+		pd.colorAttachments[0].pixelFormat = dst->Color().pixelFormat;
+		pd.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+		NSError *nativeError = nil;
+		Pipeline pipeline;
+		pipeline.render = [context.Compiler() newRenderPipelineStateWithDescriptor:pd compilerTaskOptions:nil error:&nativeError];
+		if (!pipeline.render) {
+			*error = nativeError ? nativeError.localizedDescription.UTF8String : "Failed to create Metal alpha-to-stencil pipeline";
+			return false;
+		}
+		MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+		dd.depthCompareFunction = MTLCompareFunctionAlways;
+		dd.depthWriteEnabled = false;
+		MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+		sd.stencilCompareFunction = MTLCompareFunctionAlways;
+		sd.depthStencilPassOperation = MTLStencilOperationReplace;
+		dd.frontFaceStencil = dd.backFaceStencil = sd;
+		pipeline.depthStencil = [context.Device() newDepthStencilStateWithDescriptor:dd];
+		if (!pipeline.depthStencil) {
+			*error = "Failed to create Metal alpha-to-stencil state";
+			return false;
+		}
+		found = pipelines_.emplace(key, pipeline).first;
+	}
+	if (!EnsureCommands(context, error)) {
+		return false;
+	}
+	auto encoder = activeEncoder;
+	if (!encoder) {
+		MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+		dst->SetRenderAttachments(rp);
+		rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		rp.depthAttachment.loadAction = MTLLoadActionLoad;
+		// Every stencil pixel is replaced, while color and depth stay unchanged.
+		rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+		context.ProfileRenderPass(rp, "Alpha-to-stencil framebuffer fetch");
+		encoder = context.RenderEncoder(context.Commands(), rp);
+	}
+	if (!encoder) {
+		*error = "Failed to encode Metal alpha-to-stencil pass";
+		return false;
+	}
+	context.Keep({found->second.render, found->second.depthStencil});
+	[encoder setRenderPipelineState:found->second.render];
+	[encoder setDepthStencilState:found->second.depthStencil];
+	[encoder setViewport:MTLViewport{0, 0, (double)dst->Width(), (double)dst->Height(), 0, 1}];
+	[encoder setScissorRect:MTLScissorRect{0, 0, (NSUInteger)dst->Width(), (NSUInteger)dst->Height()}];
+	[encoder setCullMode:MTLCullModeNone];
+	[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	if (!activeEncoder) {
+		context.EndEncoder(encoder);
+	}
 	return true;
 }
 
@@ -1115,13 +1224,15 @@ bool Readback(RenderContext &context, id<MTLTexture> texture, Draw::Aspect aspec
 		}
 		return false;
 	}
-	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Framebuffer readback");
+	id<MTL4ComputeCommandEncoder> blit = context.BlitEncoder(context.Commands(), "Framebuffer readback", true);
 	if (!blit) {
 		*error = "Failed to encode Metal readback";
 		return false;
 	}
 	context.Keep(texture);
 	context.Keep(readback);
+	context.UseResource(blit, texture, MTLStageBlit, (MTLStages)0);
+	context.UseResource(blit, readback, (MTLStages)0, MTLStageBlit);
 	[blit copyFromTexture:texture sourceSlice:texture.textureType == MTLTextureType2DArray ? z : 0
 		sourceLevel:level sourceOrigin:MTLOriginMake(x, y, texture.textureType == MTLTextureType3D ? z : 0)
 		sourceSize:MTLSizeMake(width, height, 1) toBuffer:readback destinationOffset:0

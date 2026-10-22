@@ -249,7 +249,12 @@ enum TiltTypes {
 	TILT_DPAD,
 	TILT_ACTION_BUTTON,
 	TILT_TRIGGER_BUTTONS,
+	TILT_ANALOG_RIGHT,
 };
+
+inline bool TiltTypeIsAnalog(int type) {
+	return type == TILT_ANALOG || type == TILT_ANALOG_RIGHT;
+}
 
 enum class ScreenEdgePosition {
 	BOTTOM_LEFT = 0,
@@ -277,6 +282,7 @@ enum class DebugOverlay : int {
 	GPU_PROFILE,
 	GPU_ALLOCATOR,
 	FRAMEBUFFER_LIST,
+	JIT_STATS,
 };
 
 // Android-only for now

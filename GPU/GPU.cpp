@@ -40,6 +40,10 @@
 #include "GPU/D3D11/GPU_D3D11.h"
 #endif
 
+#if PPSSPP_API(METAL) && !defined(PPSSPP_HAS_METAL)
+#include "GPU/Metal/GPU_Metal.h"
+#endif
+
 GPUStatistics gpuStats;
 GPUCommon *gpu;
 
@@ -61,6 +65,8 @@ static GPUCommon *CreateGPUCore(GPUCore gpuCore, GraphicsContext *ctx, Draw::Dra
 	case GPUCORE_METAL:
 #ifdef PPSSPP_HAS_METAL
 		return draw ? CreateMetalGPU(ctx, draw) : nullptr;
+#elif PPSSPP_API(METAL)
+		return new GPU_Metal(ctx, draw);
 #else
 		return nullptr;
 #endif

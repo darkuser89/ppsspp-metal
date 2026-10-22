@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "Common/TimeUtil.h"
+
 #include "ext/glslang/SPIRV/GlslangToSpv.h"
 
 // The existing SPIRV-Cross targets abort on unsupported input. Metal uses a
@@ -19,7 +21,11 @@
 namespace Metal {
 
 bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompileOptions &options,
-	CompiledShader *result, std::string *error) {
+	CompiledShader *result, std::string *error, ShaderCompileTimings *timings) {
+	double phaseStart = timings ? time_now_d() : 0.0;
+	if (timings) {
+		*timings = {};
+	}
 	if (!result || !error) {
 		return false;
 	}
@@ -71,9 +77,19 @@ bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompi
 		*error = std::string("Metal GLSL link failed: ") + program.getInfoLog() + program.getInfoDebugLog();
 		return false;
 	}
+	if (timings) {
+		const double now = time_now_d();
+		timings->glslSeconds = now - phaseStart;
+		phaseStart = now;
+	}
 	std::vector<uint32_t> spirv;
 	glslang::SpvOptions spvOptions{};
 	glslang::GlslangToSpv(*program.getIntermediate(language), spirv, &spvOptions);
+	if (timings) {
+		const double now = time_now_d();
+		timings->spirvSeconds = now - phaseStart;
+		phaseStart = now;
+	}
 
 	try {
 		ppsspp_metal_spirv::CompilerMSL compiler(std::move(spirv));
@@ -180,6 +196,9 @@ bool CompileShader(std::string_view source, ShaderStage stage, const ShaderCompi
 			for (int i = 0; i < 3; ++i) {
 				compiled.workgroupSize[i] = compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize, i);
 			}
+		}
+		if (timings) {
+			timings->mslSeconds = time_now_d() - phaseStart;
 		}
 		*result = std::move(compiled);
 		return true;

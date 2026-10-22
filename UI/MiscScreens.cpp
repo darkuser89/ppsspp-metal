@@ -70,9 +70,9 @@ void HandleCommonMessages(UIMessage message, const char *value, ScreenManager *m
 
 	if (message == UIMessage::REQUEST_CLEAR_JIT && PSP_IsInited()) {
 		// TODO: This seems to clearly be the wrong place to handle this.
-		if (MIPSComp::jit) {
-			if (MIPSComp::jit)
-				MIPSComp::jit->ClearCache();
+		if (mipsr4k.jit) {
+			if (mipsr4k.jit)
+				mipsr4k.jit->ClearCache();
 		}
 		currentMIPS->UpdateCore((CPUCore)g_Config.iCpuCore);
 	} else if (message == UIMessage::SHOW_CONTROL_MAPPING && isActiveScreen && std::string(activeScreen->tag()) != "ControlMapping") {
@@ -243,15 +243,16 @@ TextureShaderScreen::TextureShaderScreen(std::string_view title) : ListPopupScre
 
 void TextureShaderScreen::CreateViews() {
 	auto ps = GetI18NCategory(I18NCat::TEXTURESHADERS);
-	ReloadAllPostShaderInfo(screenManager()->getDrawContext());
-	
-	shaders_ = GetAllTextureShaderInfo();
 #ifdef PPSSPP_HAS_METAL
 	if (Metal::IsBackend(screenManager()->getDrawContext())) {
 		MetalReloadAllPostShaderInfo(screenManager()->getDrawContext());
 		shaders_ = MetalTextureShaderList();
-	}
+	} else
 #endif
+	{
+		ReloadAllPostShaderInfo(screenManager()->getDrawContext());
+		shaders_ = GetAllTextureShaderInfo();
+	}
 	for (int i = 0; i < (int)shaders_.size(); ) {
 		if (shaders_[i].hidden
 #ifdef PPSSPP_HAS_METAL
@@ -381,7 +382,7 @@ void LogoScreen::Next() {
 		switch (afterLogoScreen_) {
 		case AfterLogoScreen::TO_GAME_SETTINGS:
 			if (!gamePath.empty()) {
-				screenManager()->switchScreen(new EmuScreen(gamePath));
+				screenManager()->switchScreen(new EmuScreen(gamePath, boot_mountIso));
 			} else {
 				screenManager()->switchScreen(new MainScreen());
 			}
@@ -393,7 +394,7 @@ void LogoScreen::Next() {
 		case AfterLogoScreen::DEFAULT:
 		default:
 			if (boot_filename.size()) {
-				screenManager()->switchScreen(new EmuScreen(gamePath));
+				screenManager()->switchScreen(new EmuScreen(gamePath, boot_mountIso));
 			} else {
 				screenManager()->switchScreen(new MainScreen());
 			}

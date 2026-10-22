@@ -3,6 +3,7 @@
 
 #pragma once
 #include "GPU/metal4/ShaderBindingsMetal.h"
+#include "GPU/metal4/ShaderTranslationCacheMetal.h"
 
 #include <array>
 #include <map>
@@ -22,6 +23,7 @@ struct MetalGEShader {
 	std::string source;
 	std::string error;
 	uint64_t uniformMask = 0;
+	uint64_t translationOptions = UINT64_MAX;
 };
 
 struct MetalGEVertexShader : MetalGEShader {
@@ -64,6 +66,15 @@ public:
 	int GetNumFragmentShaders() const { return (int)fragmentCache_.size(); }
 	bool LoadCache(const Path &filename);
 	void SaveCache(const Path &filename) const;
+	struct CompileMetrics {
+		double generationSeconds = 0.0;
+		double frontendSeconds = 0.0;
+		Metal::ShaderCompileTimings phases;
+		uint64_t generated = 0;
+		uint64_t translated = 0;
+		uint64_t translationCacheHits = 0;
+	};
+	const CompileMetrics &Metrics() const { return compileMetrics_; }
 
 	// Uploads immutable snapshots. Failure retains the previous snapshots and all
 	// dirty flags. Upload slices remain immutable until their submission finishes,
@@ -85,12 +96,18 @@ private:
 	std::map<FShaderID, std::unique_ptr<MetalGEFragmentShader>> fragmentCache_;
 	std::array<char, 32768> code_{};
 	uint64_t generation_ = 0;
+	CompileMetrics compileMetrics_;
+	Metal::TranslationCache::Record *loadingTranslation_ = nullptr;
 	u32 useFlags_ = 0;
 	bool vendorChecks_ = false;
 	UB_VS_FS_Base base_{};
 	UB_VS_Lights lights_{};
 	MetalGEUniformBuffers buffers_;
 	MetalGEUniformBuffers boundBuffers_;
+	MetalGERasterUniforms raster_{};
+	Metal::UploadSlice rasterBuffer_;
+	Metal::UploadSlice boundRasterBuffer_;
+	uint64_t rasterGeneration_ = 0;
 	uint64_t boundRenderStateSerial_ = 0;
 	bool boundUniformsValid_ = false;
 	bool boundStereoViewMask_ = false;

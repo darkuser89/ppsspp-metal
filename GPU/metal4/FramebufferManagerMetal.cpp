@@ -20,6 +20,7 @@
 #include <cmath>
 
 #include "Common/GPU/thin3d.h"
+#include "Common/GPU/metal4/thin3d_metal.h"
 #include "Common/Data/Collections/TinySet.h"
 #include "Common/Data/Convert/ColorConv.h"
 #include "Common/LogReporting.h"
@@ -327,6 +328,13 @@ VirtualFramebuffer *FramebufferManagerMetal::DoSetRenderFrameBuffer(FramebufferH
 	// we need to infer the size of the current framebuffer somehow.
 	int drawing_width, drawing_height;
 	EstimateDrawingSize(params.fb_address, std::max(params.fb_stride, (u16)4), params.fb_format, params.viewportWidth, params.viewportHeight, params.regionWidth, params.regionHeight, params.scissorRight, params.scissorBottom, drawing_width, drawing_height);
+	// compat.ini's FixedFramebuffer: always this size, and read and written outside where it's drawn.
+	const CompatFramebuffer &fixed = PSP_CoreParameter().compat.flags().FixedFramebuffer;
+	const bool fixedFb = fixed.address != 0 && params.fb_address == fixed.address && params.fb_stride == fixed.width;
+	if (fixedFb) {
+		drawing_width = fixed.width;
+		drawing_height = fixed.height;
+	}
 
 	if (params.fb_address == params.z_address) {
 		// Most likely Z will not be used in this pass, as that would wreak havoc (undefined behavior for sure)
@@ -517,7 +525,8 @@ VirtualFramebuffer *FramebufferManagerMetal::DoSetRenderFrameBuffer(FramebufferH
 		currentRenderVfb_ = vfb;
 
 		// Assume that if we're clearing right when switching to a new framebuffer, we don't need to upload.
-		if (useBufferedRendering_ && params.isDrawing && vfb->fb_stride > 0) {
+		// A fixed framebuffer has data outside where this draw goes.
+		if (useBufferedRendering_ && (params.isDrawing || fixedFb) && vfb->fb_stride > 0) {
 			gpu->PerformWriteColorFromMemory(params.fb_address, colorByteSize);
 			// Alpha was already done by PerformWriteColorFromMemory.
 			PerformWriteStencilFromMemory(params.fb_address, colorByteSize, WriteStencil::STENCIL_IS_ZERO | WriteStencil::IGNORE_ALPHA);
@@ -880,7 +889,9 @@ void FramebufferManagerMetal::CopyToColorFromOverlappingFramebuffers(VirtualFram
 			}
 
 			if (pipeline && src->fb_format != dst->fb_format) {
-				WriteStencilFromFramebufferAlpha(dst);
+				if (dst->fb_format != GE_FORMAT_565 && !Draw::T3DMetalWriteStencilFromAlpha(draw_, dst->fbo)) {
+					WriteStencilFromFramebufferAlpha(dst);
+				}
 			}
 		}
 	}
@@ -1024,7 +1035,7 @@ void FramebufferManagerMetal::ShiftDepthForOffsetRendering(VirtualFramebuffer *v
 	if (w <= 0) {
 		return;
 	}
-	Draw::Framebuffer *temp = GetTempFBO(TempFBO::DEPTH_SHIFT, vfb->renderWidth, vfb->renderHeight);
+	Draw::Framebuffer *temp = GetTempFBO(TempFBO::DEPTH_SHIFT, vfb->renderWidth, vfb->renderHeight, vfb->fbo->MultiSampleLevel());
 	if (!temp) {
 		return;
 	}
@@ -1260,7 +1271,10 @@ void FramebufferManagerMetal::DrawPixels(VirtualFramebuffer *vfb, int dstX, int 
 	if (useBufferedRendering_ && vfb) {
 		_dbg_assert_(vfb->fbo);
 		if (vfb->fbo) {
-			if (channel == RASTER_DEPTH || PSP_CoreParameter().compat.flags().NearestFilteringOnFramebufferCreate) {
+			// A fixed framebuffer holds data that's read back.
+			const u32 fixedAddress = PSP_CoreParameter().compat.flags().FixedFramebuffer.address;
+			const bool fixedFb = fixedAddress != 0 && vfb->fb_address == fixedAddress;
+			if (channel == RASTER_DEPTH || PSP_CoreParameter().compat.flags().NearestFilteringOnFramebufferCreate || fixedFb) {
 				flags = DRAWTEX_NEAREST;
 			} else {
 				flags = DRAWTEX_LINEAR;
@@ -1423,6 +1437,16 @@ void FramebufferManagerMetal::CopyFramebufferForColorTexture(VirtualFramebuffer 
 		}
 		BlitFramebuffer(dst, x, y, src, x, y, w, h, 0, RASTER_COLOR, "CopyFBForColorTexture");
 	}
+}
+
+// Whether the 480x272 the display shows from addr is all in memory. The PSP takes strides that
+// aren't: negative ones (rows going up, which this doesn't handle), and larger than VRAM has room for.
+static bool IsValidDisplayRange(u32 addr, int stride, GEBufferFormat format) {
+	if (stride <= 0) {
+		return false;
+	}
+	const u32 bpp = BufferFormatBytesPerPixel(format);
+	return Memory::IsValidRange(addr, ((272 - 1) * (u32)stride + 480) * bpp);
 }
 
 Draw::Texture *FramebufferManagerMetal::MakePixelTexture(const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, int width, int height) {
@@ -1701,8 +1725,10 @@ VirtualFramebuffer *FramebufferManagerMetal::FindDisplayVFB(u32 fbaddr, u32 *off
 		}
 	}
 
-	// Reject too-tiny framebuffers to display (Godfather, see issue #16915).
-	if (vfb && vfb->height < 64) {
+	// Reject too-tiny framebuffers to display (Godfather, see issue #16915). By the buffer's size: width
+	// and height only cover the latest draw, which can be small (the OoT PSP port ends its frames with
+	// a 51x51 one).
+	if (vfb && vfb->bufferHeight < 64) {
 		vfb = nullptr;
 	}
 	return vfb;
@@ -1733,7 +1759,7 @@ void FramebufferManagerMetal::PrepareCopyDisplayToOutput(const DisplayLayoutConf
 	VirtualFramebuffer *vfb = FindDisplayVFB(fbaddr, &offsetX, &offsetY);
 
 	if (!vfb) {
-		if (Memory::IsValidAddress(fbaddr)) {
+		if (IsValidDisplayRange(fbaddr, displayStride_, displayFormat_)) {
 			// The game is displaying something directly from RAM. In GTA, it's decoded video.
 			// If successful, this effectively calls presentation_->NotifyPresent();
 			if (!DrawFramebufferToOutput(config, Memory::GetPointerUnchecked(fbaddr), displayStride_, displayFormat_)) {
@@ -1918,6 +1944,11 @@ void FramebufferManagerMetal::ResizeFramebufFBO(VirtualFramebuffer *vfb, int w, 
 	if (PSP_CoreParameter().compat.flags().Force04154000Download && vfb->fb_address == 0x04154000) {
 		force1x = true;
 	}
+	// compat.ini's NativeResolutionFramebuffer, which holds data read back texel by texel.
+	const u32 nativeResAddress = PSP_CoreParameter().compat.flags().NativeResolutionFramebuffer;
+	if (nativeResAddress != 0 && vfb->fb_address == nativeResAddress) {
+		force1x = true;
+	}
 
 	if (force1x && g_Config.iInternalResolution != 1) {
 		vfb->renderScaleFactor = 1;
@@ -1930,6 +1961,11 @@ void FramebufferManagerMetal::ResizeFramebufFBO(VirtualFramebuffer *vfb, int w, 
 	}
 
 	bool creating = old.bufferWidth == 0;
+#if PPSSPP_PLATFORM(MAC)
+	vfb->multisampled = ShouldMultisample(vfb);
+#else
+	vfb->multisampled = true;
+#endif
 	if (creating) {
 		INFO_LOG(Log::FrameBuf, "Creating %s FBO at %08x/%08x stride=%d %dx%d (force=%d)", GeBufferFormatToString(vfb->fb_format), vfb->fb_address, vfb->z_address, vfb->fb_stride, vfb->bufferWidth, vfb->bufferHeight, (int)force);
 	} else {
@@ -1962,7 +1998,7 @@ void FramebufferManagerMetal::ResizeFramebufFBO(VirtualFramebuffer *vfb, int w, 
 
 	gpuStats.perFrame.numFBOsCreated++;
 
-	vfb->fbo = draw_->CreateFramebuffer({ vfb->renderWidth, vfb->renderHeight, 1, GetFramebufferLayers(), msaaLevel_, true, tag });
+	vfb->fbo = draw_->CreateFramebuffer({ vfb->renderWidth, vfb->renderHeight, 1, GetFramebufferLayers(), vfb->multisampled ? msaaLevel_ : 0, true, tag });
 	if (Memory::IsVRAMAddress(vfb->fb_address) && vfb->fb_stride != 0) {
 		NotifyMemInfo(MemBlockFlags::ALLOC, vfb->fb_address, vfb->BufferByteSize(RASTER_COLOR), tag, len);
 	}
@@ -2960,7 +2996,7 @@ void FramebufferManagerMetal::NotifyBlockTransferAfter(u32 dstBasePtr, int dstSt
 	if (!useBufferedRendering_ && dstStride >= 480 && width >= 480 && height == 272) {
 		bool isPrevDisplayBuffer = PrevDisplayFramebufAddr() == dstBasePtr;
 		bool isDisplayBuffer = CurrentDisplayFramebufAddr() == dstBasePtr;
-		if (isPrevDisplayBuffer || isDisplayBuffer) {
+		if ((isPrevDisplayBuffer || isDisplayBuffer) && IsValidDisplayRange(dstBasePtr, dstStride, displayFormat_)) {
 			FlushBeforeCopy();
 			// HACK
 			DrawFramebufferToOutput(displayLayoutConfigCopy_, Memory::GetPointerUnchecked(dstBasePtr), dstStride, displayFormat_);
@@ -3064,6 +3100,9 @@ void FramebufferManagerMetal::NotifyConfigChanged() {
 void FramebufferManagerMetal::DestroyAllFBOs() {
 	DiscardFramebufferCopy();
 	currentRenderVfb_ = nullptr;
+	// Or a new framebuffer at the same address would skip its depth shift.
+	depthShiftedFor_ = 0;
+	lastRenderAddress_ = 0;
 	displayFramebuf_ = nullptr;
 	prevDisplayFramebuf_ = nullptr;
 	prevPrevDisplayFramebuf_ = nullptr;
@@ -3129,8 +3168,11 @@ Draw::Framebuffer *FramebufferManagerMetal::CopyColorSample0(VirtualFramebuffer 
 	return copy;
 }
 
-Draw::Framebuffer *FramebufferManagerMetal::GetTempFBO(TempFBO reason, u16 w, u16 h) {
-	u64 key = ((u64)reason << 48) | ((u32)w << 16) | h;
+Draw::Framebuffer *FramebufferManagerMetal::GetTempFBO(TempFBO reason, u16 w, u16 h, int msaaLevel) {
+	if (reason != TempFBO::DEPTH_SHIFT) {
+		msaaLevel = 0;
+	}
+	u64 key = ((u64)msaaLevel << 56) | ((u64)reason << 48) | ((u32)w << 16) | h;
 	auto it = tempFBOs_.find(key);
 	if (it != tempFBOs_.end()) {
 		it->second.last_frame_used = gpuStats.totals.numFlips;
@@ -3138,8 +3180,6 @@ Draw::Framebuffer *FramebufferManagerMetal::GetTempFBO(TempFBO reason, u16 w, u1
 	}
 
 	bool z_stencil = reason == TempFBO::STENCIL || reason == TempFBO::DEPTH_SHIFT;
-	// The depth shift copies to and from a framebuffer, which needs the same samples.
-	const int msaaLevel = reason == TempFBO::DEPTH_SHIFT ? msaaLevel_ : 0;
 	char name[128];
 	snprintf(name, sizeof(name), "tempfbo_%s_%dx%d", TempFBOReasonToString(reason), w / renderScaleFactor_, h / renderScaleFactor_);
 
@@ -3342,9 +3382,6 @@ bool FramebufferManagerMetal::GetStencilbuffer(u32 fb_address, int fb_stride, GP
 	// No need to free on failure, the caller/destructor will do that.  Usually this is a reused buffer, anyway.
 	buffer.Allocate(w, h, GPU_DBG_FORMAT_8BIT, flipY);
 	bool retval = draw_->CopyFramebufferToMemory(vfb->fbo, Draw::Aspect::STENCIL_BIT, 0, 0, w,h, Draw::DataFormat::S8, buffer.GetData(), w, Draw::ReadbackMode::BLOCK, "GetStencilbuffer");
-	if (!retval) {
-		retval = ReadbackStencilbuffer(vfb->fbo, 0, 0, w, h, buffer.GetData(), w, Draw::ReadbackMode::BLOCK);
-	}
 	// That may have unbound the framebuffer, rebind to avoid crashes when debugging.
 	RebindFramebuffer("RebindFramebuffer - GetStencilbuffer");
 	return retval;
@@ -3478,9 +3515,6 @@ bool FramebufferManagerMetal::ReadbackStencilToMemory(u32 addr, int size) {
 	const int sh = h * scale;
 	std::vector<u8> stencil(sw * sh);
 	bool ok = draw_->CopyFramebufferToMemory(vfb->fbo, Draw::Aspect::STENCIL_BIT, 0, y * scale, sw, sh, Draw::DataFormat::S8, stencil.data(), sw, Draw::ReadbackMode::BLOCK, "ReadbackStencilToMemory");
-	if (!ok) {
-		ok = ReadbackStencilbuffer(vfb->fbo, 0, y * scale, sw, sh, stencil.data(), sw, Draw::ReadbackMode::BLOCK);
-	}
 	draw_->Invalidate(InvalidationFlags::CACHED_RENDER_STATE);
 	textureCache_->ForgetLastTexture();
 	RebindFramebuffer("RebindFramebuffer - ReadbackStencilToMemory");

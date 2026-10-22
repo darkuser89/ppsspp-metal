@@ -1,3 +1,13 @@
+#ifdef PPSSPP_HAS_METAL
+#include "GPU/metal4/PostShaderMetal.h"
+namespace PostShaders = Metal::PostShaders;
+#else
+#include "GPU/Common/PostShader.h"
+namespace PostShaders {
+using ::GetPostShaderInfo;
+}
+#endif
+
 // Copyright (c) 2013- PPSSPP Project.
 
 // This program is free software: you can redistribute it and/or modify
@@ -75,7 +85,7 @@ static bool SupportsCustomDriver() {
 #endif
 
 static std::string PostShaderTranslateName(std::string_view value) {
-	const ShaderInfo *info = GetPostShaderInfo(value);
+	const ShaderInfo *info = PostShaders::GetPostShaderInfo(value);
 	if (info) {
 		auto ps = GetI18NCategory(I18NCat::POSTSHADERS);
 		return std::string(ps->T(value, info->name));
@@ -160,6 +170,8 @@ void DeveloperToolsScreen::CreateGeneralTab(UI::LinearLayout *list) {
 	// Only the interpreter raises these, but don't hide it behind the CPU core choice - it'd just
 	// look like the setting had vanished.
 	list->Add(new CheckBox(&g_Config.bEnableFPUExceptionTraps, dev->T("Enable FPU exceptions")));
+	// Experimental, so not translated yet.
+	list->Add(new CheckBox(&g_Config.bEmulateMediaEngine, dev->T("Enable ME emulation for homebrew")));
 
 	list->Add(new Choice(dev->T("JIT debug tools")))->OnClick.Handle(this, &DeveloperToolsScreen::OnJitDebugTools);
 	list->Add(new CheckBox(&g_Config.bShowDeveloperMenu, dev->T("Show in-game developer menu")));
@@ -588,7 +600,7 @@ void DeveloperToolsScreen::CreateGraphicsTab(UI::LinearLayout *list) {
 			screenManager()->push(procScreen);
 		});
 
-		const ShaderInfo *shaderInfo = GetPostShaderInfo(g_Config.sStereoToMonoShader);
+		const ShaderInfo *shaderInfo = PostShaders::GetPostShaderInfo(g_Config.sStereoToMonoShader);
 		if (shaderInfo) {
 			for (size_t i = 0; i < ARRAY_SIZE(shaderInfo->settings); ++i) {
 				auto &setting = shaderInfo->settings[i];

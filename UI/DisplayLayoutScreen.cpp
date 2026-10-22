@@ -1,3 +1,17 @@
+#ifdef PPSSPP_HAS_METAL
+#include "GPU/metal4/PostShaderMetal.h"
+namespace PostShaders = Metal::PostShaders;
+#else
+#include "GPU/Common/PostShader.h"
+namespace PostShaders {
+using ::ReloadAllPostShaderInfo;
+using ::GetPostShaderInfo;
+using ::GetAllPostShaderInfo;
+using ::GetFullPostShadersChain;
+using ::FixPostShaderOrder;
+}
+#endif
+
 // Copyright (c) 2013- PPSSPP Project.
 
 // This program is free software: you can redistribute it and/or modify
@@ -167,7 +181,7 @@ static void NotifyPostChanges() {
 void DisplayLayoutScreen::OnPostProcShaderChange(UI::EventParams &e) {
 	// Remove the virtual "Off" entry. TODO: Get rid of it generally.
 	g_Config.vPostShaderNames.erase(std::remove(g_Config.vPostShaderNames.begin(), g_Config.vPostShaderNames.end(), "Off"), g_Config.vPostShaderNames.end());
-	FixPostShaderOrder(&g_Config.vPostShaderNames);
+	PostShaders::FixPostShaderOrder(&g_Config.vPostShaderNames);
 	NotifyPostChanges();
 }
 
@@ -178,7 +192,7 @@ static std::string PostShaderTranslateName(std::string_view value) {
 		return std::string(gr->T("Add postprocessing shader"));
 	}
 
-	const ShaderInfo *info = GetPostShaderInfo(value);
+	const ShaderInfo *info = PostShaders::GetPostShaderInfo(value);
 	if (info) {
 		auto ps = GetI18NCategory(I18NCat::POSTSHADERS);
 		return std::string(ps->T(value, info->name));
@@ -190,7 +204,7 @@ static std::string PostShaderTranslateName(std::string_view value) {
 void DisplayLayoutScreen::sendMessage(UIMessage message, const char *value) {
 	UIBaseDialogScreen::sendMessage(message, value);
 	if (message == UIMessage::POSTSHADER_UPDATED) {
-		g_Config.bShaderChainRequires60FPS = PostShaderChainRequires60FPS(GetFullPostShadersChain(g_Config.vPostShaderNames));
+		g_Config.bShaderChainRequires60FPS = PostShaderChainRequires60FPS(PostShaders::GetFullPostShadersChain(g_Config.vPostShaderNames));
 		RecreateViews();
 	}
 }
@@ -421,7 +435,7 @@ void DisplayLayoutScreen::CreateViews() {
 				// Protect against possible race conditions.
 				if (i < g_Config.vPostShaderNames.size()) {
 					g_Config.vPostShaderNames.erase(g_Config.vPostShaderNames.begin() + i);
-					FixPostShaderOrder(&g_Config.vPostShaderNames);
+					PostShaders::FixPostShaderOrder(&g_Config.vPostShaderNames);
 					NotifyPostChanges();
 					RecreateViews();
 				}
@@ -436,7 +450,7 @@ void DisplayLayoutScreen::CreateViews() {
 
 				PopupContextMenuScreen *contextMenu = new UI::PopupContextMenuScreen(postShaderContextMenu, ARRAY_SIZE(postShaderContextMenu), I18NCat::DIALOG, moreButton);
 				screenManager()->push(contextMenu);
-				const ShaderInfo *info = GetPostShaderInfo(g_Config.vPostShaderNames[i]);
+				const ShaderInfo *info = PostShaders::GetPostShaderInfo(g_Config.vPostShaderNames[i]);
 				bool usesLastFrame = info ? info->usePreviousFrame : false;
 				contextMenu->SetEnabled(0, i > 0 && !usesLastFrame);
 				contextMenu->SetEnabled(1, i < g_Config.vPostShaderNames.size() - 1);
@@ -454,7 +468,7 @@ void DisplayLayoutScreen::CreateViews() {
 					default:
 						return;
 					}
-					FixPostShaderOrder(&g_Config.vPostShaderNames);
+					PostShaders::FixPostShaderOrder(&g_Config.vPostShaderNames);
 					NotifyPostChanges();
 					RecreateViews();
 				});
@@ -509,8 +523,8 @@ void DisplayLayoutScreen::CreateViews() {
 
 void PostProcScreen::CreateViews() {
 	auto ps = GetI18NCategory(I18NCat::POSTSHADERS);
-	ReloadAllPostShaderInfo(screenManager()->getDrawContext());
-	shaders_ = GetAllPostShaderInfo();
+	PostShaders::ReloadAllPostShaderInfo(screenManager()->getDrawContext());
+	shaders_ = PostShaders::GetAllPostShaderInfo();
 	std::vector<std::string> items;
 	int selected = -1;
 	const std::string selectedName = id_ >= (int)g_Config.vPostShaderNames.size() ? "Off" : g_Config.vPostShaderNames[id_];

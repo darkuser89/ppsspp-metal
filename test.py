@@ -85,6 +85,7 @@ class Command(object):
 # These have worked and should keep working always - regression tests.
 # -g flag runs these.
 tests_good = [
+  "cpu/cop0/eret",
   "cpu/cpu_alu/cpu_alu",
   "cpu/cpu_alu/cpu_branch",
   "cpu/cpu_alu/branch_link_ra",
@@ -138,8 +139,11 @@ tests_good = [
   "audio/atrac/setdata",
   "audio/atrac/sas",
   "audio/atrac/c0mono",
+  "audio/atrac/headerfields",
   "audio/audiocodec/basic",
   "audio/audiocodec/at3param",
+  "audio/audiocodec/at3errors",
+  "audio/audiocodec/context",
   "audio/mp3/checkneeded",
   "audio/mp3/getbitrate",
   "audio/mp3/getchannel",
@@ -185,6 +189,7 @@ tests_good = [
   "audio/sascore/pcm",
   "audio/sascore/pitch",
   "audio/sascore/vag",
+  "ccc/convertstring",
   "ctrl/ctrl",
   "ctrl/idle/idle",
   "ctrl/sampling/sampling",
@@ -317,6 +322,7 @@ tests_good = [
   "hash/sha1ctx",
   "hle/check_not_used_uids",
   "intr/intr",
+  "intr/kernel/intrhandler",
   "intr/mfic",
   "intr/enablesub",
   "intr/registersub",
@@ -338,6 +344,8 @@ tests_good = [
   "malloc/malloc",
   "misc/dcache",
   "misc/deadbeef",
+  "modules/cutrel/cutrel",
+  "modules/cutrel/kernel/cutrel",
   "modules/loadrace/loadrace",
   "modules/startoptions/startoptions",
   "modules/unresolved/unresolved",
@@ -367,6 +375,7 @@ tests_good = [
   "sysmem/volatile",
   "threads/alarm/alarm",
   "threads/alarm/cancel/cancel",
+  "threads/alarm/pending/pending",
   "threads/alarm/refer/refer",
   "threads/alarm/set/set",
   "threads/callbacks/afterwait",
@@ -480,6 +489,8 @@ tests_good = [
   "threads/tls/create",
   "threads/tls/partition",
   "threads/tls/kernel/partition",
+  "threads/threads/kernel/priority",
+  "gpu/ge/kernel/edramsize",
   "threads/tls/delete",
   "threads/tls/get",
   "threads/tls/free",
@@ -504,6 +515,7 @@ tests_good = [
   "threads/vtimers/getbase",
   "threads/vtimers/gettime",
   "threads/vtimers/interrupt",
+  "threads/vtimers/pending/pending",
   "threads/vtimers/refer",
   "threads/vtimers/sethandler",
   "threads/vtimers/settime",
@@ -518,6 +530,8 @@ tests_good = [
   "utility/msgdialog/abort",
   "utility/savedata/autosave",
   "utility/savedata/shutdownstatus",
+  "utility/savedata/noupdate",
+  "utility/savedata/initstatus",
   "utility/savedata/filelist",
   "utility/savedata/getsize",
   "utility/savedata/makedata",
@@ -599,7 +613,6 @@ tests_next = [
   "audio/mp3/init",
   "audio/output2/frequency",
   "audio/output2/rest",
-  "ccc/convertstring",
   "font/fonttest",
   "font/charinfo",
   "font/newlib",
@@ -619,6 +632,8 @@ tests_next = [
   "gpu/signals/simple",
   "gpu/simple/simple",
   "intr/waits",
+  "me/audiofifo",  # needs the Media Engine on, and Sony's ME firmware installed
+  "me/vram",  # needs the Media Engine on, and Sony's ME firmware installed
   "sysmem/kernel/heapgrow",
   "io/file/file",
   "io/io/io",
@@ -637,6 +652,7 @@ tests_next = [
   #"modules/loadexec/loader",
   "modules/unloadfill/unloadfill",
   "net/http/http",
+  "net/inet/bind",
   "net/primary/ether",
   "sysmem/partition",
   # These two mbx tests only appeared to work because they papered over bugs 
@@ -659,7 +675,9 @@ tests_next = [
   #"utility/savedata/saveemptyfilename",
   "utility/savedata/secureversion",
   "utility/savedata/sizes",
+  "video/mp4/avchold",
   "video/mpeg/basic",
+  "video/mpeg/decodeend",
   "video/mpeg/deletetiming",
   "video/pmf/pmf",
   "video/pmf_simple/pmf_simple",
@@ -718,12 +736,9 @@ def init():
 def cpu_backend(args):
   # Which backend headless will end up on, given the args we hand through to it. Headless defaults
   # to the JIT, and a later flag overrides an earlier one, like its own parsing in Core/CmdLine.cpp.
-  short_flags = {'-i': 'interpreter', '-r': 'ir', '-j': 'jit', '-J': 'jit-ir'}
   backend = 'jit'
   for arg in args:
-    if arg in short_flags:
-      backend = short_flags[arg]
-    elif arg.startswith('--cpu='):
+    if arg.startswith('--cpu='):
       backend = arg[len('--cpu='):]
   return backend
 
@@ -749,6 +764,9 @@ def run_tests(test_list, args):
     # TODO: Maybe --compare should detect --graphics?
     cmdline = [PPSSPP_EXE, '--root', TEST_ROOT + '../', '--compare', '--timeout-wall=' + str(timeout), '@-']
     cmdline.extend([i for i in args if i not in ['-g', '-m', '-b']])
+    # A memory stick of the tests' own, so they neither write into the user's nor see its firmware.
+    if not any(i.startswith('--memstick') for i in cmdline):
+      cmdline.append('--memstick=' + os.path.join(os.path.dirname(os.path.abspath(PPSSPP_EXE)), 'memstick'))
 
     c = Command(cmdline, '\n'.join(test_filenames))
     returncode = c.run(timeout * len(test_filenames))

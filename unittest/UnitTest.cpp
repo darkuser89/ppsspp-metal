@@ -58,8 +58,11 @@
 #include "Common/Data/Text/Parsers.h"
 #include "Common/Data/Text/WrapText.h"
 #include "Common/Data/Encoding/Utf8.h"
+#include "Common/Data/Encoding/Utf16.h"
+#include "Common/Data/Encoding/Shiftjis.h"
 #include "Common/Buffer.h"
 #include "Common/File/Path.h"
+#include "Common/File/FileUtil.h"
 #include "Common/Log/LogManager.h"
 #include "Common/Math/SIMDHeaders.h"
 #include "Common/Math/CrossSIMD.h"
@@ -116,6 +119,7 @@
 #include "Core/HLE/sceUsbMic.h"
 #include "Core/Util/PathUtil.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
+#include "Core/MIPS/MIPSStackWalk.h"
 #include "GPU/Common/DepthSwizzle.h"
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/Common/GPUStateUtils.h"
@@ -366,6 +370,55 @@ bool TestUtf8() {
 			const std::string once = ReplaceInvalidUTF8(input);
 			EXPECT_TRUE(ReplaceInvalidUTF8(once) == once);
 		}
+	}
+
+	return true;
+}
+
+bool TestTextDecoders() {
+	{
+		const char16_t pair[] = { 0xD83C, 0xDFAE, 0 };
+		UTF16LE utf(pair);
+		EXPECT_EQ_HEX((uint32_t)utf.next(), 0x1F3AEu);
+		EXPECT_TRUE(utf.end());
+	}
+
+	// An unpaired surrogate is invalid on its own, and decoding carries on after it.
+	{
+		const char16_t highThenA[] = { 0xD800, 'A', 0 };
+		UTF16LE utf(highThenA);
+		EXPECT_TRUE(utf.next() == UTF16LE::INVALID);
+		EXPECT_EQ_HEX((uint32_t)utf.next(), (uint32_t)'A');
+		EXPECT_TRUE(utf.end());
+
+		const char16_t lowThenA[] = { 0xDC00, 'A', 0 };
+		UTF16LE utf2(lowThenA);
+		EXPECT_TRUE(utf2.next() == UTF16LE::INVALID);
+		EXPECT_EQ_HEX((uint32_t)utf2.next(), (uint32_t)'A');
+	}
+
+	// A high surrogate right before the terminator must not consume it.
+	{
+		const char16_t highAtEnd[] = { 0xD800, 0, 'A', 0 };
+		UTF16LE utf(highAtEnd);
+		EXPECT_TRUE(utf.next() == UTF16LE::INVALID);
+		EXPECT_EQ_INT(utf.shortIndex(), 1);
+		EXPECT_TRUE(utf.end());
+	}
+
+	{
+		ShiftJIS sjis("A\xA1\x82\xA0");
+		EXPECT_EQ_HEX(sjis.next(), 0x41u);
+		EXPECT_EQ_HEX(sjis.next(), 0xA1u);
+		EXPECT_EQ_HEX(sjis.next(), 0x2422u);
+		EXPECT_TRUE(sjis.end());
+	}
+
+	// Lead bytes that encode nothing.
+	for (const char *bad : { "\x80", "\xA0", "\xFD", "\xFE", "\xFF" }) {
+		ShiftJIS sjis(bad);
+		EXPECT_TRUE(sjis.next() == ShiftJIS::INVALID);
+		EXPECT_EQ_INT(sjis.byteIndex(), 1);
 	}
 
 	return true;
@@ -2412,6 +2465,106 @@ static bool CheckBlockShadow() {
 	return true;
 }
 
+// A leaf with no symbol, right after a function with a stack frame (#17664).
+static bool CheckStackWalk() {
+	const u32 caller = 0x08804000;
+	const u32 leaf = caller + 0x20;
+	const u32 code[] = {
+		0x27BDFFF0,  // caller: addiu sp, sp, -16
+		0xAFBF000C,  // sw ra, 12(sp)
+		0x0C000000 | ((leaf >> 2) & 0x03FFFFFF),  // jal leaf
+		0x00000000,  // nop
+		0x8FBF000C,  // lw ra, 12(sp)
+		0x27BD0010,  // addiu sp, sp, 16
+		0x03E00008,  // jr ra
+		0x00000000,  // nop
+		0x24820001,  // leaf: addiu v0, a0, 1
+		0x24420001,  // addiu v0, v0, 1
+		0x03E00008,  // jr ra
+		0x00000000,  // nop
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(code); i++) {
+		Memory::WriteUnchecked_U32(code[i], caller + (u32)i * 4);
+	}
+	const u32 sp = 0x09F00000 - 16;
+	// The caller's own return address, which the leaf's frame must not pick up.
+	Memory::WriteUnchecked_U32(0x08900000, sp + 12);
+
+	SymbolMap symbolMap;
+	g_symbolMap = &symbolMap;
+	std::vector<MIPSStackWalk::StackFrame> frames = MIPSStackWalk::Walk(leaf + 4, caller + 0x10, sp, caller, 0x09F00000);
+	g_symbolMap = nullptr;
+
+	EXPECT_EQ_INT((int)frames.size(), 2);
+	EXPECT_EQ_HEX(frames[0].entry, leaf);
+	EXPECT_EQ_INT(frames[0].stackSize, 0);
+	EXPECT_EQ_HEX(frames[1].pc, caller + 0x10);
+	EXPECT_EQ_HEX(frames[1].entry, caller);
+	EXPECT_EQ_INT(frames[1].stackSize, 16);
+
+	// With a symbol, the entry is where it starts, even when the prologue isn't first.
+	const u32 func = 0x08805000;
+	const u32 funcCode[] = {
+		0x3C080000,  // func: lui t0, 0
+		0x27BDFFF0,  // addiu sp, sp, -16
+		0xAFBF000C,  // sw ra, 12(sp)
+		0x00000000,  // nop
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(funcCode); i++) {
+		Memory::WriteUnchecked_U32(funcCode[i], func + (u32)i * 4);
+	}
+	Memory::WriteUnchecked_U32(caller + 0x10, sp + 12);
+	symbolMap.AddFunction("func", func, sizeof(funcCode));
+	symbolMap.SortSymbols();
+	g_symbolMap = &symbolMap;
+	frames = MIPSStackWalk::Walk(func + 0xC, caller + 0x10, sp, caller, 0x09F00000);
+	g_symbolMap = nullptr;
+
+	EXPECT_EQ_INT((int)frames.size(), 2);
+	EXPECT_EQ_HEX(frames[0].entry, func);
+	EXPECT_EQ_INT(frames[0].stackSize, 16);
+	EXPECT_EQ_HEX(frames[1].pc, caller + 0x10);
+
+	// No symbol, and an early return between the prologue and pc. After the call below, ra points
+	// back into this function, so that jr ra can't be the end of the function before.
+	const u32 early = 0x08806000;
+	const u32 earlyCode[] = {
+		0x27BDFFF0,  // early: addiu sp, sp, -16
+		0xAFBF000C,  // sw ra, 12(sp)
+		0x10800003,  // beqz a0, +3
+		0x00000000,  // nop
+		0x8FBF000C,  // lw ra, 12(sp)
+		0x03E00008,  // jr ra
+		0x27BD0010,  // addiu sp, sp, 16
+		0x0C000000 | ((leaf >> 2) & 0x03FFFFFF),  // jal leaf
+		0x00000000,  // nop
+		0x00000000,  // nop (pc)
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(earlyCode); i++) {
+		Memory::WriteUnchecked_U32(earlyCode[i], early + (u32)i * 4);
+	}
+	g_symbolMap = &symbolMap;
+	frames = MIPSStackWalk::Walk(early + 0x24, early + 0x24, sp, caller, 0x09F00000);
+	g_symbolMap = nullptr;
+
+	EXPECT_EQ_INT((int)frames.size(), 2);
+	EXPECT_EQ_HEX(frames[0].entry, early);
+	EXPECT_EQ_INT(frames[0].stackSize, 16);
+	EXPECT_EQ_HEX(frames[1].pc, caller + 0x10);
+	return true;
+}
+
+static bool TestStackWalk() {
+	Memory::g_MemorySize = Memory::RAM_NORMAL_SIZE;
+	if (!Memory::Init(Memory::MemMapSetupFlags::Default)) {
+		printf("Memory::Init failed\n");
+		return false;
+	}
+	const bool success = CheckStackWalk();
+	Memory::Shutdown();
+	return success;
+}
+
 static bool TestBlockShadow() {
 	Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
 	if (!Memory::Init(Memory::MemMapSetupFlags::Default)) {
@@ -2430,6 +2583,13 @@ static bool TestPath() {
 
 	Path path2("/asdf/jkl");
 	EXPECT_EQ_STR(path2.NavigateUp().ToString(), std::string("/asdf"));
+
+	// Relative to the current directory. This used to create nothing and still report success.
+	const Path relDir("unittest_createfullpath");
+	File::DeleteDirRecursively(relDir);
+	EXPECT_TRUE(File::CreateFullPath(relDir / "a/b"));
+	EXPECT_TRUE(File::IsDirectory(File::GetCurDirectory() / "unittest_createfullpath/a/b"));
+	File::DeleteDirRecursively(relDir);
 
 	Path path3 = path2 / "foo/bar";
 	EXPECT_EQ_STR(path3.WithExtraExtension(".txt").ToString(), std::string("/asdf/jkl/foo/bar.txt"));
@@ -3576,10 +3736,18 @@ TestItem availableTests[] = {
 	TEST_ITEM(Breakpoints),
 	TEST_ITEM(TempBreakpoints),
 	TEST_ITEM(Utf8),
+	TEST_ITEM(TextDecoders),
 	TEST_ITEM(IRPassSimplify),
 	TEST_ITEM(Jit),
 	TEST_ITEM(JitDotBench),
 	TEST_ITEM(JitReplacementHooks),
+	TEST_ITEM(CPUEret),
+	TEST_ITEM(MMIO),
+	TEST_ITEM(MESpace),
+	TEST_ITEM(MeCore),
+	TEST_ITEM(MeInterrupts),
+	TEST_ITEM(MeWait),
+	TEST_ITEM(MeDmacplus),
 	TEST_ITEM(CPUEquivalence),
 	TEST_ITEM(CPURoundingMode),
 	TEST_ITEM(VFPUDotJit),
@@ -3638,6 +3806,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(GEDumpGameID),
 	TEST_ITEM(QueueBuf),
 	TEST_ITEM(RequestManager),
+	TEST_ITEM(StackWalk),
 };
 
 int main(int argc, const char *argv[]) {

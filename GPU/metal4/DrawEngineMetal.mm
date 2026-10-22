@@ -6,6 +6,7 @@
 #include "GPU/metal4/FramebufferManagerMetal.h"
 #include "GPU/Common/SoftwareTransformCommon.h"
 #include "Common/Data/Convert/SmallDataConvert.h"
+#include "Common/TimeUtil.h"
 
 namespace {
 bool SameViewport(const MTLViewport &a, const MTLViewport &b) {
@@ -37,7 +38,6 @@ void DrawEngineMetal::DeviceLost() {
 		draw_->SetInvalidationCallback({});
 	}
 	pipelines_.DeviceLost();
-	samplers_.Clear();
 	manager_ = nullptr;
 	draw_ = nullptr;
 }
@@ -57,7 +57,6 @@ void DrawEngineMetal::NotifyConfigChanged() {
 	DrawEngineCommon::NotifyConfigChanged();
 	encoderState_.valid = false;
 	pipelines_.Clear();
-	samplers_.Clear();
 }
 
 void DrawEngineMetal::BeginFrame() {
@@ -99,7 +98,7 @@ bool DrawEngineMetal::ApplyDrawState(GEPrimitiveType prim, MetalDrawState *state
 				SamplerCacheKey key{};
 				key.sClamp = true;
 				key.tClamp = true;
-				manager_->SetNativeSampler(ShaderBinding::DRAW_BINDING_2ND_TEXTURE, samplers_.GetOrCreate(manager_->Context().Device(), key, error));
+				manager_->SetNativeSampler(ShaderBinding::DRAW_BINDING_2ND_TEXTURE, textureCache_->GetSampler(key, error));
 				if (!error->empty()) {
 					return false;
 				}
@@ -128,9 +127,26 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		return false;
 	}
 	GEPrimitiveType prim = prevPrim_;
-	bool hardware = CanUseHardwareTransform(prim) && gstate.getShadeMode() != GE_SHADE_FLAT;
+	const bool flat = gstate.getShadeMode() == GE_SHADE_FLAT;
+	const double flatStart = flat ? time_now_d() : 0.0;
+	bool hardware = CanUseHardwareTransform(prim);
 	if ((clipInfoFlags_ & ClipInfoFlags::Valid) && (clipInfoFlags_ & ClipInfoFlags::SoftClipCull)) {
 		hardware = false;
+	}
+	if (flat) {
+		++transformMetrics_.flatDraws;
+#if PPSSPP_PLATFORM(MAC)
+		// Preserve CPU lighting and color packing for flat-lit primitives.
+		if (hardware && gstate.isLightingEnabled()) {
+			++transformMetrics_.flatLightingFallbacks;
+			hardware = false;
+		}
+#endif
+		transformMetrics_.flatHardwareEligible += hardware;
+#if !PPSSPP_PLATFORM(MAC)
+		hardware = false;
+#endif
+		transformMetrics_.flatHardwareDraws += hardware;
 	}
 	if (clipInfoFlags_ != lastClipInfoFlags_ || hardware != lastUseHwTransform_) {
 		gstate_c.Dirty(DIRTY_VERTEXSHADER_STATE | DIRTY_FRAGMENTSHADER_STATE | DIRTY_RASTER_STATE | DIRTY_TEXTURE_PARAMS);
@@ -139,7 +155,8 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	}
 	// Skinning may have partially decoded vertices already. The software and
 	// depth-raster paths also need the decoded vertices on the CPU.
-	const bool directDecode = hardware && !dec_->skinInDecode && !useDepthRaster_ && ComputeNumVertsToDecode() > 0;
+	const bool directDecode = hardware && !dec_->skinInDecode && !useDepthRaster_ &&
+		decodeVertsCounter_ == 0 && numDecodedVerts_ == 0 && ComputeNumVertsToDecode() > 0;
 	if (!directDecode) {
 		DecodeVerts(dec_, decoded_);
 	}
@@ -167,6 +184,14 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	size_t decodedIndexOffset = 0;
 	int count, maxIndex;
 	bool indexed;
+	auto decodeIndices = [&] {
+		// Expand strips/fans before rotating each triangle to Metal's provoking
+		// vertex. Rotate CPU indices before copying them into the upload buffer.
+		DecodeIndsAndGetData(&prim, &count, &maxIndex, &indexed, !hardware || flat);
+		if (hardware && flat) {
+			IndexBufferProvokingLastToFirst(prim, decIndex_, count);
+		}
+	};
 	if (directDecode) {
 		// The index generator needs vertex offsets, not the decoded bytes. Work
 		// them out first so vertices and indices fit in a single upload slice.
@@ -177,9 +202,13 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 			decodedCount += draw.indexUpperBound - draw.indexLowerBound + 1;
 		}
 		numDecodedVerts_ = decodedCount;
-		DecodeIndsAndGetData(&prim, &count, &maxIndex, &indexed, false);
+		decodeIndices();
 		numDecodedVerts_ = 0;
 		auto &context = manager_->Context();
+		// Texture readback can submit the previous buffer before this upload.
+		if (!context.Commands() && !context.BeginCommands(error)) {
+			return false;
+		}
 		const size_t vertexBytes = (size_t)decodedCount * dec_->GetDecVtxFmt().stride;
 		decodedIndexOffset = (vertexBytes + sizeof(uint16_t) - 1) & ~(sizeof(uint16_t) - 1);
 		const size_t uploadBytes = indexed ? decodedIndexOffset + (size_t)count * sizeof(uint16_t) : vertexBytes;
@@ -195,7 +224,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 		}
 		decodedUploadGeneration = context.CommandGeneration();
 	} else {
-		DecodeIndsAndGetData(&prim, &count, &maxIndex, &indexed, !hardware);
+		decodeIndices();
 	}
 	uint16_t *indices = decIndex_;
 	const void *vertices = directDecode ? (const uint8_t *)decodedUpload.buffer.contents + decodedUpload.offset : decoded_;
@@ -246,6 +275,10 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	}
 	if (textureNeedsApply) {
 		textureCache_->ApplySampler(texture, clipInfoFlags_ & ClipInfoFlags::FlatZ, transformed.pixelMapped);
+	}
+	if (flat) {
+		transformMetrics_.flatVertices += numDecodedVerts_;
+		transformMetrics_.flatPreparationSeconds += time_now_d() - flatStart;
 	}
 	if (action == SW_CULLED) {
 		return true;
@@ -321,6 +354,37 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	if (!shaderManager_->UpdateUniforms(framebufferManager_->UseBufferedRendering(), transformed.pixelMapped, error)) {
 		return false;
 	}
+	const MTLViewport mtlViewport{viewport.viewportX, viewport.viewportY, viewport.viewportW, viewport.viewportH, 0, 1};
+	bool regionBatch = textureEnabled && textureCache_->HasScaledTexture() && !hardware && indexed &&
+		count % 6 == 0 && vertexCount == count / 6 * 4;
+	if (regionBatch) {
+		for (int i = 0; i < count / 6; ++i) {
+			unsigned used = 0;
+			for (int j = 0; j < 6; ++j) {
+				const int index = indices[i * 6 + j] - i * 4;
+				if (index < 0 || index >= 4) {
+					regionBatch = false;
+					break;
+				}
+				used |= 1u << index;
+			}
+			if (used != 15) {
+				regionBatch = false;
+				break;
+			}
+		}
+	}
+	bool needsOriginalVertices = true;
+	if (regionBatch) {
+		samplingRegions_.assign(count / 6, {});
+		regionBatch = false;
+		needsOriginalVertices = false;
+		for (int i = 0; i < count / 6; ++i) {
+			const bool cropped = textureCache_->ComputeSamplingRegion(static_cast<const TransformedVertex *>(vertices) + i * 4, mtlViewport, &samplingRegions_[i]);
+			regionBatch |= cropped;
+			needsOriginalVertices |= !cropped;
+		}
+	}
 	auto &context = manager_->Context();
 	const uint32_t stride = hardware ? decodedFormat->stride : sizeof(TransformedVertex);
 	const size_t vertexBytes = (size_t)vertexCount * stride;
@@ -353,6 +417,8 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 				}
 			}
 		}
+	} else if (indexed && !needsOriginalVertices) {
+		ib = context.Upload(indices, (size_t)count * sizeof(uint16_t), error, 4);
 	} else if (indexed) {
 		const size_t indexOffset = (vertexBytes + sizeof(uint16_t) - 1) & ~(sizeof(uint16_t) - 1);
 		vb = context.ReserveUpload(indexOffset + (size_t)count * sizeof(uint16_t), error);
@@ -364,7 +430,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	} else {
 		vb = context.Upload(vertices, vertexBytes, error);
 	}
-	if (!vb || (indexed && !ib)) {
+	if ((needsOriginalVertices && !vb) || (indexed && !ib)) {
 		return false;
 	}
 	if (!pipeline || shaderGeneration != shaderManager_->CacheGeneration()) {
@@ -384,7 +450,6 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	const uint64_t serial = manager_->RenderStateSerial();
 	const bool sameEncoderState = encoderState_.valid && encoderState_.serial == serial;
 	const NSUInteger stencil = transformed.setStencil ? transformed.stencilValue : state.stencilRef;
-	const MTLViewport mtlViewport{viewport.viewportX, viewport.viewportY, viewport.viewportW, viewport.viewportH, 0, 1};
 	const MTLScissorRect mtlScissor{(NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h};
 	if (!sameEncoderState || encoderState_.pipeline != pipeline->state) {
 		manager_->Context().Keep(pipeline->state);
@@ -429,43 +494,22 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 	encoderState_.viewport = mtlViewport;
 	encoderState_.scissor = mtlScissor;
 	encoderState_.blendColor = state.blendColor;
-	manager_->Context().SetBuffer(encoder, MTLRenderStageVertex, vb.buffer, vb.offset, Metal::VERTEX_BUFFER_SLOT);
+	if (vb) {
+		manager_->Context().SetBuffer(encoder, MTLRenderStageVertex, vb.buffer, vb.offset, Metal::VERTEX_BUFFER_SLOT);
+	}
 	MTLPrimitiveType topology = hardware && prim == GE_PRIM_TRIANGLE_STRIP ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
+	manager_->Context().UseResource(encoder, ib.buffer, MTLStageVertex, (MTLStages)0);
 	const NSUInteger instances = gstate_c.Use(GPU_USE_SINGLE_PASS_STEREO) && manager_->RenderTarget()->Layers() > 1 ? 2 : 1;
-	bool regionBatch = textureEnabled && textureCache_->HasScaledTexture() && !hardware && indexed &&
-		count % 6 == 0 && vertexCount == count / 6 * 4;
-	if (regionBatch) {
-		for (int i = 0; i < count / 6; ++i) {
-			unsigned used = 0;
-			for (int j = 0; j < 6; ++j) {
-				const int index = indices[i * 6 + j] - i * 4;
-				if (index < 0 || index >= 4) {
-					regionBatch = false;
-					break;
-				}
-				used |= 1u << index;
-			}
-			if (used != 15) {
-				regionBatch = false;
-				break;
-			}
-		}
-	}
-	if (regionBatch) {
-		// Keep the original batch unless at least one quad needs atlas isolation.
-		regionBatch = false;
-		std::array<TransformedVertex, 4> adjusted;
-		for (int i = 0; i < vertexCount; i += 4) {
-			if (textureCache_->BindSamplingRegion(static_cast<const TransformedVertex *>(vertices) + i, adjusted.data(), mtlViewport)) {
-				regionBatch = true;
-				break;
-			}
-		}
-	}
 	if (regionBatch) {
 		for (int i = 0; i < count / 6; ++i) {
 			std::array<TransformedVertex, 4> adjusted;
-			const bool cropped = textureCache_->BindSamplingRegion(static_cast<const TransformedVertex *>(vertices) + i * 4, adjusted.data(), mtlViewport);
+			const auto &region = samplingRegions_[i];
+			const bool planned = region[2] > region[0] && region[3] > region[1];
+			const bool cropped = textureCache_->BindSamplingRegion(static_cast<const TransformedVertex *>(vertices) + i * 4, adjusted.data(), planned ? &region : nullptr);
+			if (!cropped && !vb) {
+				// Allocation/scaling failures retain the original draw as a fallback.
+				vb = context.Upload(vertices, vertexBytes, error);
+			}
 			auto vertexBuffer = cropped ? context.Upload(adjusted.data(), sizeof(adjusted), error) : vb;
 			if (!vertexBuffer) {
 				return false;
@@ -475,6 +519,7 @@ bool DrawEngineMetal::FlushDraw(std::string *error) {
 				return false;
 			}
 			manager_->Context().SetBuffer(encoder, MTLRenderStageVertex, vertexBuffer.buffer, vertexBuffer.offset, Metal::VERTEX_BUFFER_SLOT);
+			textureCache_->RecordRegionDraw(i == 0 || samplingRegions_[i] != samplingRegions_[i - 1]);
 			[encoder drawIndexedPrimitives:topology indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:ib.buffer.gpuAddress + (ib.offset + i * 6 * sizeof(uint16_t)) indexBufferLength:ib.buffer.length - (ib.offset + i * 6 * sizeof(uint16_t)) instanceCount:instances baseVertex:cropped ? -i * 4 : 0 baseInstance:0];
 		}
 	} else if (indexed) {

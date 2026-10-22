@@ -286,7 +286,6 @@ void MetalLoadPostShaderInfo(Draw::DrawContext *draw, const std::vector<Path> &d
 
 // Scans the directories for shader ini files and collects info about all the shaders found.
 void MetalReloadAllPostShaderInfo(Draw::DrawContext *draw) {
-	ReloadAllPostShaderInfo(draw);
 	std::vector<Path> directories;
 	directories.push_back(Path("shaders"));  // For VFS
 	directories.push_back(GetSysDirectory(DIRECTORY_CUSTOM_SHADERS));
@@ -391,5 +390,59 @@ std::vector<TextureShaderInfo> MetalTextureShaderList() {
 }
 bool MetalTextureShaderSupported(std::string_view name) {
 	const auto *info = MetalGetTextureShaderInfo(name);
-	return info && info->metalSupported && info->computeShaderFiles.size() == 1 && info->constantBuffer.empty();
+	// Selection still requires the asset's Metal opt-in; layout validation is
+	// shared with Configure, including multipass shaders and constant buffers.
+	return info && info->metalSupported && MetalTextureShaderSupported(*info);
+}
+
+bool MetalTextureShaderSupported(const MetalTextureShaderInfo &info) {
+	if (info.scaleFactor < 2 || info.scaleFactor >= 8 || info.computeShaderFiles.empty()) {
+		return false;
+	}
+	const size_t count = info.computeShaderFiles.size();
+	if (count != 1 && !((info.scaleFactor == 2 && count == 3) || (info.scaleFactor == 4 && count == 4))) {
+		return false;
+	}
+	for (const Path &file : info.computeShaderFiles) {
+		if (file.empty()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+namespace Metal::PostShaders {
+
+void ReloadAllPostShaderInfo(Draw::DrawContext *draw) {
+	if (Metal::IsBackend(draw)) {
+		MetalReloadAllPostShaderInfo(draw);
+	} else {
+		::ReloadAllPostShaderInfo(draw);
+	}
+}
+
+const ShaderInfo *GetPostShaderInfo(std::string_view name) {
+	return GetGPUBackend() == GPUBackend::METAL ? MetalGetPostShaderInfo(name) : ::GetPostShaderInfo(name);
+}
+
+const TextureShaderInfo *GetTextureShaderInfo(std::string_view name) {
+	return GetGPUBackend() == GPUBackend::METAL ? MetalGetTextureShaderInfo(name) : ::GetTextureShaderInfo(name);
+}
+
+const std::vector<ShaderInfo> &GetAllPostShaderInfo() {
+	return GetGPUBackend() == GPUBackend::METAL ? MetalGetAllPostShaderInfo() : ::GetAllPostShaderInfo();
+}
+
+std::vector<const ShaderInfo *> GetFullPostShadersChain(const std::vector<std::string> &names) {
+	return GetGPUBackend() == GPUBackend::METAL ? MetalGetFullPostShadersChain(names) : ::GetFullPostShadersChain(names);
+}
+
+void FixPostShaderOrder(std::vector<std::string> *names) {
+	if (GetGPUBackend() == GPUBackend::METAL) {
+		MetalFixPostShaderOrder(names);
+	} else {
+		::FixPostShaderOrder(names);
+	}
+}
+
 }

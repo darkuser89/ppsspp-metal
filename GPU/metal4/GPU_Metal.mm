@@ -53,9 +53,17 @@ public:
 			drawEngine_.SavePipelineCache(pipelineCachePath_);
 			metalShaders_->SaveCache(shaderCachePath_);
 		}
+		if (g_Config.bGpuLogProfiler) {
+			char stats[8192];
+			StringWriter writer(stats);
+			GetStats(writer);
+			INFO_LOG(Log::G3D, "Metal final profile counters:\n%s", stats);
+		}
 		// GPUCommonHWMetal owns the managers and deletes them after member destruction.
 		framebufferManager_->SetDrawEngine(nullptr);
 	}
+
+	bool IsLoadingShaderCache() const override { return drawEngine_.PipelinesPending(); }
 
 	u32 CheckGPUFeatures() const override {
 		u32 features = GPUCommonHWMetal::CheckGPUFeatures();
@@ -107,11 +115,55 @@ public:
 		FormatGPUStatsCommon(writer);
 		writer.F("Metal vertex/fragment shaders: %d / %d\n", metalShaders_->GetNumVertexShaders(), metalShaders_->GetNumFragmentShaders());
 		writer.F("Metal GE pipelines: %d\n", drawEngine_.GetNumPipelines());
+		const auto pipelines = drawEngine_.PipelineMetrics();
+		writer.F("Metal PSO sync/async elapsed totals: %.3f/%.3f ms (%llu/%llu compiles)\n",
+			pipelines.syncSeconds * 1000.0, pipelines.asyncSeconds * 1000.0,
+			(unsigned long long)pipelines.syncCompiles, (unsigned long long)pipelines.asyncCompiles);
+		writer.F("Metal PSO owner waits: %.3f ms (%llu); archive captures: %.3f ms (%llu)\n",
+			pipelines.waitSeconds * 1000.0, (unsigned long long)pipelines.waits,
+			pipelines.archiveSeconds * 1000.0, (unsigned long long)pipelines.archiveSaves);
+		writer.F("Metal pipeline cache saves: %.3f ms (%llu calls, %llu deferred); %llu binaries captured, %llu archive failures\n",
+			pipelines.cacheSaveSeconds * 1000.0, (unsigned long long)pipelines.cacheSaves,
+			(unsigned long long)pipelines.archiveDeferrals, (unsigned long long)pipelines.archivePipelines, (unsigned long long)pipelines.archiveFailures);
+		const auto &compile = metalShaders_->Metrics();
+		writer.F("Metal shader generation/frontend CPU totals: %.3f/%.3f ms (%llu/%llu calls)\n",
+			compile.generationSeconds * 1000.0, compile.frontendSeconds * 1000.0,
+			(unsigned long long)compile.generated, (unsigned long long)compile.translated);
+		writer.F("Metal persistent translation cache hits: %llu\n", (unsigned long long)compile.translationCacheHits);
+		writer.F("Metal frontend GLSL/SPIR-V/MSL phase totals: %.3f/%.3f/%.3f ms\n",
+			compile.phases.glslSeconds * 1000.0, compile.phases.spirvSeconds * 1000.0, compile.phases.mslSeconds * 1000.0);
 		writer.F("Metal MSAA samples: %d\n", 1 << msaaLevel_);
+		const auto &transforms = drawEngine_.TransformMetrics();
+		writer.F("Metal flat draws/eligible/hardware/vertices: %llu/%llu/%llu/%llu; preparation: %.3f ms\n",
+			(unsigned long long)transforms.flatDraws, (unsigned long long)transforms.flatHardwareEligible,
+			(unsigned long long)transforms.flatHardwareDraws, (unsigned long long)transforms.flatVertices,
+			transforms.flatPreparationSeconds * 1000.0);
+		writer.F("Metal flat lighting fallbacks: %llu\n", (unsigned long long)transforms.flatLightingFallbacks);
+		const auto regions = static_cast<TextureCacheMetal *>(textureCache_)->GetRegionMetrics();
+		writer.F("Metal atlas totals hits/misses/draws/evictions/clears: %llu/%llu/%llu/%llu/%llu\n",
+			(unsigned long long)regions.hits, (unsigned long long)regions.misses, (unsigned long long)regions.draws,
+			(unsigned long long)regions.evictions, (unsigned long long)regions.clears);
+		writer.F("Metal atlas adjacent region groups: %llu\n", (unsigned long long)regions.groups);
+		writer.F("Metal atlas source/region bytes, entries: %zu/%zu, %zu\n", regions.sourceBytes, regions.regionBytes, regions.count);
 		if (draw_) {
 			writer.F("Metal render passes begun this frame: %u\n", draw_->GetCurrentBackendState().passes);
 			auto *context = (Metal::RenderContext *)draw_->GetNativeObject(Draw::NativeObject::CONTEXT);
 			if (context) {
+				const auto metrics = context->Metrics();
+				writer.F("Metal queue barriers/full/init boundaries: %llu/%llu/%llu; resource/prior-submission dependencies: %llu/%llu\n",
+					(unsigned long long)metrics.queueBarriers, (unsigned long long)metrics.fullQueueBarriers,
+					(unsigned long long)metrics.initializationBoundaries, (unsigned long long)metrics.resourceDependencies,
+					(unsigned long long)metrics.priorSubmissionDependencies);
+				writer.F("Metal CPU completion wait elapsed: %.3f ms (%llu calls, %llu pending at lock); not GPU barrier time\n",
+					metrics.completionWaitSeconds * 1000.0, (unsigned long long)metrics.completionWaits,
+					(unsigned long long)metrics.blockingCompletionWaits);
+				writer.F("Metal upload total payload/padding bytes: %llu/%llu; capacity: %zu; argument tables: %zu\n",
+					(unsigned long long)metrics.uploadBytes, (unsigned long long)metrics.uploadPadding, metrics.uploadCapacity, metrics.argumentCapacity);
+				writer.F("Metal library total CPU time: %.3f ms, %llu compiles\n", metrics.librarySeconds * 1000.0, (unsigned long long)metrics.libraryCompiles);
+				writer.F("Metal transient copy-plane/sample-layer/backbuffer allocations: %llu/%llu/%llu; bytes: %llu/%llu/%llu\n",
+					(unsigned long long)metrics.transientAllocations[0], (unsigned long long)metrics.transientAllocations[1], (unsigned long long)metrics.transientAllocations[2],
+					(unsigned long long)metrics.transientBytes[0], (unsigned long long)metrics.transientBytes[1], (unsigned long long)metrics.transientBytes[2]);
+				writer.F("Metal copy plane requests/capacity: %llu/%zu bytes\n", (unsigned long long)metrics.copyPlaneRequests, metrics.copyPlaneCapacity);
 				const double gpuTimeMs = context->LastSubmissionGPUTimeMs();
 				if (gpuTimeMs >= 0.0) {
 					writer.F("Last Metal submission GPU time: %.3f ms\n", gpuTimeMs);

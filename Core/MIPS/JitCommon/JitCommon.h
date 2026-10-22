@@ -114,9 +114,29 @@ namespace MIPSComp {
 		virtual int Replace_fabsf() = 0;
 	};
 
+	// For the JIT stats debug overlay.
+	struct JitStats {
+		int numBlocks = 0;
+		int numValidBlocks = 0;
+		// In IR instructions. Invalidated blocks keep their space until the cache is cleared.
+		size_t irArenaUsed = 0;
+		size_t irArenaSize = 0;
+		// In bytes. Zero when not compiling to native code.
+		size_t codeUsed = 0;
+		size_t codeSize = 0;
+		// How many times the cache was cleared because one of them filled up.
+		int irArenaFullClears = 0;
+		int codeFullClears = 0;
+		// Calls to InvalidateCacheAt that hit at least one block, and the blocks they hit.
+		int invalidations = 0;
+		int invalidatedBlocks = 0;
+	};
+
 	class JitInterface {
 	public:
 		virtual ~JitInterface() {}
+
+		virtual void GetStats(JitStats *stats) const {}
 
 		virtual const u8 *GetCodeBase() const = 0;  // Just for displaying in the debugger.
 		virtual bool CodeInRange(const u8 *ptr) const = 0;
@@ -128,8 +148,13 @@ namespace MIPSComp {
 		virtual const u8 *GetCrashHandler() const = 0;
 		virtual JitBlockCacheDebugInterface *GetBlockCacheDebugInterface() = 0;
 		virtual void InvalidateCacheAt(u32 em_address, int length = 4) = 0;
+		// Invalidates every block not entirely inside one of the (address, size) ranges.
+		virtual void InvalidateCacheExcept(const std::vector<std::pair<u32, u32>> &keep) = 0;
 		virtual void DoState(PointerWrap &p) = 0;
 		virtual void RunLoopUntil(u64 globalticks) = 0;
+		// Runs until the downcount runs out, without CoreTiming. For the Media Engine, which the IR
+		// interpreter runs, and the native JITs that NativeJitRunsMediaEngine().
+		virtual void RunDowncount() {}
 		virtual void Compile(u32 em_address) = 0;
 		virtual void ClearCache() = 0;
 		virtual void UpdateFCR31() = 0;
@@ -160,9 +185,9 @@ namespace MIPSComp {
 	// This seems to be the same for all branch types.
 	u32 ResolveNotTakenTarget(const BranchInfo &branchInfo);
 
-	extern JitInterface *jit;
-
-	void DoDummyJitState(PointerWrap &p);
+	void DoDummyJitState(PointerWrap &p, const MIPSState *mips);
 
 	JitInterface *CreateNativeJit(MIPSState *mipsState);
+	// Whether the native JIT's dispatcher can run the Media Engine.
+	bool NativeJitRunsMediaEngine();
 }

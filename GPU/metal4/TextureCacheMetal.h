@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <list>
 
 #include "GPU/metal4/TextureCachePolicyMetal.h"
 #include "Common/GPU/metal4/MetalRenderManager.h"
@@ -50,9 +51,26 @@ public:
 	void *GetNativeTextureView(const MetalTexCacheEntry *entry, bool flat) const override;
 	void ResetGETextureBindings();
 	void RestoreGETextureBindings();
-	bool BindSamplingRegion(const TransformedVertex *vertices, TransformedVertex *adjusted, const MTLViewport &viewport = {});
+	bool ComputeSamplingRegion(const TransformedVertex *vertices, const MTLViewport &viewport, std::array<int, 4> *region) const;
+	bool BindSamplingRegion(const TransformedVertex *vertices, TransformedVertex *adjusted, const std::array<int, 4> *region = nullptr);
 	bool HasScaledTexture() const { return geScaledTexture_ != nullptr; }
+	id<MTLSamplerState> GetSampler(const SamplerCacheKey &key, std::string *error);
 	const size_t CacheSizeEstimate() const override;
+	struct RegionMetrics {
+		uint64_t hits = 0, misses = 0, evictions = 0, clears = 0, draws = 0, groups = 0;
+		size_t sourceBytes = 0, regionBytes = 0, count = 0;
+	};
+	void RecordRegionDraw(bool startsGroup) {
+		++regionMetrics_.draws;
+		regionMetrics_.groups += startsGroup;
+	}
+	RegionMetrics GetRegionMetrics() const {
+		auto metrics = regionMetrics_;
+		metrics.sourceBytes = sourceBytes_;
+		metrics.regionBytes = regionBytes_;
+		metrics.count = regionCount_;
+		return metrics;
+	}
 
 protected:
 	void BindTexture(MetalTexCacheEntry *entry) override;
@@ -64,18 +82,27 @@ protected:
 	void BoundFramebufferTexture() override;
 
 private:
+	using RegionKey = std::array<int, 4>;
+	using RegionLRU = std::list<std::pair<Metal::Texture *, RegionKey>>;
+	struct ScaledRegion {
+		Draw::AutoRef<Metal::Texture> texture;
+		RegionLRU::iterator lru;
+		size_t bytes;
+	};
 	struct ScaledTextureSource {
 		int width, height;
 		std::vector<uint32_t> pixels;
-		std::map<std::array<int, 4>, Draw::AutoRef<Metal::Texture>> regions;
+		std::map<RegionKey, ScaledRegion> regions;
 	};
 	std::map<Metal::Texture *, ScaledTextureSource> scaledSources_;
+	RegionLRU regionLRU_;
 	Metal::Texture *geScaledTexture_ = nullptr;
 	Draw::AutoRef<Metal::Texture> temporaryRegion_;
 	SamplerCacheKey geSamplerKey_{};
 	size_t regionBytes_ = 0;
 	size_t sourceBytes_ = 0;
 	size_t regionCount_ = 0;
+	RegionMetrics regionMetrics_;
 	void UpdateScalingShader();
 	bool ReadCompressedTextureDebug(id<MTLTexture> texture, int mip, int width, int height, GPUDebugBuffer &buffer, std::string *error);
 	Metal::RenderManager *manager_ = nullptr;

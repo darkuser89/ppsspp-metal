@@ -7,9 +7,11 @@
 
 namespace Draw {
 class DrawContext;
+class Framebuffer;
 
 // Starts offscreen. The platform GraphicsContext may attach a CAMetalLayer
 // through NativeObject::RENDER_MANAGER (Metal::RenderManager).
 // No Vulkan instance or MoltenVK library is involved.
 DrawContext *T3DCreateMetalContext(std::string *error);
+bool T3DMetalWriteStencilFromAlpha(DrawContext *draw, Framebuffer *framebuffer);
 }
