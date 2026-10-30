@@ -157,6 +157,8 @@ public:
 				writer.F("Metal CPU completion wait elapsed: %.3f ms (%llu calls, %llu pending at lock); not GPU barrier time\n",
 					metrics.completionWaitSeconds * 1000.0, (unsigned long long)metrics.completionWaits,
 					(unsigned long long)metrics.blockingCompletionWaits);
+				writer.F("Metal drawable queue waits/presentations: %llu/%llu\n",
+					(unsigned long long)metrics.drawableWaits, (unsigned long long)metrics.presentedDrawables);
 				writer.F("Metal upload total payload/padding bytes: %llu/%llu; capacity: %zu; argument tables: %zu\n",
 					(unsigned long long)metrics.uploadBytes, (unsigned long long)metrics.uploadPadding, metrics.uploadCapacity, metrics.argumentCapacity);
 				writer.F("Metal library total CPU time: %.3f ms, %llu compiles\n", metrics.librarySeconds * 1000.0, (unsigned long long)metrics.libraryCompiles);
@@ -248,7 +250,11 @@ private:
 			framebufferManager_->ClearAllDepthBuffers();
 			gstate_c.useFlagsChanged = false;
 		}
-		if (shaderCachePath_.Valid() && gpuStats.totals.numFlips && !(gpuStats.totals.numFlips & 32767)) {
+		const int flips = gpuStats.totals.numFlips;
+		const bool newFlip = flips != lastCacheCheckFlip_;
+		lastCacheCheckFlip_ = flips;
+		// Paused/slow PSP output can have several host frames at the same flip.
+		if (newFlip && shaderCachePath_.Valid() && flips && !(flips & 32767)) {
 			drawEngine_.SavePipelineCache(pipelineCachePath_);
 			metalShaders_->SaveCache(shaderCachePath_);
 		}
@@ -258,6 +264,7 @@ private:
 	ShaderManagerMetal *metalShaders_ = nullptr;
 	Path shaderCachePath_;
 	Path pipelineCachePath_;
+	int lastCacheCheckFlip_ = -1;
 };
 
 GPUCommon *CreateMetalGPU(GraphicsContext *context, Draw::DrawContext *draw) {

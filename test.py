@@ -93,6 +93,7 @@ tests_good = [
   "cpu/cpu_alu/cpu_div",
   "cpu/cpu_alu/shift_encodings",
   "cpu/cpu_alu/allegrex_encodings",
+  "cpu/jump/unaligned",
   "cpu/vfpu/callout",
   "cpu/vfpu/colors",
   "cpu/vfpu/convert",
@@ -172,6 +173,8 @@ tests_good = [
   "audio/blocking/vaudio",
   "audio/sceaudio/reserve",
   "audio/sceaudio/datalen",
+  "audio/sceaudio/input",
+  "audio/sceaudio/routing",
   "audio/output2/changelength",
   "audio/output2/release",
   "audio/output2/reserve",
@@ -346,9 +349,18 @@ tests_good = [
   "misc/deadbeef",
   "modules/cutrel/cutrel",
   "modules/cutrel/kernel/cutrel",
+  "modules/idlist/idlist",
   "modules/loadrace/loadrace",
   "modules/startoptions/startoptions",
   "modules/unresolved/unresolved",
+  "net/inet/blocking",
+  "net/inet/addr",
+  "net/inet/options",
+  "net/inet/msg",
+  "net/inet/limits",
+  "net/inet/polledge",
+  "net/inet/reuse",
+  "net/inet/errnothread",
   "misc/libc",
   "misc/sdkver",
   "misc/testgp",
@@ -541,6 +553,7 @@ tests_good = [
   "umd/callbacks/umd",
   "umd/wait/wait",
   "umd/register",
+  "video/mpeg/cscvme",
   "video/mpeg/ringbuffer/avail",
   "video/mpeg/ringbuffer/construct",
   "video/mpeg/ringbuffer/destruct",
@@ -652,8 +665,35 @@ tests_next = [
   #"modules/loadexec/loader",
   "modules/unloadfill/unloadfill",
   "net/http/http",
+  "net/adhoc/adhocctl",
+  "net/adhoc/alerts",
+  "net/adhoc/discover",
+  "net/adhoc/gamemode",
+  "net/adhoc/limits",
+  "net/adhoc/loopback",
+  "net/adhoc/matching",
+  "net/adhoc/pdp",
+  "net/adhoc/poll",
+  "net/adhoc/ptp",
+  "net/adhoc/self",
   "net/inet/bind",
+  "net/inet/poll",
+  "net/inet/errors",
+  "net/inet/states",
+  "net/inet/offline",
+  "net/inet/stats",
+  "net/inet/tcp",
+  "net/inet/udp",
   "net/primary/ether",
+  # Two-console tests: run on two instances through the built-in relay (see run_pair_tests).
+  "net/adhoc/pair/basic",
+  "net/adhoc/pair/flow",
+  "net/adhoc/pair/gamemode",
+  "net/adhoc/pair/lifecycle",
+  "net/adhoc/pair/matching",
+  "net/adhoc/pair/matching2",
+  "net/adhoc/pair/matching3",
+  "net/adhoc/pair/vanish",
   "sysmem/partition",
   # These two mbx tests only appeared to work because they papered over bugs 
 
@@ -675,9 +715,9 @@ tests_next = [
   #"utility/savedata/saveemptyfilename",
   "utility/savedata/secureversion",
   "utility/savedata/sizes",
-  "video/mp4/avchold",
+  "video/mp4/avchold",  # needs Sony's mp4 and mpeg modules: --disable-hle=0x110, see docs/pspautotests.md
   "video/mpeg/basic",
-  "video/mpeg/decodeend",
+  "video/mpeg/decodeend",  # needs Sony's mpeg module, as avchold
   "video/mpeg/deletetiming",
   "video/pmf/pmf",
   "video/pmf_simple/pmf_simple",
@@ -697,6 +737,21 @@ tests_next = [
 test_flags = {
   "utility/savedata/nomemstick": ["--no-memstick"],
 }
+
+# The ad hoc tests create groups, so they need a server to log in to, and they wait for its replies
+# in real time.
+ADHOC_FLAGS = ["--adhoc-server", "--realtime", "--timeout-wall=60"]
+
+def flags_for(test):
+  if test in test_flags:
+    return test_flags[test]
+  if test.startswith("net/adhoc/"):
+    return ADHOC_FLAGS
+  return None
+
+def is_pair_test(test):
+  # A two-console test is a set of programs, NAME_host.prx and NAME_client.prx.
+  return os.path.exists(TEST_ROOT + test + "_host.prx")
 
 
 # These are the tests we ignore (not important, or impossible to run)
@@ -749,6 +804,10 @@ def run_tests(test_list, args):
   # Debug builds are several times slower, enough for the heavier tests to brush the limit.
   if 'Debug' in os.path.normpath(PPSSPP_EXE).split(os.sep):
     timeout *= DEBUG_TIMEOUT_SCALE
+  # Tests that need longer bring their own.
+  for arg in args:
+    if arg.startswith('--timeout-wall='):
+      timeout = int(arg[len('--timeout-wall='):])
 
   test_filenames = []
   for test in test_list:
@@ -763,7 +822,7 @@ def run_tests(test_list, args):
   if len(test_filenames):
     # TODO: Maybe --compare should detect --graphics?
     cmdline = [PPSSPP_EXE, '--root', TEST_ROOT + '../', '--compare', '--timeout-wall=' + str(timeout), '@-']
-    cmdline.extend([i for i in args if i not in ['-g', '-m', '-b']])
+    cmdline.extend([i for i in args if i not in ['-g', '-m', '-b'] and not i.startswith('--timeout-wall=')])
     # A memory stick of the tests' own, so they neither write into the user's nor see its firmware.
     if not any(i.startswith('--memstick') for i in cmdline):
       cmdline.append('--memstick=' + os.path.join(os.path.dirname(os.path.abspath(PPSSPP_EXE)), 'memstick'))
@@ -773,6 +832,16 @@ def run_tests(test_list, args):
 
     print("Ran " + ' '.join(cmdline))
 
+  return returncode
+
+def run_pair_tests(test_list, args):
+  # Each instance needs its own process, so Tools/adhoc_multi.py starts them, the host running the
+  # built-in ad hoc server and relay.
+  cmdline = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tools', 'adhoc_multi.py'), '--headless', PPSSPP_EXE, '--relay']
+  cmdline.extend([i for i in args if i not in ['-g', '-m', '-b', '--teamcity']])
+  cmdline.extend(test_list)
+  returncode = subprocess.call(cmdline)
+  print("Ran " + ' '.join(cmdline))
   return returncode
 
 def main():
@@ -816,11 +885,15 @@ def main():
     if skipped:
       print("Skipping %d known failures on %s: %s" % (len(skipped), skip_arch, ", ".join(skipped)))
 
-  plain = [t for t in tests if t not in test_flags]
+  pair = [t for t in tests if is_pair_test(t)]
+  tests = [t for t in tests if t not in pair]
+  plain = [t for t in tests if flags_for(t) is None]
   returncode = run_tests(plain, args)
   for test in tests:
-    if test in test_flags:
-      returncode = run_tests([test], args + test_flags[test]) or returncode
+    if flags_for(test) is not None:
+      returncode = run_tests([test], args + flags_for(test)) or returncode
+  if pair:
+    returncode = run_pair_tests(pair, args) or returncode
   if teamcity:
     return 0
   return returncode

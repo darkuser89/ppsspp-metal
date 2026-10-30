@@ -525,7 +525,7 @@ typedef struct SceNetAdhocMatchingContext {
 
 // End of psp definitions
 
-const size_t MAX_ADHOCCTL_HANDLERS = 32; //4
+const size_t MAX_ADHOCCTL_HANDLERS = 4; // pspautotests net/adhoc/adhocctl
 const size_t MAX_MATCHING_HANDLERS = 32; //4
 
 enum {
@@ -801,7 +801,7 @@ extern std::atomic<bool> friendFinderRunning;
 extern SceNetAdhocctlPeerInfo * friends;
 extern SceNetAdhocctlScanInfo * networks;
 extern u64 adhocctlStartTime;
-extern bool isAdhocctlNeedLogin;
+extern std::atomic<bool> isAdhocctlNeedLogin;
 extern bool isAdhocctlBusy;
 extern int adhocctlState;
 extern int adhocctlCurrentMode;

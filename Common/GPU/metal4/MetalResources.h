@@ -104,14 +104,19 @@ public:
 		Draw::FBBlitFilter filter, std::string *error);
 	bool StencilFromAlpha(RenderContext &context, Framebuffer *dst, std::string *error,
 		id<MTL4RenderCommandEncoder> activeEncoder = nil);
+	size_t GetNumPipelines() const { return pipelines_.size(); }
 
 private:
 	struct Pipeline {
 		id<MTLRenderPipelineState> render = nil;
 		id<MTLDepthStencilState> depthStencil = nil;
 	};
-	std::map<std::array<uint64_t, 7>, Pipeline> pipelines_;
+	std::map<std::array<uint64_t, 6>, Pipeline> pipelines_;
+	// Transfer functions depend on source access/aspects, not destination format or sample count.
+	std::map<std::array<uint64_t, 4>, id<MTLFunction>> fragmentShaders_;
 	id<MTLFunction> vertex_ = nil;
+	id<MTLFunction> stencilVertex_ = nil;
+	id<MTLFunction> stencilFragment_ = nil;
 };
 
 // Encoders must have ended before these operations. The caller owns render-pass

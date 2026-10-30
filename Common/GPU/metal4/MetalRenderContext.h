@@ -45,6 +45,10 @@ struct ResourceMetrics {
 	std::array<uint64_t, 3> transientBytes{};
 	double librarySeconds = 0.0;
 	uint64_t libraryCompiles = 0;
+	uint64_t libraryCacheHits = 0;
+	uint64_t libraryCacheEvictions = 0;
+	size_t libraryCacheEntries = 0;
+	size_t libraryCacheBytes = 0;
 	size_t uploadCapacity = 0;
 	size_t argumentCapacity = 0;
 	size_t copyPlaneCapacity = 0;
@@ -58,6 +62,8 @@ struct ResourceMetrics {
 	uint64_t resourceDependencies = 0;
 	uint64_t priorSubmissionDependencies = 0;
 	uint64_t resourceIdentityResolutions = 0;
+	uint64_t presentedDrawables = 0;
+	uint64_t drawableWaits = 0;
 };
 
 struct Submission {
@@ -137,7 +143,9 @@ public:
 	// Declare accesses before commands; intrapass dependencies still need encoder barriers.
 	void UseResource(id<MTL4CommandEncoder> encoder, id<MTLResource> resource, MTLStages reads, MTLStages writes);
 	void ProfileExternalCommands() { mainUnknownAccesses_ = true; if (profilingEnabled_) { profileIncomplete_ = true; } }
+	void UseDrawable(id<MTLDrawable> drawable);
 	void PresentDrawable(id<MTLDrawable> drawable);
+	bool HasPendingDrawables() const;
 	std::shared_ptr<Submission> CurrentSubmission() const { return currentCompletion_; }
 
 	id<MTLDevice> Device() const { return device_; }
@@ -150,6 +158,8 @@ public:
 	uint64_t TimestampFrequency() const { return timestampFrequency_; }
 	std::string DeviceName() const;
 	id<MTLFunction> CreateShader(const CompiledShader &shader, const char *tag, std::string *error);
+	static constexpr size_t MAX_LIBRARY_CACHE_ENTRIES = 64;
+	static constexpr size_t MAX_LIBRARY_CACHE_BYTES = 1024 * 1024;
 
 private:
 	bool WaitForCommands(const std::shared_ptr<Submission> &completion, std::string *error);
@@ -190,6 +200,15 @@ private:
 	id<MTL4CommandQueue> queue_ = nil;
 	id<MTL4Compiler> compiler_ = nil;
 	NSMapTable<id<MTLFunction>, id<MTLLibrary>> *functionLibraries_ = nil;
+	// Exact source keys; compile options are fixed by CreateShader. Functions own
+	// their libraries through functionLibraries_; this index does not extend their lifetime.
+	struct CachedLibrary {
+		__weak id<MTLLibrary> library = nil;
+		uint64_t lastUsed = 0;
+	};
+	std::map<std::string, CachedLibrary> libraryCache_;
+	size_t libraryCacheBytes_ = 0;
+	uint64_t libraryCacheUse_ = 0;
 	id<MTL4CommandBuffer> commands_ = nil;
 	id<MTL4CommandBuffer> initializationCommands_ = nil;
 	id<MTL4ComputeCommandEncoder> initializationBlitEncoder_ = nil;
@@ -203,7 +222,12 @@ private:
 	std::array<size_t, 3> argumentUsage_{};
 	std::array<unsigned, 3> argumentLowUsage_{};
 	size_t argumentPoolUsed_ = 0;
-	id<MTLDrawable> pendingDrawable_ = nil;
+	struct DrawableState {
+		id<MTLDrawable> drawable = nil;
+		bool waited = false;
+		bool present = false;
+	};
+	std::vector<DrawableState> drawables_;
 	struct ProfilePass {
 		std::string tag;
 		NSUInteger firstSample = 0;

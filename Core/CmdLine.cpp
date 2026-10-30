@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 
@@ -51,6 +52,34 @@ enum class ParseParamResult {
 	BadValue,
 };
 
+// Decimal, or hex with 0x, optionally signed. Not base 0, which would read a leading 0 as octal.
+// Up to 0xFFFFFFFF is accepted so a full 32-bit mask can be given, and wraps into the int.
+static bool ParseIntParam(const std::string &value, int *out) {
+	const char *p = value.c_str();
+	bool negative = false;
+	if (*p == '-' || *p == '+') {
+		negative = *p == '-';
+		p++;
+	}
+	int base = 10;
+	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+		base = 16;
+		p += 2;
+	}
+	// strtoull would take another sign or leading spaces here.
+	if (!isxdigit((unsigned char)*p)) {
+		return false;
+	}
+	char *end = nullptr;
+	errno = 0;
+	const unsigned long long magnitude = strtoull(p, &end, base);
+	if (*end != '\0' || errno == ERANGE || magnitude > (negative ? 0x80000000ULL : 0xFFFFFFFFULL)) {
+		return false;
+	}
+	*out = negative ? (int)(0 - (uint32_t)magnitude) : (int)(uint32_t)magnitude;
+	return true;
+}
+
 ParseParamResult SetValue(CommandLineOptions *options, const CommandLineParam &param, const std::string &value) {
 	uint8_t *optionsPtr = reinterpret_cast<uint8_t *>(options);
 	switch (param.type) {
@@ -77,7 +106,7 @@ ParseParamResult SetValue(CommandLineOptions *options, const CommandLineParam &p
 	{
 		// Not std::stoi - that throws on junk, which takes the process down with no diagnostic.
 		int v;
-		if (sscanf(value.c_str(), "%d", &v) != 1) {
+		if (!ParseIntParam(value, &v)) {
 			PRINT_STDERR("Error: Invalid value for integer parameter --%s: '%s'.\n", param.longName, value.c_str());
 			return ParseParamResult::BadValue;
 		}
@@ -190,6 +219,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(fullscreen), CmdParamType::BoolInverse, "windowed", '\0', "Force windowed mode", CmdLineMode::Application},
 	{POFF(startScreen), CmdParamType::String, "start-screen", '\0', "Start on a specific screen (e.g. 'gamesettings', 'touchscreentest')", CmdLineMode::Application},
 	{POFF(escapeExit), CmdParamType::Bool, "escape-exit", '\0', "Escape key exits the application", CmdLineMode::Application},
+	{POFF(gameWindow), CmdParamType::Bool, "game-window", '\0', "Show the game in a second window, for testing multiple outputs (Vulkan, or Metal on Mac)", CmdLineMode::Application},
 	{POFF(pauseMenuExit), CmdParamType::Bool, "pause-menu-exit", '\0', "Exit the application when the game ends, instead of returning to the menu", CmdLineMode::Application},
 	{POFF(appendConfig), CmdParamType::String, "appendconfig", '\0', "Merge config FILE into the current configuration"},
 	{POFF(root), CmdParamType::String, "root", 'r', "Mount directory as the root of host0:/."},
@@ -225,6 +255,9 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(timeoutEmulated), CmdParamType::Double, "timeout-emulated", '\0', "Stop the run after this many emulated seconds", CmdLineMode::Headless},
 	// The old name for --timeout-wall, kept working because it's in a lot of scripts.
 	{POFF(timeoutWall), CmdParamType::Double, "timeout", '\0', "Alias for --timeout-wall", CmdLineMode::Headless},
+	{POFF(instance), CmdParamType::Int, "instance", '\0', "Run as instance N of several talking to each other over ad hoc (own 127.0.0.N address and MAC)", CmdLineMode::Headless},
+	{POFF(realtime), CmdParamType::Bool, "realtime", '\0', "Run at PSP speed instead of as fast as possible", CmdLineMode::Headless},
+	{POFF(adhocServer), CmdParamType::Bool, "adhoc-server", '\0', "Run the built-in ad hoc server"},
 	{POFF(frameStats), CmdParamType::Bool, "frame-stats", '\0', "Print flips per emulated second at the end of the run, counted from --state's load", CmdLineMode::Headless},
 	{POFF(maxScreenshotError), CmdParamType::Double, "max-mse", '\0', "Maximum allowed MSE error for screenshot comparison", CmdLineMode::Headless},
 	{POFF(mountIso), CmdParamType::String, "mount", 'm', "Mount ISO/CSO on umd1: when booting an ELF/PBP or --vsh"},
@@ -265,6 +298,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(yres), CmdParamType::Int, "yres", '\0', "Set Y resolution", CmdLineMode::Application},
 	{POFF(dpi), CmdParamType::Double, "dpi", '\0', "Set DPI", CmdLineMode::Application},
 	{POFF(scale), CmdParamType::Double, "scale", '\0', "Set scale", CmdLineMode::Application},
+	{POFF(skipLogo), CmdParamType::Bool, "skip-logo", '\0', "Skip the logo screen", CmdLineMode::Application},
 	// TODO: At some point we should maybe simply expose all config settings to be set directly from the command line automatically?
 };
 
@@ -536,6 +570,10 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 }
 
 void CommandLineOptions::ApplyToConfig() const {
+	if (adhocServer.has_value()) {
+		g_Config.bEnableAdhocServer = adhocServer.value();
+		g_Config.DoNotSaveSetting(&g_Config.bEnableAdhocServer);
+	}
 	if (fuseId.has_value()) {
 		g_Config.sFuseID = fuseId.value();
 		g_Config.DoNotSaveSetting(&g_Config.sFuseID);

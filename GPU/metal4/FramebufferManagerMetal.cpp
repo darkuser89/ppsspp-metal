@@ -131,6 +131,14 @@ bool FramebufferManagerMetal::PresentedThisFrame() const {
 	return presentation_->PresentedThisFrame();
 }
 
+void FramebufferManagerMetal::SetPresentationOutput(const OutputParams *output) {
+	presentation_->SetOutputOverride(output);
+}
+
+bool FramebufferManagerMetal::PresentsToOtherOutput() const {
+	return presentation_->HasOutputOverride();
+}
+
 void FramebufferManagerMetal::SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format) {
 	displayFramebufPtr_ = framebuf & 0x3FFFFFFF;
 	if (Memory::IsVRAMAddress(displayFramebufPtr_))

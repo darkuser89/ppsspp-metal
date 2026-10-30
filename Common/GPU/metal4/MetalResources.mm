@@ -869,13 +869,13 @@ bool FramebufferCopy::StencilFromAlpha(RenderContext &context, Framebuffer *dst,
 		*error = "Invalid Metal alpha-to-stencil framebuffer";
 		return false;
 	}
-	const std::array<uint64_t, 7> key{1ull << 32, 0, 0, 0, 1, (uint64_t)dst->Color().pixelFormat,
-		(uint64_t)MTLPixelFormatDepth32Float_Stencil8};
+	const std::array<uint64_t, 6> key{1ull << 32, 0, 0, 0, 1, (uint64_t)dst->Color().pixelFormat};
 	auto found = pipelines_.find(key);
 	if (found == pipelines_.end()) {
-		CompiledShader vertex;
-		vertex.entryPoint = "stencilVertex";
-		vertex.source = R"(
+		if (!stencilVertex_) {
+			CompiledShader vertex;
+			vertex.entryPoint = "stencilVertex";
+			vertex.source = R"(
 #include <metal_stdlib>
 using namespace metal;
 vertex float4 stencilVertex(uint id [[vertex_id]]) {
@@ -883,9 +883,15 @@ vertex float4 stencilVertex(uint id [[vertex_id]]) {
 	return float4(p[id], 0, 1);
 }
 )";
-		CompiledShader fragment;
-		fragment.entryPoint = "stencilFragment";
-		fragment.source = R"(
+			stencilVertex_ = context.CreateShader(vertex, "Metal alpha-to-stencil vertex", error);
+			if (!stencilVertex_) {
+				return false;
+			}
+		}
+		if (!stencilFragment_) {
+			CompiledShader fragment;
+			fragment.entryPoint = "stencilFragment";
+			fragment.source = R"(
 #include <metal_stdlib>
 using namespace metal;
 struct StencilOut {
@@ -896,14 +902,14 @@ fragment StencilOut stencilFragment(float4 color [[color(0)]]) {
 	return {color, uint(floor(color.a * 255.99f))};
 }
 )";
-		auto vs = context.CreateShader(vertex, "Metal alpha-to-stencil vertex", error);
-		auto fs = context.CreateShader(fragment, "Metal alpha-to-stencil fragment", error);
-		if (!vs || !fs) {
-			return false;
+			stencilFragment_ = context.CreateShader(fragment, "Metal alpha-to-stencil fragment", error);
+			if (!stencilFragment_) {
+				return false;
+			}
 		}
 		MTL4RenderPipelineDescriptor *pd = [MTL4RenderPipelineDescriptor new];
-		pd.vertexFunctionDescriptor = context.FunctionDescriptor(vs);
-		pd.fragmentFunctionDescriptor = context.FunctionDescriptor(fs);
+		pd.vertexFunctionDescriptor = context.FunctionDescriptor(stencilVertex_);
+		pd.fragmentFunctionDescriptor = context.FunctionDescriptor(stencilFragment_);
 		pd.colorAttachments[0].pixelFormat = dst->Color().pixelFormat;
 		pd.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
 		NSError *nativeError = nil;
@@ -997,8 +1003,8 @@ bool FramebufferCopy::Blit(RenderContext &context, Framebuffer *src, int sx, int
 	if (@available(macOS 13.0, iOS 16.0, *)) {
 		arraySamples = perSample && src->ColorAttachment().textureType == MTLTextureType2DMultisampleArray;
 	}
-	const auto depthFormat = dst->DepthStencil() ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
-	const std::array<uint64_t, 7> key{(uint64_t)aspects, perSample, arraySamples, linear, (uint64_t)dst->SampleCount(), (uint64_t)dst->Color().pixelFormat, (uint64_t)depthFormat};
+	// Metal 4 pipeline descriptors have no depth-attachment format.
+	const std::array<uint64_t, 6> key{(uint64_t)aspects, perSample, arraySamples, linear, (uint64_t)dst->SampleCount(), (uint64_t)dst->Color().pixelFormat};
 	auto found = pipelines_.find(key);
 	if (found == pipelines_.end()) {
 		if (!vertex_) {
@@ -1017,55 +1023,62 @@ vertex float4 copyVertex(uint id [[vertex_id]]) {
 				return false;
 			}
 		}
-		CompiledShader shader;
-		shader.entryPoint = "copyFragment";
-		shader.source = "#include <metal_stdlib>\nusing namespace metal;\nstruct Out {\n";
-		if (color) {
-			shader.source += "float4 color [[color(0)]];\n";
-		}
-		if (depth) {
-			shader.source += "float depth [[depth(any)]];\n";
-		}
-		if (stencil) {
-			shader.source += "uint stencil [[stencil]];\n";
-		}
-		shader.source += "};\nfragment Out copyFragment(float4 pos [[position]], constant float4 &region [[buffer(0)]], constant float2 &dstOrigin [[buffer(1)]], constant float2 &invSize [[buffer(2)]]";
-		const std::string textureType = arraySamples ? "texture2d_ms_array" : perSample ? "texture2d_ms" : "texture2d";
-		if (perSample) {
-			shader.source += ", uint sample [[sample_id]]";
-		}
-		if (arraySamples) {
-			shader.source += ", constant uint &sourceLayer [[buffer(3)]]";
-		}
-		if (color) {
-			shader.source += ", " + textureType + (linear ? "<float, access::sample> colorTex [[texture(0)]]" : "<float, access::read> colorTex [[texture(0)]]");
-		}
-		if (depth) {
-			shader.source += ", " + textureType + "<float, access::read> depthTex [[texture(1)]]";
-		}
-		if (stencil) {
-			shader.source += ", " + textureType + "<uint, access::read> stencilTex [[texture(2)]]";
-		}
-		shader.source += ") { float2 sourcePos = (pos.xy - dstOrigin) * region.zw + region.xy; uint2 p = uint2(sourcePos); Out out;\n";
-		const std::string read = arraySamples ? ".read(p, sourceLayer, sample)" : perSample ? ".read(p, sample)" : ".read(p)";
-		if (color) {
-			if (linear) {
-				shader.source += "constexpr sampler linearSampler(filter::linear, address::clamp_to_edge); out.color = colorTex.sample(linearSampler, sourcePos * invSize);\n";
-			} else {
-				shader.source += "out.color = colorTex" + read + ";\n";
-			}
-		}
-		if (depth) {
-			shader.source += "out.depth = depthTex" + read + ".r;\n";
-		}
-		if (stencil) {
-			shader.source += "out.stencil = stencilTex" + read + ".r;\n";
-		}
-		shader.source += "return out; }\n";
-		auto fragment = context.CreateShader(shader, "Metal transfer fragment", error);
+		const std::array<uint64_t, 4> shaderKey{(uint64_t)aspects, perSample, arraySamples, linear};
+		auto cachedShader = fragmentShaders_.find(shaderKey);
+		id<MTLFunction> fragment = cachedShader == fragmentShaders_.end() ? nil : cachedShader->second;
 		if (!fragment) {
-			return false;
+			CompiledShader shader;
+			shader.entryPoint = "copyFragment";
+			shader.source = "#include <metal_stdlib>\nusing namespace metal;\nstruct Out {\n";
+			if (color) {
+				shader.source += "float4 color [[color(0)]];\n";
+			}
+			if (depth) {
+				shader.source += "float depth [[depth(any)]];\n";
+			}
+			if (stencil) {
+				shader.source += "uint stencil [[stencil]];\n";
+			}
+			shader.source += "};\nfragment Out copyFragment(float4 pos [[position]], constant float4 &region [[buffer(0)]], constant float2 &dstOrigin [[buffer(1)]], constant float2 &invSize [[buffer(2)]]";
+			const std::string textureType = arraySamples ? "texture2d_ms_array" : perSample ? "texture2d_ms" : "texture2d";
+			if (perSample) {
+				shader.source += ", uint sample [[sample_id]]";
+			}
+			if (arraySamples) {
+				shader.source += ", constant uint &sourceLayer [[buffer(3)]]";
+			}
+			if (color) {
+				shader.source += ", " + textureType + (linear ? "<float, access::sample> colorTex [[texture(0)]]" : "<float, access::read> colorTex [[texture(0)]]");
+			}
+			if (depth) {
+				shader.source += ", " + textureType + "<float, access::read> depthTex [[texture(1)]]";
+			}
+			if (stencil) {
+				shader.source += ", " + textureType + "<uint, access::read> stencilTex [[texture(2)]]";
+			}
+			shader.source += ") { float2 sourcePos = (pos.xy - dstOrigin) * region.zw + region.xy; uint2 p = uint2(sourcePos); Out out;\n";
+			const std::string read = arraySamples ? ".read(p, sourceLayer, sample)" : perSample ? ".read(p, sample)" : ".read(p)";
+			if (color) {
+				if (linear) {
+					shader.source += "constexpr sampler linearSampler(filter::linear, address::clamp_to_edge); out.color = colorTex.sample(linearSampler, sourcePos * invSize);\n";
+				} else {
+					shader.source += "out.color = colorTex" + read + ";\n";
+				}
+			}
+			if (depth) {
+				shader.source += "out.depth = depthTex" + read + ".r;\n";
+			}
+			if (stencil) {
+				shader.source += "out.stencil = stencilTex" + read + ".r;\n";
+			}
+			shader.source += "return out; }\n";
+			fragment = context.CreateShader(shader, "Metal transfer fragment", error);
+			if (!fragment) {
+				return false;
+			}
+			fragmentShaders_.emplace(shaderKey, fragment);
 		}
+
 		MTL4RenderPipelineDescriptor *pd = [MTL4RenderPipelineDescriptor new];
 		pd.vertexFunctionDescriptor = context.FunctionDescriptor(vertex_);
 		pd.fragmentFunctionDescriptor = context.FunctionDescriptor(fragment);

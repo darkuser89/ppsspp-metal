@@ -13,9 +13,13 @@
 #include "Core/CoreParameter.h"
 #include "Core/System.h"
 #include "Core/MemMap.h"
+#include "Core/Util/PathUtil.h"
 #include "GPU/metal4/DrawEngineMetal.h"
 #include "GPU/metal4/GPUCommonHWMetal.h"
+#include "GPU/metal4/GPU_Metal.h"
 #include "GPU/metal4/PostShaderMetal.h"
+#include "GPU/metal4/PresentationMetal.h"
+#include "GPU/Common/Overlay.h"
 #include "GPU/Common/SplineCommon.h"
 #include "GPU/Common/SoftwareTransformCommon.h"
 #include "GPU/Common/ShaderUniforms.h"
@@ -25,14 +29,139 @@
 #include <mach/mach.h>
 #include <thread>
 #include "Common/File/FileUtil.h"
+#include "Common/Data/Text/StringWriter.h"
+#include "Core/ELF/ParamSFO.h"
 #include "Common/Data/Format/PNGLoad.h"
 #include "Common/Thread/ThreadManager.h"
 #include <stdexcept>
+
+@interface RegressionMetalLayer : CAMetalLayer
+@property(nonatomic) NSUInteger attempts;
+@property(nonatomic) BOOL unavailable;
+@end
+@implementation RegressionMetalLayer
+- (id<CAMetalDrawable>)nextDrawable {
+	++self.attempts;
+	return self.unavailable ? nil : [super nextDrawable];
+}
+@end
 
 static void Check(bool ok, const std::string &message) {
 	if (!ok) {
 		throw std::runtime_error(message);
 	}
+}
+
+static void MultipleOutputs() {
+	using namespace Draw;
+	std::string error;
+	std::unique_ptr<DrawContext> draw(T3DCreateMetalContext(&error));
+	Check(draw && draw->GetDeviceCaps().multipleSwapchains, "native Metal multiple-output capability");
+	auto *manager = (Metal::RenderManager *)draw->GetNativeObject(NativeObject::RENDER_MANAGER);
+	draw->SetTargetSize(64, 40);
+	int w, h;
+	draw->GetFramebufferDimensions(draw->GetPrimarySwapchain(), &w, &h);
+	Check(w == 64 && h == 40 && draw->GetPrimarySwapchain()->Width() == 64, "primary output dimensions");
+	SwapchainDesc desc{WINDOWSYSTEM_METAL_EXT, nullptr, nullptr, 32, 24, "secondary regression"};
+	auto *a = draw->CreateSwapchain(desc, &error);
+	desc.width = 20;
+	desc.height = 36;
+	auto *b = draw->CreateSwapchain(desc, &error);
+	Check(a && b && a != b, error);
+	auto clear = [&](Framebuffer *fb, uint32_t color) {
+		draw->BindFramebufferAsRenderTarget(fb, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR, color, 0.25f, 17}, "output regression");
+	};
+	auto verify = [&](Framebuffer *fb, uint32_t color) {
+		draw->GetFramebufferDimensions(fb, &w, &h);
+		std::vector<uint32_t> pixels(w * h);
+		Check(draw->CopyFramebufferToMemory(fb, Aspect::COLOR_BIT, 0, 0, w, h, DataFormat::R8G8B8A8_UNORM,
+			pixels.data(), w, ReadbackMode::BLOCK, "output pixels"), "output readback");
+		Check(std::all_of(pixels.begin(), pixels.end(), [&](uint32_t pixel) { return pixel == color; }), "outputs shared or lost their contents");
+	};
+	for (int frame = 0; frame < 8; ++frame) {
+		draw->BeginFrame(DebugFlags::NONE);
+		clear(draw->GetPrimarySwapchain(), 0xFF102030 + frame);
+		clear(a, 0xFF405060 + frame);
+		clear(b, 0xFF708090 + frame);
+		verify(a, 0xFF405060 + frame);
+		verify(nullptr, 0xFF102030 + frame);
+		verify(b, 0xFF708090 + frame);
+		draw->Present(PresentMode::FIFO);
+	}
+	draw->ResizeSwapchain(a, 48, 16);
+	draw->BeginFrame(DebugFlags::NONE);
+	clear(a, 0xFFABCDEF);
+	clear(b, 0xFF123456);
+	verify(a, 0xFFABCDEF);
+	verify(b, 0xFF123456);
+	draw->Present(PresentMode::FIFO);
+	draw->GetFramebufferDimensions(a, &w, &h);
+	Check(w == 48 && h == 16, "secondary resize used the primary size");
+	draw->DestroySwapchain(a);
+	// The secondary keeps rendering without acquiring or binding the primary.
+	draw->SetTargetSize(0, 0);
+	draw->BeginFrame(DebugFlags::NONE);
+	clear(b, 0xFFEECCAA);
+	verify(b, 0xFFEECCAA);
+	draw->Present(PresentMode::FIFO);
+	draw->DestroySwapchain(b);
+	desc.width = 0;
+	Check(!draw->CreateSwapchain(desc, &error) && !error.empty(), "zero-size output accepted");
+	desc.width = draw->GetDeviceCaps().maxTextureSize + 1;
+	Check(!draw->CreateSwapchain(desc, &error), "oversized output accepted");
+
+	RegressionMetalLayer *hidden = [RegressionMetalLayer layer];
+	hidden.unavailable = YES;
+	hidden.drawableSize = CGSizeMake(16, 16);
+	desc = {WINDOWSYSTEM_METAL_EXT, (__bridge void *)hidden, nullptr, 0, 0, "unavailable regression"};
+	a = draw->CreateSwapchain(desc, &error);
+	Check(a != nullptr, error);
+	draw->BeginFrame(DebugFlags::NONE);
+	clear(a, 0xFF123456);
+	clear(a, 0xFF345678);
+	draw->ResizeSwapchain(a, 24, 24);
+	clear(a, 0xFF567890);
+	Check(hidden.attempts == 1, "unavailable drawable requested twice in one frame");
+	draw->Present(PresentMode::FIFO);
+	draw->BeginFrame(DebugFlags::NONE);
+	clear(a, 0xFF123456);
+	Check(hidden.attempts == 2, "unavailable output was not retried next frame");
+	draw->Present(PresentMode::FIFO);
+	draw->DestroySwapchain(a);
+	Check(manager->Context().WaitUntilIdle(&error), error);
+	std::cout << "PASS multiple outputs: eight three-target frames, exact GPU pixels, resize/destruction, primary absent, unavailable acquisition once per frame\n";
+
+	RegressionMetalLayer *layerA = [RegressionMetalLayer layer];
+	RegressionMetalLayer *layerB = [RegressionMetalLayer layer];
+	layerA.drawableSize = CGSizeMake(16, 16);
+	layerB.drawableSize = CGSizeMake(24, 16);
+	desc = {WINDOWSYSTEM_METAL_EXT, (__bridge void *)layerA, nullptr, 16, 16, "real output A"};
+	a = draw->CreateSwapchain(desc, &error);
+	desc.data1 = (__bridge void *)layerB;
+	desc.width = 24;
+	b = draw->CreateSwapchain(desc, &error);
+	Check(a && b, error);
+	const auto presents = manager->Context().Metrics().presentedDrawables;
+	for (int frame = 0; frame < 2; ++frame) {
+		if (frame == 1) {
+			// A surface can change size without the platform having sent its resize event yet.
+			layerA.drawableSize = CGSizeMake(32, 24);
+			layerB.drawableSize = CGSizeMake(8, 32);
+		}
+		draw->BeginFrame(DebugFlags::NONE);
+		clear(a, 0xFF0055AA);
+		verify(a, 0xFF0055AA);
+		clear(b, 0xFFAA5500);
+		verify(b, 0xFFAA5500);
+		Check(a->Width() == (frame ? 32 : 16) && b->Height() == (frame ? 32 : 16), "actual drawable size did not replace the stale output extent");
+		draw->Present(PresentMode::FIFO);
+		Check(manager->Context().WaitUntilIdle(&error), error);
+	}
+	Check(layerA.attempts == 2 && layerB.attempts == 2 && manager->Context().Metrics().presentedDrawables == presents + 4,
+		"all acquired native drawables must be presented once after readback submission");
+	draw->DestroySwapchain(a);
+	draw->DestroySwapchain(b);
+	std::cout << "PASS native drawable outputs: two CAMetalLayers, exact GPU pixels, unnotified size change, readback submissions then four queue presentations\n";
 }
 
 static void DependencyAccounting() {
@@ -136,6 +265,299 @@ static void DependencyAccounting() {
 	context.EndEncoder(encoder);
 	Check(context.SubmitCommands(true, &error), error);
 	std::cout << "PASS resource identity cache: 20000 repeated binds, alias equivalence, submission invalidation\n";
+}
+
+static void OutputRetirement(bool destroy) {
+	using namespace Draw;
+	for (int variant = 0; variant < 4; ++variant) {
+		const bool native = variant & 1;
+		const bool afterReadback = variant & 2;
+		std::string error;
+		std::unique_ptr<DrawContext> draw(T3DCreateMetalContext(&error));
+		Check(draw != nullptr, error);
+		auto *manager = (Metal::RenderManager *)draw->GetNativeObject(NativeObject::RENDER_MANAGER);
+		auto &context = manager->Context();
+		RegressionMetalLayer *layer = native ? [RegressionMetalLayer layer] : nil;
+		layer.drawableSize = CGSizeMake(16, 16);
+		SwapchainDesc desc{WINDOWSYSTEM_METAL_EXT, (__bridge void *)layer, nullptr, 16, 16, "retiring output"};
+		auto *output = draw->CreateSwapchain(desc, &error);
+		Check(output != nullptr, error);
+		draw->BeginFrame(DebugFlags::NONE);
+		draw->BindFramebufferAsRenderTarget(output, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR,
+			0xFF123456, 0.375f, 91}, "retiring output");
+		manager->EndRenderPass();
+		__weak id<MTLTexture> oldColor = static_cast<Metal::Framebuffer *>(manager->RenderTarget())->Color();
+		__weak id<MTLTexture> oldDepth = static_cast<Metal::Framebuffer *>(manager->RenderTarget())->DepthStencil();
+		if (afterReadback) {
+			std::array<uint32_t, 16 * 16> pixels{};
+			Check(draw->CopyFramebufferToMemory(output, Aspect::COLOR_BIT, 0, 0, 16, 16, DataFormat::R8G8B8A8_UNORM,
+				pixels.data(), 16, ReadbackMode::BLOCK, "retiring pixels"), "retiring output readback");
+			Check(pixels[0] == 0xFF123456 && !context.Commands(), "readback did not finish the submission");
+		}
+		auto commands = context.Commands();
+		const auto waits = context.Metrics().completionWaits;
+		const auto presents = context.Metrics().presentedDrawables;
+		if (destroy) {
+			draw->DestroySwapchain(output);
+		} else {
+			draw->ResizeSwapchain(output, 24, 32);
+		}
+		std::cout << "MEASURE output-retirement destroy=" << destroy << " native=" << native << " after-readback=" << afterReadback
+			<< " completion-waits=" << context.Metrics().completionWaits - waits << '\n';
+		Check(context.Commands() == commands && context.Metrics().completionWaits == waits,
+			"output retirement submitted or waited for unrelated GPU work");
+		Check(afterReadback || (oldColor && oldDepth), "retired attachments released before GPU submission");
+		draw->Present(PresentMode::IMMEDIATE);
+		Check(context.WaitUntilIdle(&error), error);
+		Check(context.Metrics().presentedDrawables == presents + native, "retired native drawable lost its presentation");
+		if (!destroy) {
+			if (native) {
+				layer.drawableSize = CGSizeMake(24, 32);
+			}
+			draw->BeginFrame(DebugFlags::NONE);
+			draw->BindFramebufferAsRenderTarget(output, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR,
+				0xFFABCDEF, 0.625f, 173}, "resized output");
+			std::vector<uint32_t> pixels(24 * 32);
+			Check(draw->CopyFramebufferToMemory(output, Aspect::COLOR_BIT, 0, 0, 24, 32, DataFormat::R8G8B8A8_UNORM,
+				pixels.data(), 24, ReadbackMode::BLOCK, "resized pixels"), "resized output readback");
+			Check(std::all_of(pixels.begin(), pixels.end(), [](uint32_t pixel) { return pixel == 0xFFABCDEF; }),
+				"retired output contaminated its replacement");
+			draw->Present(PresentMode::IMMEDIATE);
+			draw->DestroySwapchain(output);
+		}
+		Check(context.WaitUntilIdle(&error), error);
+	}
+	std::cout << "PASS nonblocking output " << (destroy ? "destruction" : "resize")
+		<< ": offscreen/native attachments retained, no submission/wait, drawable presented, replacement pixels\n";
+}
+
+static void DynamicDepthAttachments() {
+	using namespace Draw;
+	std::string error;
+	std::unique_ptr<DrawContext> draw(T3DCreateMetalContext(&error));
+	Check(draw != nullptr, error);
+	const char *vertexSource = R"(#version 450
+layout(location=0) in vec3 position;
+layout(location=1) in vec4 color;
+layout(location=0) out vec4 varyingColor;
+void main() { gl_Position = vec4(position, 1.0); varyingColor = color; }
+)";
+	const char *fragmentSource = R"(#version 450
+layout(location=0) in vec4 varyingColor;
+layout(location=0) out vec4 color;
+void main() { color = varyingColor; }
+)";
+	AutoRef<ShaderModule> vs(draw->CreateShaderModule(ShaderStage::Vertex, GLSL_VULKAN,
+		(const uint8_t *)vertexSource, strlen(vertexSource), "dynamic depth vertex"));
+	AutoRef<ShaderModule> fs(draw->CreateShaderModule(ShaderStage::Fragment, GLSL_VULKAN,
+		(const uint8_t *)fragmentSource, strlen(fragmentSource), "dynamic depth fragment"));
+	struct Vertex { float x, y, z, r, g, b, a; };
+	AutoRef<InputLayout> layout(draw->CreateInputLayout({sizeof(Vertex), {
+		{0, DataFormat::R32G32B32_FLOAT, 0}, {1, DataFormat::R32G32B32A32_FLOAT, 12}}}));
+	DepthStencilStateDesc depthDesc{true, true, Comparison::LESS, true,
+		{StencilOp::KEEP, StencilOp::REPLACE, StencilOp::KEEP, Comparison::ALWAYS}};
+	AutoRef<DepthStencilState> depth(draw->CreateDepthStencilState(depthDesc));
+	AutoRef<BlendState> blend(draw->CreateBlendState({false, 0xF}));
+	AutoRef<RasterState> raster(draw->CreateRasterState({}));
+	Check(vs && fs && layout && depth && blend && raster, "dynamic depth pipeline resources");
+	PipelineDesc desc{Primitive::TRIANGLE_LIST, {vs, fs}, layout, depth, blend, raster, nullptr};
+	AutoRef<Pipeline> pipeline(draw->CreateGraphicsPipeline(desc, "dynamic depth"));
+	Check(pipeline != nullptr, "dynamic depth pipeline");
+	int cases = 0;
+	for (int samples : {0, 2}) {
+		for (bool hasDepth : {true, false, true, false}) {
+			AutoRef<Framebuffer> fb(draw->CreateFramebuffer({8, 8, 1, 1, samples, hasDepth, "dynamic depth target"}));
+			Check(fb != nullptr, "dynamic depth framebuffer");
+			draw->BeginFrame(DebugFlags::NONE);
+			draw->BindFramebufferAsRenderTarget(fb, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR,
+				0, 0.5f, 17}, "dynamic depth");
+			draw->BindPipeline(pipeline);
+			draw->SetViewport({0, 0, 8, 8, 0, 1});
+			draw->SetScissorRect(0, 0, 8, 8);
+			for (bool far : {false, true}) {
+				const float z = far ? 0.75f : 0.25f;
+				const float r = far ? 1.0f : 0.0f, g = far ? 0.0f : 1.0f;
+				const Vertex vertices[] = {{-1, -1, z, r, g, 0, 1}, {3, -1, z, r, g, 0, 1}, {-1, 3, z, r, g, 0, 1}};
+				draw->SetStencilParams(far ? 173 : 91, 255, 255);
+				draw->DrawUP(vertices, 3);
+			}
+			std::array<uint32_t, 64> colors{};
+			Check(draw->CopyFramebufferToMemory(fb, Aspect::COLOR_BIT, 0, 0, 8, 8,
+				DataFormat::R8G8B8A8_UNORM, colors.data(), 8, ReadbackMode::BLOCK, "dynamic depth colors"), "dynamic depth colors");
+			const uint32_t expected = hasDepth ? 0xFF00FF00 : 0xFF0000FF;
+			Check(std::all_of(colors.begin(), colors.end(), [&](uint32_t color) { return color == expected; }),
+				"depth attachment did not select dynamic depth/stencil state");
+			if (hasDepth) {
+				std::array<float, 64> depths{};
+				std::array<uint8_t, 64> stencils{};
+				Check(draw->CopyFramebufferToMemory(fb, Aspect::DEPTH_BIT, 0, 0, 8, 8,
+					DataFormat::D32F, depths.data(), 8, ReadbackMode::BLOCK, "dynamic depth values"), "dynamic depth values");
+				Check(draw->CopyFramebufferToMemory(fb, Aspect::STENCIL_BIT, 0, 0, 8, 8,
+					DataFormat::S8, stencils.data(), 8, ReadbackMode::BLOCK, "dynamic stencil values"), "dynamic stencil values");
+				Check(std::all_of(depths.begin(), depths.end(), [](float z) { return z == 0.25f; }) &&
+					std::all_of(stencils.begin(), stencils.end(), [](uint8_t s) { return s == 91; }), "dynamic depth/stencil writes");
+			}
+			draw->Present(PresentMode::IMMEDIATE);
+			++cases;
+		}
+	}
+	std::cout << "PASS dynamic depth attachments: " << cases << " color/depth/stencil cases, one pipeline object, 1x/MSAA4\n";
+}
+
+static void PrimarySurfaceChanges(int change) {
+	using namespace Draw;
+	for (int variant = 0; variant < 2; ++variant) {
+		std::string error;
+		std::unique_ptr<DrawContext> draw(T3DCreateMetalContext(&error));
+		Check(draw != nullptr, error);
+		auto *manager = (Metal::RenderManager *)draw->GetNativeObject(NativeObject::RENDER_MANAGER);
+		auto &context = manager->Context();
+		RegressionMetalLayer *a = [RegressionMetalLayer layer], *b = [RegressionMetalLayer layer];
+		a.drawableSize = b.drawableSize = CGSizeMake(16, 16);
+		Check(manager->SetSurface(a, &error), error);
+		draw->BeginFrame(DebugFlags::NONE);
+		draw->BindFramebufferAsRenderTarget(nullptr, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR,
+			0xFF123456, 0.25f, 91}, "primary change");
+		manager->EndRenderPass();
+		if (variant) {
+			std::array<uint32_t, 256> pixels{};
+			Check(draw->CopyFramebufferToMemory(nullptr, Aspect::COLOR_BIT, 0, 0, 16, 16,
+				DataFormat::R8G8B8A8_UNORM, pixels.data(), 16, ReadbackMode::BLOCK, "primary before change"), "primary pixels");
+			Check(pixels[0] == 0xFF123456, "old primary color");
+		}
+		const auto waits = context.Metrics().completionWaits;
+		const auto presents = context.Metrics().presentedDrawables;
+		auto commands = context.Commands();
+		if (change == 0) {
+			Check(manager->SetSurface(b, &error), error);
+		} else if (change == 1) {
+			Check(manager->SetSurface(nil, &error), error);
+		} else if (change == 2) {
+			a.drawableSize = CGSizeMake(24, 32);
+			manager->ResizeSurface();
+		} else if (change == 6) {
+			Check(manager->SetSurface(a, &error), error);
+		} else {
+			a.drawableSize = CGSizeMake(24, 32);
+			const Event event = change == 3 ? Event::RESIZED : change == 4 ? Event::LOST_BACKBUFFER : Event::GOT_BACKBUFFER;
+			draw->HandleEvent(event, 24, 32, nullptr, nullptr);
+		}
+		std::cout << "MEASURE primary-change action=" << change << " after-readback=" << variant
+			<< " completion-waits=" << context.Metrics().completionWaits - waits << '\n';
+		Check(context.Commands() == commands && context.Metrics().completionWaits == waits,
+			"primary change submitted or drained existing GPU work");
+		draw->Present(PresentMode::IMMEDIATE);
+		Check(context.WaitUntilIdle(&error), error);
+		Check(context.Metrics().presentedDrawables == presents + 1, "retired primary drawable was dropped");
+		draw->BeginFrame(DebugFlags::NONE);
+		draw->BindFramebufferAsRenderTarget(nullptr, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR,
+			0xFFABCDEF, 0.75f, 173}, "new primary");
+		int w, h;
+		draw->GetFramebufferDimensions(nullptr, &w, &h);
+		std::vector<uint32_t> pixels(w * h);
+		Check(draw->CopyFramebufferToMemory(nullptr, Aspect::COLOR_BIT, 0, 0, w, h,
+			DataFormat::R8G8B8A8_UNORM, pixels.data(), w, ReadbackMode::BLOCK, "new primary"), "new primary readback");
+		Check(std::all_of(pixels.begin(), pixels.end(), [](uint32_t p) { return p == 0xFFABCDEF; }), "new primary contents");
+		draw->Present(PresentMode::IMMEDIATE);
+		Check(context.WaitUntilIdle(&error), error);
+	}
+	std::cout << "PASS primary surface change " << change << ": active/after-readback, no forced wait, old drawable presented and new output exact\n";
+}
+
+static void PeriodicCacheSaves() {
+	const auto oldConfig = g_Config;
+	const auto oldCore = PSP_CoreParameter();
+	const auto oldState = gstate;
+	const auto oldCached = gstate_c;
+	const auto oldStats = gpuStats;
+	const auto oldSFO = g_paramSFO;
+	auto *oldGPU = gpu;
+	struct Restore {
+		std::function<void()> apply;
+		~Restore() { apply(); }
+	} restore{[&] { g_Config = oldConfig; PSP_CoreParameter() = oldCore; gstate = oldState; gstate_c = oldCached;
+		gpuStats = oldStats; g_paramSFO = oldSFO; gpu = oldGPU; }};
+	g_Config.appCacheDirectory = Path(std::filesystem::current_path().string() + "/periodic-cache");
+	g_Config.memStickDirectory = g_Config.appCacheDirectory;
+	g_Config.bShaderCache = true;
+	g_Config.bSkipBufferEffects = false;
+	g_Config.bStereoRendering = false;
+	g_Config.bMetalFXSpatial = false;
+	g_Config.iInternalResolution = 1;
+	g_Config.iMultiSampleLevel = 0;
+	g_Config.vPostShaderNames.clear();
+	PSP_CoreParameter().renderWidth = 480;
+	PSP_CoreParameter().renderHeight = 272;
+	PSP_CoreParameter().renderScaleFactor = 1;
+	g_paramSFO.Clear();
+	g_paramSFO.SetValue("DISC_ID", "M4TEST001", 10);
+	std::filesystem::remove_all(g_Config.appCacheDirectory.ToString());
+	std::string error;
+	std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
+	Check(draw && draw->CreatePresets(), "periodic cache context");
+	std::unique_ptr<GPUCommon> renderer(CreateMetalGPU(nullptr, draw.get()));
+	gpu = renderer.get();
+	DisplayLayoutConfig config{};
+	const std::pair<int, unsigned long long> sequence[] = {{0, 0}, {32767, 0}, {32768, 1}, {32768, 1},
+		{32768, 1}, {32769, 1}, {65536, 2}, {65536, 2}, {0, 2}, {32768, 3}, {32768, 3}};
+	for (auto [flips, expected] : sequence) {
+		gpuStats.totals.numFlips = flips;
+		renderer->BeginHostFrame(config);
+		char text[8192];
+		StringWriter writer(text);
+		renderer->GetStats(writer);
+		const char *line = strstr(text, "Metal pipeline cache saves:");
+		double ms = 0;
+		unsigned long long count = UINT64_MAX;
+		Check(line && sscanf(line, "Metal pipeline cache saves: %lf ms (%llu", &ms, &count) == 2, "periodic cache statistics");
+		std::cout << "MEASURE periodic-cache flips=" << flips << " saves=" << count << '\n';
+		Check(count == expected, "repeated host frames rewrote caches at the same PSP flip");
+		if (expected) {
+			Check(VerifyShaderCacheChecksum(g_Config.appCacheDirectory / "M4TEST001.metalpipelinecache"), "periodic pipeline cache not written completely");
+		}
+	}
+	std::cout << "PASS periodic cache save: real GPU host-frame path, repeated flips, next boundary, counter reset and valid pipeline file\n";
+}
+
+static void DrawableReadbackOrdering() {
+	using namespace Draw;
+	for (bool primary : {true, false}) {
+		std::string error;
+		std::unique_ptr<DrawContext> draw(T3DCreateMetalContext(&error));
+		Check(draw != nullptr, error);
+		auto *manager = (Metal::RenderManager *)draw->GetNativeObject(NativeObject::RENDER_MANAGER);
+		auto &context = manager->Context();
+		RegressionMetalLayer *layer = [RegressionMetalLayer layer];
+		layer.drawableSize = CGSizeMake(16, 16);
+		Swapchain *secondary = nullptr;
+		if (primary) {
+			Check(manager->SetSurface(layer, &error), error);
+		} else {
+			secondary = draw->CreateSwapchain({WINDOWSYSTEM_METAL_EXT, (__bridge void *)layer, nullptr, 16, 16, "drawable ordering"}, &error);
+			Check(secondary != nullptr, error);
+		}
+		draw->BeginFrame(DebugFlags::NONE);
+		draw->BindFramebufferAsRenderTarget(secondary, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR,
+			0xFF123456, 0.25f, 91}, "drawable before readback");
+		for (int read = 0; read < 2; ++read) {
+			std::array<uint32_t, 256> pixels{};
+			Check(draw->CopyFramebufferToMemory(secondary, Aspect::COLOR_BIT, 0, 0, 16, 16,
+				DataFormat::R8G8B8A8_UNORM, pixels.data(), 16, ReadbackMode::BLOCK, "drawable ordering readback"), "drawable readback");
+			std::cout << "MEASURE drawable-order primary=" << primary << " read=" << read
+				<< " queue-waits=" << context.Metrics().drawableWaits << " presents=" << context.Metrics().presentedDrawables << '\n';
+			Check(context.Metrics().drawableWaits == 1 && context.Metrics().presentedDrawables == 0,
+				"drawable access submitted before its queue wait, or presented before the final frame");
+			Check(std::all_of(pixels.begin(), pixels.end(), [](uint32_t pixel) { return pixel == 0xFF123456; }), "ordered drawable pixels");
+		}
+		draw->Present(PresentMode::IMMEDIATE);
+		Check(context.WaitUntilIdle(&error), error);
+		Check(context.Metrics().drawableWaits == 1 && context.Metrics().presentedDrawables == 1,
+			"final presentation repeated the acquisition wait or missed its drawable");
+		if (secondary) {
+			draw->DestroySwapchain(secondary);
+		}
+	}
+	std::cout << "PASS drawable ordering: primary/secondary, wait before first readback, no repeat wait, exact pixels, one final presentation\n";
 }
 
 static void SubmissionDependencies() {
@@ -749,6 +1171,216 @@ static void Multipass(Metal::RenderContext &context) {
 	std::cout << "PASS native-multipass-scaling " << cases << "\n";
 }
 
+static void LibraryReuse() {
+	Metal::RenderContext context;
+	std::string error;
+	Check(context.Init(&error, 2), error);
+	Metal::CompiledShader shader;
+	shader.source = R"(#include <metal_stdlib>
+using namespace metal;
+kernel void first(device uint *output [[buffer(0)]], uint i [[thread_position_in_grid]]) { output[i] = 17 + i; }
+kernel void second(device uint *output [[buffer(0)]], uint i [[thread_position_in_grid]]) { output[i] = 93 + i; }
+)";
+	auto verify = [&](id<MTLFunction> function, uint32_t expected) {
+		NSError *nativeError = nil;
+		auto pipeline = context.CreateComputePipeline(function, &nativeError);
+		Check(pipeline != nil, nativeError ? nativeError.localizedDescription.UTF8String : "library fixture pipeline");
+		auto output = [context.Device() newBufferWithLength:8 * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+		Check(output != nil, "library fixture buffer");
+		Check(context.BeginCommands(&error), error);
+		context.Keep({pipeline, output});
+		auto encoder = context.ComputeEncoder(context.Commands(), "library reuse", true);
+		[encoder setComputePipelineState:pipeline];
+		context.SetBuffer(encoder, output, 0, 0);
+		context.UseResource(encoder, output, (MTLStages)0, MTLStageDispatch);
+		[encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(8, 1, 1)];
+		context.EndEncoder(encoder);
+		Check(context.SubmitCommands(true, &error), error);
+		const auto *values = (const uint32_t *)output.contents;
+		for (uint32_t i = 0; i < 8; ++i) {
+			Check(values[i] == expected + i, "library reuse selected the wrong entry point/source");
+		}
+	};
+	shader.entryPoint = "first";
+	id<MTLFunction> first = context.CreateShader(shader, "first caller", &error);
+	Check(first != nil, error);
+	verify(first, 17);
+	shader.entryPoint = "second";
+	id<MTLFunction> second = context.CreateShader(shader, "second caller", &error);
+	Check(second != nil, error);
+	verify(second, 93);
+	std::cout << "MEASURE library-reuse exact-source two-entrypoints native-compiles=" << context.Metrics().libraryCompiles << " expected=1 GPU-values=16-exact\n";
+	Check(context.Metrics().libraryCompiles == 1, "identical MSL library compiled again for a different caller/entry point");
+	Check(context.Metrics().libraryCacheHits == 1, "library cache did not report reuse");
+	const std::string original = shader.source;
+	shader.entryPoint = "missing";
+	Check(!context.CreateShader(shader, "missing entry", &error) && !error.empty(), "missing entry accepted");
+	shader.entryPoint = "first";
+	id<MTLFunction> repeated = context.CreateShader(shader, "another tag", &error);
+	Check(repeated && context.Metrics().libraryCompiles == 1, "missing entry or debug tag poisoned a valid library");
+	verify(repeated, 17);
+	shader.source.replace(shader.source.find("17 + i"), 6, "61 + i");
+	id<MTLFunction> changed = context.CreateShader(shader, "changed source", &error);
+	Check(changed && context.Metrics().libraryCompiles == 2, "different MSL source aliased a cached library");
+	verify(changed, 61);
+	shader.source = "this is not valid MSL";
+	for (unsigned i = 0; i < 2; ++i) {
+		Check(!context.CreateShader(shader, "invalid source", &error) && !error.empty(), "invalid MSL accepted");
+	}
+	Check(context.Metrics().libraryCompiles == 4, "failed compilation was cached");
+	shader.source = std::string(1, char(0xff));
+	Check(!context.CreateShader(shader, "invalid UTF-8", &error) && !error.empty(), "invalid source encoding accepted");
+	Check(context.Metrics().libraryCompiles == 4, "invalid UTF-8 reached the compiler");
+	shader.source = original;
+	shader.entryPoint = std::string(1, char(0xff));
+	Check(!context.CreateShader(shader, "invalid entry encoding", &error) && !error.empty(), "invalid entry encoding accepted");
+	shader.entryPoint = "first";
+	{
+		Metal::RenderContext other;
+		Check(other.Init(&error, 2), error);
+		Check(other.CreateShader(shader, "separate context", &error) != nil, error);
+		Check(other.Metrics().libraryCompiles == 1, "library cache crossed renderer ownership");
+	}
+	std::vector<id<MTLFunction>> retained;
+	for (unsigned i = 0; i < Metal::RenderContext::MAX_LIBRARY_CACHE_ENTRIES + 2; ++i) {
+		shader.source = original + "// variant " + std::to_string(i) + "\n";
+		id<MTLFunction> function = context.CreateShader(shader, "bounded cache", &error);
+		Check(function != nil, error);
+		retained.push_back(function);
+		const auto metrics = context.Metrics();
+		Check(metrics.libraryCacheEntries <= Metal::RenderContext::MAX_LIBRARY_CACHE_ENTRIES &&
+			metrics.libraryCacheBytes <= Metal::RenderContext::MAX_LIBRARY_CACHE_BYTES, "library key cache exceeded its bounds");
+	}
+	Check(context.Metrics().libraryCacheEvictions > 0, "entry budget was not exercised");
+	// Eviction removes a lookup key, never a live function's native library.
+	verify(first, 17);
+	for (unsigned i = 0; i < 3; ++i) {
+		shader.source = original + "/*" + std::string(Metal::RenderContext::MAX_LIBRARY_CACHE_BYTES / 2, ' ') + "*/\n//" + std::to_string(i);
+		id<MTLFunction> function = context.CreateShader(shader, "text budget", &error);
+		Check(function != nil, error);
+		retained.push_back(function);
+		Check(context.Metrics().libraryCacheBytes <= Metal::RenderContext::MAX_LIBRARY_CACHE_BYTES, "text budget was not enforced");
+	}
+	const auto beforeLarge = context.Metrics();
+	shader.source = original + "/*" + std::string(Metal::RenderContext::MAX_LIBRARY_CACHE_BYTES, ' ') + "*/";
+	for (unsigned i = 0; i < 2; ++i) {
+		id<MTLFunction> function = context.CreateShader(shader, "oversized key", &error);
+		Check(function != nil, error);
+		retained.push_back(function);
+	}
+	Check(context.Metrics().libraryCompiles == beforeLarge.libraryCompiles + 2 &&
+		context.Metrics().libraryCacheEntries == beforeLarge.libraryCacheEntries &&
+		context.Metrics().libraryCacheBytes == beforeLarge.libraryCacheBytes, "oversized source entered the bounded index");
+	verify(retained.back(), 17);
+	context.ResetMetrics();
+	Check(context.Metrics().libraryCacheBytes == beforeLarge.libraryCacheBytes, "metric reset cleared the library cache");
+	std::cout << "PASS library-reuse entrypoints/source/encoding/failures/context isolation; entry/text bounds and live evicted functions; 48 exact GPU values\n";
+}
+
+static void CacheParseGate() {
+	const auto oldConfig = g_Config;
+	const auto oldCached = gstate_c;
+	struct Restore {
+		std::function<void()> restore;
+		~Restore() { restore(); }
+	} restore{[&] { g_Config = oldConfig; gstate_c = oldCached; }};
+	g_Config.bShaderCache = true;
+	std::string error;
+	std::unique_ptr<Draw::DrawContext> builder(Draw::T3DCreateMetalContext(&error));
+	Check(builder != nullptr, error);
+	ShaderManagerMetal shaders(builder.get());
+	VShaderID vertex;
+	vertex.clear();
+	FShaderID fragment;
+	fragment.clear();
+	Check(shaders.GetVertexShaderFromID(vertex, &error) && shaders.GetFragmentShaderFromID(fragment, &error), error);
+	const Path file("parse-gate.metalshadercache");
+	shaders.SaveCache(file);
+	Check(VerifyShaderCacheChecksum(file), "parse gate fixture save");
+	std::ifstream input(file.ToString(), std::ios::binary);
+	std::string body((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+	Check(body.size() > 64, "parse gate fixture size");
+	body.resize(body.size() - 8);
+	FILE *readerFile = File::OpenCFile(file, "rb");
+	Check(readerFile && fseek(readerFile, 56, SEEK_SET) == 0, "parse gate header");
+	Metal::TranslationCache::Reader reader(readerFile, body.size() - 56);
+	Metal::TranslationCache::Record record;
+	Check(reader.Value(&vertex) && Metal::TranslationCache::Read(reader, &record), "parse gate first record");
+	const size_t fragmentOffset = ftell(readerFile);
+	fclose(readerFile);
+	std::array<std::string, 6> malformed{body.substr(0, fragmentOffset + sizeof(fragment) + 2), body + "x", body, body, body, body};
+	fragment.set_invalid();
+	memcpy(malformed[2].data() + fragmentOffset, &fragment, sizeof(fragment));
+	vertex.set_invalid();
+	memcpy(malformed[3].data() + 56, &vertex, sizeof(vertex));
+	const uint32_t excessive = 8193, maximum = 8192;
+	memcpy(malformed[4].data() + 32, &excessive, sizeof(excessive));
+	memcpy(malformed[5].data() + 32, &maximum, sizeof(maximum));
+	auto write = [&](const std::string &bytes) {
+		std::ofstream output(file.ToString(), std::ios::binary | std::ios::trunc);
+		output.write(bytes.data(), bytes.size());
+		output.close();
+		Check(AppendShaderCacheChecksum(file) && VerifyShaderCacheChecksum(file), "parse gate valid checksum");
+	};
+	unsigned compilerWork = 0;
+	for (size_t i = 0; i < malformed.size(); ++i) {
+		write(malformed[i]);
+		// A separate renderer keeps this test independent of any live library cache.
+		std::unique_ptr<Draw::DrawContext> draw(Draw::T3DCreateMetalContext(&error));
+		Check(draw != nullptr, error);
+		auto manager = (Metal::RenderManager *)draw->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
+		ShaderManagerMetal sample(draw.get());
+		manager->Context().ResetMetrics();
+		Check(!sample.LoadCache(file), "malformed shader cache accepted");
+		const auto native = manager->Context().Metrics();
+		const auto metrics = sample.Metrics();
+		std::cout << "MEASURE cache-parse-gate case=" << i << " generated=" << metrics.generated << " translated=" << metrics.translated << " native-compiles=" << native.libraryCompiles << '\n';
+		compilerWork += metrics.generated != 0 || metrics.translated != 0 || native.libraryCompiles != 0;
+		Check(sample.GetNumVertexShaders() == 0 && sample.GetNumFragmentShaders() == 0, "partial malformed cache retained");
+	}
+	Check(compilerWork == 0, "malformed cache reached the shader generator/compiler before validation finished");
+	vertex.clear();
+	fragment.clear();
+	const auto *oldVS = shaders.GetVertexShaderFromID(vertex, &error);
+	const auto *oldFS = shaders.GetFragmentShaderFromID(fragment, &error);
+	const auto generation = shaders.CacheGeneration();
+	const auto generated = shaders.Metrics().generated;
+	for (const auto &bytes : malformed) {
+		write(bytes);
+		Check(!shaders.LoadCache(file), "malformed warm cache accepted");
+		Check(shaders.CacheGeneration() == generation && shaders.Metrics().generated == generated &&
+			shaders.GetVertexShaderFromID(vertex, &error) == oldVS && shaders.GetFragmentShaderFromID(fragment, &error) == oldFS,
+			"rejected disk payload discarded valid live shaders");
+	}
+	write(body);
+	auto builderManager = (Metal::RenderManager *)builder->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
+	const auto beforeReload = builderManager->Context().Metrics();
+	ShaderManagerMetal sameRenderer(builder.get());
+	Check(sameRenderer.LoadCache(file), "valid same-renderer cache reload");
+	const auto afterReload = builderManager->Context().Metrics();
+	Check(sameRenderer.Metrics().translationCacheHits == 2 && afterReload.libraryCompiles == beforeReload.libraryCompiles &&
+		afterReload.libraryCacheHits == beforeReload.libraryCacheHits + 2, "GE cache reload did not reuse both live native libraries");
+	std::unique_ptr<Draw::DrawContext> cold(Draw::T3DCreateMetalContext(&error));
+	Check(cold != nullptr, error);
+	ShaderManagerMetal loaded(cold.get());
+	Check(loaded.LoadCache(file) && loaded.Metrics().translationCacheHits == 2 && loaded.Metrics().translated == 0,
+		"valid full payload no longer reuses translations");
+	// A fully parsed payload can still fail native compilation. Partial shader
+	// loads must be discarded in that case, as before the parse gate.
+	std::string invalidMSL = body;
+	uint32_t glslBytes;
+	memcpy(&glslBytes, body.data() + fragmentOffset + sizeof(fragment) + 8, sizeof(glslBytes));
+	const size_t mslOffset = fragmentOffset + sizeof(fragment) + 8 + 4 + glslBytes + 4;
+	Check(mslOffset < body.size(), "fragment MSL offset");
+	invalidMSL[mslOffset] = '@';
+	write(invalidMSL);
+	ShaderManagerMetal failed(cold.get());
+	Check(!failed.LoadCache(file) && failed.Metrics().generated == 2 &&
+		failed.GetNumVertexShaders() == 0 && failed.GetNumFragmentShaders() == 0, "failed native preload retained a partial shader set");
+	File::Delete(file);
+	std::cout << "PASS cache-parse-gate six checksum-valid malformed payloads cold/warm; no compiler work or live shader loss; valid cold/live-library reload and native failure rollback\n";
+}
+
 static void CacheIntegrity(Draw::DrawContext *draw, Metal::RenderManager *manager) {
 	g_Config.bShaderCache = true;
 	ShaderManagerMetal shaders(draw);
@@ -929,6 +1561,19 @@ static void CacheIntegrity(Draw::DrawContext *draw, Metal::RenderManager *manage
 		Check(AppendShaderCacheChecksum(filename), "checksum for format mismatch fixture");
 		Check(!load(), "incompatible version with valid checksum was accepted");
 		++rejected;
+		if (!shaderFile) {
+			auto previousVersion = original.substr(0, original.size() - 8);
+			uint32_t version = 6;
+			memcpy(previousVersion.data() + 4, &version, sizeof(version));
+			write(previousVersion);
+			Check(AppendShaderCacheChecksum(filename) && !load(), "old depth-dependent pipeline cache accepted");
+			auto reservedDepth = original.substr(0, original.size() - 8);
+			const uint64_t depth = MTLPixelFormatDepth32Float_Stencil8;
+			memcpy(reservedDepth.data() + 112 + 3 * sizeof(uint64_t), &depth, sizeof(depth));
+			write(reservedDepth);
+			Check(AppendShaderCacheChecksum(filename) && !load(), "noncanonical depth cache key accepted");
+			rejected += 2;
+		}
 		if (shaderFile) {
 			// V5: 56-byte header (including image UUID), then ID, options, source length.
 			for (size_t offset : {size_t(40), size_t(72)}) {
@@ -978,7 +1623,7 @@ static std::vector<Path> ActiveArchiveFiles(const Path &filename) {
 	if (header[1] == 5) {
 		return {filename.WithExtraExtension(".metal4archive")};
 	}
-	Check(header[1] == 6 && header[9] <= 1 && header[10] <= 8, "pipeline archive bank/count");
+	Check(header[1] == 7 && header[9] <= 1 && header[10] <= 8, "pipeline archive bank/count");
 	std::vector<Path> files;
 	for (uint32_t i = 0; i < header[10]; ++i) {
 		files.push_back(filename.WithExtraExtension(".metal4archive." + std::to_string(header[9]) + "." + std::to_string(i)));
@@ -1244,7 +1889,13 @@ static void PipelineIdentity(Draw::DrawContext *draw, Metal::RenderManager *mana
 		++variants;
 	}
 	Check(get(vertex, fragment, nullptr, blend, MTLPixelFormatBGRA8Unorm) != base, "target color ignored");
-	Check(get(vertex, fragment, nullptr, blend, MTLPixelFormatRGBA8Unorm, MTLPixelFormatDepth32Float_Stencil8) != base, "target depth ignored");
+	const auto beforeDepth = pipelines.Metrics().syncCompiles;
+	const auto *withDepth = get(vertex, fragment, nullptr, blend, MTLPixelFormatRGBA8Unorm, MTLPixelFormatDepth32Float_Stencil8);
+	std::cout << "MEASURE depth-format-only additional-pipelines=" << pipelines.Metrics().syncCompiles - beforeDepth << '\n';
+	Check(withDepth == base && pipelines.Metrics().syncCompiles == beforeDepth,
+		"Metal 4 compiled an identical pipeline for a different depth attachment");
+	Check(!pipelines.GetOrCreate(shaders, vertex, fragment, nullptr, blend, MTLPixelFormatRGBA8Unorm,
+		MTLPixelFormatDepth16Unorm, &error), "unsupported depth bypassed validation");
 	for (int samples : {2, 4}) {
 		Check(get(vertex, fragment, nullptr, blend, MTLPixelFormatRGBA8Unorm, MTLPixelFormatInvalid, samples) != base, "samples ignored");
 	}
@@ -1669,6 +2320,226 @@ static void DeferredClears(Draw::DrawContext *draw, Metal::RenderManager *manage
 	std::cout << "PASS deferred-clear-boundaries " << cases << " attachment sets\n";
 }
 
+static Metal::Framebuffer *TransferTarget(Metal::RenderContext &context, int samples, int layers, bool depth, bool bgra) {
+	std::string error;
+	if (!bgra) {
+		auto fb = Metal::Framebuffer::Create(context.Device(), {8, 8, 1, layers, samples, depth, "transfer cache test"}, &error);
+		Check(fb != nullptr, error);
+		return fb;
+	}
+	Check(samples == 0 && layers == 1, "BGRA fixture must be single-sample/single-layer");
+	auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:8 mipmapped:NO];
+	desc.storageMode = MTLStorageModePrivate;
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	auto color = [context.Device() newTextureWithDescriptor:desc];
+	desc.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+	auto ds = depth ? [context.Device() newTextureWithDescriptor:desc] : nil;
+	auto fb = Metal::Framebuffer::Wrap(color, ds, &error);
+	Check(fb != nullptr, error);
+	return fb;
+}
+
+static void ClearTransferTarget(Metal::RenderContext &context, Metal::Framebuffer *fb, bool source) {
+	std::string error;
+	if (!context.Commands()) {
+		Check(context.BeginCommands(&error), error);
+	}
+	for (int layer = 0; layer < fb->Layers(); ++layer) {
+		const uint32_t color = (source ? 0x71403020 : 0xE0806040) + layer * 0x00010101;
+		auto pass = [MTL4RenderPassDescriptor new];
+		fb->SetRenderAttachments(pass, layer);
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake((color & 255) / 255.0, ((color >> 8) & 255) / 255.0,
+			((color >> 16) & 255) / 255.0, (color >> 24) / 255.0);
+		if (fb->DepthStencil()) {
+			pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionClear;
+			pass.depthAttachment.clearDepth = source ? 0.25 + layer * 0.125 : 0.75 + layer * 0.0625;
+			pass.stencilAttachment.clearStencil = (source ? 173 : 91) + layer;
+			if (fb->SampleCount() > 1) {
+				// Match EndPass: resolve depth/stencil only before a single-sample consumer.
+				pass.depthAttachment.resolveTexture = pass.stencilAttachment.resolveTexture = nil;
+				pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
+				fb->MarkDepthStencilUnresolved();
+			}
+		}
+		auto encoder = context.RenderEncoder(context.Commands(), pass);
+		Check(encoder != nil, "transfer fixture clear encoder");
+		context.EndEncoder(encoder);
+	}
+}
+
+static void VerifyTransferTarget(Metal::RenderContext &context, Metal::Framebuffer *fb, Draw::Aspect aspects, bool alphaStencil = false) {
+	using namespace Draw;
+	std::string error;
+	for (int layer = 0; layer < fb->Layers(); ++layer) {
+		std::array<uint32_t, 64> pixels;
+		Check(Metal::Readback(context, fb->ColorLayer(layer), Aspect::COLOR_BIT, 0, 0, 8, 8,
+			DataFormat::R8G8B8A8_UNORM, pixels.data(), 8, &error), error);
+		const uint32_t color = ((aspects & Aspect::COLOR_BIT) ? 0x71403020 : 0xE0806040) + layer * 0x00010101;
+		Check(std::all_of(pixels.begin(), pixels.end(), [&](uint32_t p) { return p == color; }), "transfer color/layer mismatch");
+		if (fb->DepthStencil()) {
+			Check(fb->ResolveDepthStencil(context, &error), error);
+			std::array<float, 64> depths;
+			std::array<uint8_t, 64> stencils;
+			Check(Metal::Readback(context, fb->DepthStencilLayer(layer), Aspect::DEPTH_BIT, 0, 0, 8, 8,
+				DataFormat::D32F, depths.data(), 8, &error), error);
+			Check(Metal::Readback(context, fb->DepthStencilLayer(layer), Aspect::STENCIL_BIT, 0, 0, 8, 8,
+				DataFormat::S8, stencils.data(), 8, &error), error);
+			const float z = (aspects & Aspect::DEPTH_BIT) ? 0.25f + layer * 0.125f : 0.75f + layer * 0.0625f;
+			const uint8_t stencil = alphaStencil ? color >> 24 : ((aspects & Aspect::STENCIL_BIT) ? 173 : 91) + layer;
+			for (size_t i = 0; i < depths.size(); ++i) {
+				if (depths[i] != z || stencils[i] != stencil) {
+					std::cout << "MEASURE transfer mismatch samples=" << fb->SampleCount() << " layers=" << fb->Layers()
+						<< " layer=" << layer << " aspects=" << (int)aspects << " pixel=" << i << " depth=" << depths[i]
+						<< " expected=" << z << " stencil=" << (int)stencils[i] << " expected=" << (int)stencil << '\n';
+					break;
+				}
+			}
+			Check(std::all_of(depths.begin(), depths.end(), [&](float p) { return p == z; }) &&
+				std::all_of(stencils.begin(), stencils.end(), [&](uint8_t p) { return p == stencil; }), "transfer depth/stencil/layer mismatch");
+		}
+	}
+}
+
+static void TransferPipelineIdentity() {
+	using namespace Draw;
+	int cases = 0;
+	for (int samples : {0, 2}) {
+		for (auto filter : {FB_BLIT_NEAREST, FB_BLIT_LINEAR}) {
+			Metal::RenderContext context;
+			std::string error;
+			Check(context.Init(&error, 2), error);
+			Metal::FramebufferCopy copy;
+			AutoRef<Metal::Framebuffer> src, plain, depth;
+			src.reset(TransferTarget(context, 0, 1, true, false));
+			plain.reset(TransferTarget(context, samples, 1, false, false));
+			depth.reset(TransferTarget(context, samples, 1, true, false));
+			ClearTransferTarget(context, src, true);
+			ClearTransferTarget(context, plain, false);
+			ClearTransferTarget(context, depth, false);
+			Check(copy.Blit(context, src, 0, 0, 8, 8, plain, 0, 0, 8, 8, Aspect::COLOR_BIT, filter, &error), error);
+			VerifyTransferTarget(context, plain, Aspect::COLOR_BIT);
+			const auto compiled = context.Metrics().libraryCompiles;
+			const auto pipelines = copy.GetNumPipelines();
+			Check(copy.Blit(context, src, 0, 0, 8, 8, depth, 0, 0, 8, 8, Aspect::COLOR_BIT, filter, &error), error);
+			VerifyTransferTarget(context, depth, Aspect::COLOR_BIT);
+			std::cout << "MEASURE transfer depth-only key samples=" << (1 << samples) << " filter=" << filter
+				<< " additional-libraries=" << context.Metrics().libraryCompiles - compiled
+				<< " additional-pipelines=" << copy.GetNumPipelines() - pipelines << '\n';
+			Check(copy.GetNumPipelines() == pipelines && context.Metrics().libraryCompiles == compiled,
+				"depth presence rebuilt an identical transfer pipeline or fragment library");
+			++cases;
+		}
+	}
+	std::cout << "PASS transfer pipeline identity: " << cases << " nearest/linear and 1x/MSAA4 cases; exact color, depth and stencil preserved\n";
+}
+
+static void UtilityShaderReuse(bool alphaStencil) {
+	using namespace Draw;
+	Metal::RenderContext context;
+	std::string error;
+	Check(context.Init(&error, 2), error);
+	Metal::FramebufferCopy copy;
+	AutoRef<Metal::Framebuffer> src;
+	src.reset(TransferTarget(context, 0, 1, true, false));
+	ClearTransferTarget(context, src, true);
+	uint64_t compiled = 0;
+	int cases = 0;
+	for (int variant = 0; variant < (alphaStencil ? 2 : 4); ++variant) {
+		AutoRef<Metal::Framebuffer> dst;
+		dst.reset(TransferTarget(context, variant > 1 ? variant - 1 : 0, 1, true, variant == 1));
+		ClearTransferTarget(context, dst, false);
+		if (alphaStencil) {
+			Check(copy.StencilFromAlpha(context, dst, &error), error);
+			VerifyTransferTarget(context, dst, Aspect::NO_BIT, true);
+		} else {
+			Check(copy.Blit(context, src, 0, 0, 8, 8, dst, 0, 0, 8, 8, Aspect::COLOR_BIT, FB_BLIT_NEAREST, &error), error);
+			VerifyTransferTarget(context, dst, Aspect::COLOR_BIT);
+		}
+		Check(copy.GetNumPipelines() == (size_t)variant + 1, "distinct format/sample targets shared one pipeline");
+		if (variant == 0) {
+			compiled = context.Metrics().libraryCompiles;
+		} else {
+			std::cout << "MEASURE utility shader reuse alpha=" << alphaStencil << " variant=" << variant
+				<< " additional-libraries=" << context.Metrics().libraryCompiles - compiled << '\n';
+			Check(context.Metrics().libraryCompiles == compiled, "format/sample changes rebuilt identical utility shader libraries");
+		}
+		++cases;
+	}
+	if (!alphaStencil) {
+		// Distinguish nearest and linear in the same function cache, using a nonuniform source.
+		std::array<uint32_t, 64> gradientPixels;
+		for (int y = 0; y < 8; ++y) {
+			for (int x = 0; x < 8; ++x) {
+				gradientPixels[y * 8 + x] = 0xFF4D0000 | (y * 16 << 8) | x * 32;
+			}
+		}
+		auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		desc.usage = MTLTextureUsageShaderRead;
+		auto texture = [context.Device() newTextureWithDescriptor:desc];
+		Check(texture != nil, "filter fixture texture");
+		[texture replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:gradientPixels.data() bytesPerRow:32];
+		AutoRef<Metal::Framebuffer> gradient, output;
+		gradient.reset(Metal::Framebuffer::Wrap(texture, nil, &error));
+		output.reset(TransferTarget(context, 0, 1, true, false));
+		Check(gradient != nullptr, error);
+		for (auto filter : {FB_BLIT_NEAREST, FB_BLIT_LINEAR, FB_BLIT_NEAREST, FB_BLIT_LINEAR}) {
+			ClearTransferTarget(context, output, false);
+			Check(copy.Blit(context, gradient, 0, 0, 8, 8, output, 0, 0, 4, 4, Aspect::COLOR_BIT, filter, &error), error);
+			std::array<uint32_t, 16> pixels;
+			Check(Metal::Readback(context, output->Color(), Aspect::COLOR_BIT, 0, 0, 4, 4,
+				DataFormat::R8G8B8A8_UNORM, pixels.data(), 4, &error), error);
+			for (int y = 0; y < 4; ++y) {
+				for (int x = 0; x < 4; ++x) {
+					const uint32_t expected = 0xFF4D0000 | ((y * 32 + (filter == FB_BLIT_LINEAR ? 8 : 16)) << 8) |
+						(x * 64 + (filter == FB_BLIT_LINEAR ? 16 : 32));
+					for (int shift : {0, 8, 16, 24}) {
+						Check(std::abs(int((pixels[y * 4 + x] >> shift) & 255) - int((expected >> shift) & 255)) <= 1,
+							"nearest/linear shader variants were confused");
+					}
+				}
+			}
+			++cases;
+		}
+		uint64_t warmed = 0;
+		size_t warmedPipelines = 0;
+		for (int repeat = 0; repeat < 2; ++repeat) {
+			for (int layers : {1, 2}) {
+				for (auto samples : {std::pair{0, 0}, {0, 2}, {2, 2}, {2, 0}}) {
+					AutoRef<Metal::Framebuffer> source, target;
+					source.reset(TransferTarget(context, samples.first, layers, true, false));
+					target.reset(TransferTarget(context, samples.second, layers, true, false));
+					for (int bits = 1; bits <= 7; ++bits) {
+						const auto aspects = ((bits & 1) ? Aspect::COLOR_BIT : Aspect::NO_BIT) |
+							((bits & 2) ? Aspect::DEPTH_BIT : Aspect::NO_BIT) | ((bits & 4) ? Aspect::STENCIL_BIT : Aspect::NO_BIT);
+						ClearTransferTarget(context, source, true);
+						ClearTransferTarget(context, target, false);
+						if ((aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT)) && samples.first != samples.second) {
+							Check(source->ResolveDepthStencil(context, &error), error);
+						}
+						Check(copy.Blit(context, source, 0, 0, 8, 8, target, 0, 0, 8, 8, aspects, FB_BLIT_NEAREST, &error), error);
+						if (samples.second && (aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT))) {
+							target->MarkDepthStencilResolved();
+						}
+						VerifyTransferTarget(context, target, aspects);
+						++cases;
+					}
+				}
+			}
+			if (!repeat) {
+				warmed = context.Metrics().libraryCompiles;
+				warmedPipelines = copy.GetNumPipelines();
+			} else {
+				Check(copy.GetNumPipelines() == warmedPipelines && context.Metrics().libraryCompiles == warmed,
+					"warm transfer variants rebuilt pipelines or libraries");
+			}
+		}
+	}
+	std::cout << "PASS utility shader reuse alpha=" << alphaStencil << ": " << cases
+		<< " format/sample/aspect/layer cases with checked GPU output\n";
+}
+
 static void CopyPlaneReuse() {
 	using namespace Draw;
 	std::string error;
@@ -1786,6 +2657,8 @@ public:
 
 class FlatGPUProbe : public GPUCommonHWMetal {
 public:
+	using GPUCommonHWMetal::SetPresentationOutput;
+	using GPUCommonHWMetal::PresentsToOtherOutput;
 	FlatDrawProbe engine;
 	FlatGPUProbe(Draw::DrawContext *draw, int msaaLevel) : GPUCommonHWMetal(nullptr, draw), engine(draw) {
 		auto *shaders = new ShaderManagerMetal(draw);
@@ -1822,6 +2695,135 @@ public:
 		currentList = nullptr;
 	}
 };
+
+class PresentationProbe : public PresentationMetal {
+public:
+	using PresentationMetal::PresentationMetal;
+	std::pair<int, int> FirstPostSize() const {
+		return postShaderFramebuffers_.empty() ? std::pair{0, 0} :
+			std::pair{postShaderFramebuffers_[0]->Width(), postShaderFramebuffers_[0]->Height()};
+	}
+};
+
+static void OutputPresentation(Draw::DrawContext *draw) {
+	using namespace Draw;
+	const auto oldConfig = g_Config;
+	const auto oldState = gstate;
+	const auto oldCached = gstate_c;
+	const auto oldCore = PSP_CoreParameter();
+	GPUCommon *oldGPU = gpu;
+	struct Restore {
+		std::function<void()> apply;
+		~Restore() { apply(); }
+	} restore{[&] { g_Config = oldConfig; gstate = oldState; gstate_c = oldCached; PSP_CoreParameter() = oldCore; gpu = oldGPU; ReloadAllOverlayInfo(); }};
+	g_Config.memStickDirectory = Path(std::filesystem::current_path().string() + "/overlay-memstick");
+	g_Config.bSkipBufferEffects = false;
+	g_Config.bMetalFXSpatial = false;
+	g_Config.bStereoRendering = false;
+	g_Config.iMultiSampleLevel = 0;
+	g_Config.vPostShaderNames.clear();
+	GPUStateCache::Reset();
+	GEState::Reset();
+	const Path folder = GetSysDirectory(DIRECTORY_CUSTOM_OVERLAYS);
+	std::filesystem::create_directories(folder.ToString() + "/regression");
+	std::vector<uint32_t> image(128 * 128, 0xFF0000FF);
+	for (int y = 32; y < 96; ++y) {
+		std::fill_n(image.begin() + y * 128 + 32, 64, 0);
+	}
+	Check(pngSave(folder / "regression.png", (const uint8_t *)image.data(), 128, 128, 4), "overlay fixture PNG");
+	Check(pngSave(folder / "regression/background.png", (const uint8_t *)image.data(), 128, 128, 4), "background overlay fixture PNG");
+	std::ofstream(folder.ToString() + "/regression/overlay.ini") << "[background]\nImage=background.png\nLayer=Background\nHole=32,32,64,64\n";
+	ReloadAllOverlayInfo();
+	std::array<uint32_t, 4> green{0xFF00FF00, 0xFF00FF00, 0xFF00FF00, 0xFF00FF00};
+	TextureDesc desc{};
+	desc.type = TextureType::LINEAR2D;
+	desc.format = DataFormat::R8G8B8A8_UNORM;
+	desc.width = desc.height = 2;
+	desc.depth = desc.mipLevels = 1;
+	desc.initData = {reinterpret_cast<const uint8_t *>(green.data())};
+	desc.tag = "output presentation source";
+	AutoRef<Texture> source(draw->CreateTexture(desc));
+	Check(source != nullptr, "presentation source");
+	SwapchainDesc outputDesc{WINDOWSYSTEM_METAL_EXT, nullptr, nullptr, 128, 128, "presentation regression"};
+	std::string error;
+	Swapchain *output = draw->CreateSwapchain(outputDesc, &error);
+	Check(output != nullptr, "presentation output");
+	struct Destroy {
+		DrawContext *draw;
+		Swapchain *output;
+		~Destroy() { draw->DestroySwapchain(output); }
+	} destroy{draw, output};
+	PresentationProbe presentation(draw);
+	presentation.SetLanguage(GLSL_VULKAN);
+	presentation.UpdateDisplaySize(64, 32);
+	presentation.UpdateRenderSize(2, 2);
+	OutputParams params{};
+	params.pixelWidth = params.pixelHeight = 128;
+	params.orientation = DeviceOrientation::Landscape;
+	presentation.SetOutputOverride(&params);
+	DisplayLayoutConfig config{};
+	config.fDisplayScale = config.fDisplayAspectRatio = 1.0f;
+	config.fDisplayOffsetX = config.fDisplayOffsetY = 0.5f;
+	config.bIgnoreScreenInsets = true;
+	auto render = [&](bool blank, bool overlay) {
+		draw->BeginFrame(DebugFlags::NONE);
+		draw->BindFramebufferAsRenderTarget(output, {RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR, 0xFF000000, 1.0f, 0}, "output presentation");
+		presentation.BeginFrame(config);
+		if (!g_Config.vPostShaderNames.empty()) {
+			Check(presentation.HasPostShader(), "post-shader was not restored at BeginFrame after device loss");
+		}
+		if (blank) {
+			presentation.SourceBlank();
+		} else {
+			presentation.SourceTexture(source, 2, 2);
+		}
+		presentation.RunPostshaderPasses(config, OutputFlags::NEAREST, ROTATION_LOCKED_HORIZONTAL, 0, 0, 1, 1);
+		// The UI binds the selected output after the offscreen post-shader passes.
+		draw->BindFramebufferAsRenderTarget(output, {RPAction::KEEP, RPAction::KEEP, RPAction::KEEP}, "presentation output rebind");
+		presentation.CopyToOutput(config);
+		std::vector<uint32_t> pixels(params.pixelWidth * params.pixelHeight);
+		Check(draw->CopyFramebufferToMemory(output, Aspect::COLOR_BIT, 0, 0, params.pixelWidth, params.pixelHeight,
+			DataFormat::R8G8B8A8_UNORM, pixels.data(), params.pixelWidth, ReadbackMode::BLOCK, "overlay output"), "overlay readback");
+		Check((pixels[(params.pixelHeight / 2) * params.pixelWidth + params.pixelWidth / 2] & 0xFFFFFF) == (blank ? 0 : 0x00FF00),
+			"game center missing on overridden presentation output");
+		if (overlay) {
+			Check((pixels[8 * params.pixelWidth + 8] & 0xFFFFFF) == 0x0000FF, "overlay border missing on secondary output");
+		}
+		draw->Present(PresentMode::FIFO);
+	};
+	for (const char *overlay : {"regression.png", "regression/background"}) {
+		config.sOverlay = overlay;
+		render(false, true);
+		render(true, true);
+	}
+	presentation.DeviceLost();
+	presentation.DeviceRestore(draw);
+	render(false, true);
+	config.sOverlay.clear();
+	g_Config.vPostShaderNames = {"VideoSmoothingAA", "ColorCorrection"};
+	Check(presentation.UpdatePostShader(config), "secondary post-shader setup");
+	auto firstSize = presentation.FirstPostSize();
+	Check(firstSize.first > 0 && firstSize.second > 0, "secondary post-shader intermediate missing");
+	render(false, false);
+	presentation.DeviceLost();
+	presentation.DeviceRestore(draw);
+	Check(!presentation.HasPostShader(), "post-shader restore should be deferred until BeginFrame");
+	render(false, false);
+	Check(presentation.FirstPostSize() == firstSize, "post-shader intermediate size lost after device restore");
+	draw->ResizeSwapchain(output, 256, 256);
+	params.pixelWidth = params.pixelHeight = 256;
+	presentation.SetOutputOverride(&params);
+	render(false, false);
+	auto resized = presentation.FirstPostSize();
+	Check(resized.first > firstSize.first && resized.second > firstSize.second, "output resize did not rebuild post-shader intermediates");
+	FlatGPUProbe testGPU(draw, 0);
+	gpu = &testGPU;
+	testGPU.SetPresentationOutput(&params);
+	Check(testGPU.PresentsToOtherOutput(), "Metal GE output override did not reach its private presentation");
+	testGPU.SetPresentationOutput(nullptr);
+	Check(!testGPU.PresentsToOtherOutput(), "Metal GE output override was not cleared");
+	std::cout << "PASS output presentation: foreground/background/blank overlays, device restore, two post passes rebuilt at output resize, private GE routing\n";
+}
 
 static void UpstreamVideoClamp(Draw::DrawContext *draw) {
 	const auto oldState = gstate;
@@ -2475,6 +3477,10 @@ int main(int argc, char **argv) {
 			Check(Memory::Init(Memory::MemMapSetupFlags::Default), "guest memory");
 			int failures = 0;
 			auto run = [&](const char *name, auto test) {
+				const char *filter = getenv("METAL_TEST_FILTER");
+				if (filter && std::string(name).find(filter) == std::string::npos) {
+					return;
+				}
 				try {
 					test();
 				} catch (const std::exception &error) {
@@ -2500,6 +3506,8 @@ int main(int argc, char **argv) {
 			run("submission-dependencies", [&] { SubmissionDependencies(); });
 			run("dependency-timing", [&] { DependencyTimings(false); });
 			run("dependency-precise-timing", [&] { DependencyTimings(true); });
+			run("library-reuse", [&] { LibraryReuse(); });
+			run("cache-parse-gate", [&] { CacheParseGate(); });
 			run("cache-integrity", [&] { CacheIntegrity(draw.get(), manager); });
 			if (getenv("METAL_TEST_EXPECT_ARCHIVE_UNAVAILABLE")) {
 				run("archive-unavailable", [&] { ArchiveUnavailable(draw.get(), manager); });
@@ -2507,10 +3515,27 @@ int main(int argc, char **argv) {
 				run("progressive-archives", [&] { ProgressiveArchives(draw.get(), manager); });
 			}
 			run("pipeline-identity", [&] { PipelineIdentity(draw.get(), manager); });
+			run("dynamic-depth-attachments", [&] { DynamicDepthAttachments(); });
+			run("primary-surface-replace", [&] { PrimarySurfaceChanges(0); });
+			run("primary-surface-detach", [&] { PrimarySurfaceChanges(1); });
+			run("primary-surface-resize", [&] { PrimarySurfaceChanges(2); });
+			run("primary-resize-event", [&] { PrimarySurfaceChanges(3); });
+			run("primary-lost-event", [&] { PrimarySurfaceChanges(4); });
+			run("primary-got-event", [&] { PrimarySurfaceChanges(5); });
+			run("primary-surface-rebind", [&] { PrimarySurfaceChanges(6); });
+			run("periodic-cache-saves", [&] { PeriodicCacheSaves(); });
+			run("drawable-readback-ordering", [&] { DrawableReadbackOrdering(); });
+			run("multiple-outputs", [&] { MultipleOutputs(); });
+			run("output-resize-no-wait", [&] { OutputRetirement(false); });
+			run("output-destroy-no-wait", [&] { OutputRetirement(true); });
+			run("output-presentation", [&] { OutputPresentation(draw.get()); });
 			run("lazy-frame-commands", [&] { LazyFrameCommands(); });
 			run("alpha-stencil-fetch", [&] { AlphaStencilFetch(draw.get(), manager); });
 			run("deferred-clears", [&] { DeferredClears(draw.get(), manager); });
 			run("copy-plane-reuse", [&] { CopyPlaneReuse(); });
+			run("transfer-pipeline-identity", [&] { TransferPipelineIdentity(); });
+			run("transfer-shader-reuse", [&] { UtilityShaderReuse(false); });
+			run("alpha-stencil-shader-reuse", [&] { UtilityShaderReuse(true); });
 			run("upload-pools", [&] { UploadPools(); });
 			run("atlas-pressure", [&] { AtlasPressure(draw.get(), manager); });
 			run("scaler-support", [&] { ScalingSupport(draw.get()); });

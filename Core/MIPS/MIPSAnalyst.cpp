@@ -135,6 +135,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x1616ee7052542059, 48, "vtfm_t", },
 	{ 0x16965ca11a4e7dac, 104, "vmmul_q_transp", },
 	{ 0x16afe830a5dd2de2, 40, "vdiv_q", },
+	{ 0x181b963854b3045f, 1736, "zuma_pad_analog", }, // Zuma
 	{ 0x184e834a63a79016, 32, "isnanf", },
 	{ 0x1874ee898c7b9f16, 512, "kokoroconnect_download_frame", }, // Kokoro Connect Yochi Random
 	{ 0x189212bda9c94df1, 736, "atanf", },
@@ -195,6 +196,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x35d3527ff8c22ff2, 56, "matrix_scale_q", },
 	{ 0x368f6cf979709a31, 744, "memmove", }, // Jui Dr. Touma Jotarou
 	{ 0x373ce518eee5a2d2, 20, "matrix300_store_q", },
+	{ 0x38260ad724f4d8f7, 804, "zuma_aim_cursor", }, // Zuma
 	{ 0x3840f5766fada4b1, 592, "dissidia_recordframe_avi", }, // Dissidia (US), Dissidia 012 (US)
 	{ 0x388043e96b0e11fd, 144, "sceGupMaterial", },
 	{ 0x38f19bc3be215acc, 388, "log10f", },
@@ -337,6 +339,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x8ee81b03d2eef1e7, 28, "vmul_t", },
 	{ 0x8f09fb8693c3c49d, 992, "kirameki_school_life_download_frame", }, // Hentai Ouji To Warawanai Neko
 	{ 0x8f19c41e8b987e18, 100, "matrix_mogrify", },
+	{ 0x8f84fb657a6ba506, 1148, "syphonfilterls_fade", }, // Syphon Filter: Logan's Shadow (US)
 	{ 0x8ff11e9bed387401, 700, "memmove", }, // God Eater 2
 	{ 0x910140c1a07aa59e, 256, "sceVfpuMatrix4Rot", },
 	{ 0x91606bd72ae90481, 44, "wmemcpy", },
@@ -360,6 +363,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x9e6e007072b74503, 2028, "syphonfilterls_draw_trail", }, // Syphon Filter: Logan's Shadow (US)
 	{ 0x9f269daa6f0da803, 128, "sceGupScissor", },
 	{ 0x9f7919eeb43982b0, 208, "__fixdfsi", },
+	{ 0xa0ec0ed83a53b883, 7304, "syphonfilter_steer", }, // Syphon Filter: Dark Mirror (US)
 	{ 0xa1c9b0a2c71235bf, 1752, "marvelalliance1_copy" }, // Marvel Ultimate Alliance 1 (EU)
 	{ 0x9b76c7f2a41aa805, 1752, "marvelalliance1_copy" }, // Marvel Ultimate alliance 1 (US)
 	{ 0xa1ca0640f11182e7, 72, "strcspn", },

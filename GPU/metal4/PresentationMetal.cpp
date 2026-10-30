@@ -20,6 +20,8 @@
 #include <cmath>
 #include <set>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include "Common/GPU/thin3d.h"
 
 #include "Common/System/Display.h"
@@ -36,6 +38,7 @@
 #include "Core/HW/Display.h"
 #include "GPU/metal4/PostShaderMetal.h"
 #include "GPU/metal4/PresentationMetal.h"
+#include "GPU/Common/Overlay.h"
 #include "GPU/GPUState.h"
 #include "Common/GPU/ShaderTranslation.h"
 
@@ -43,32 +46,6 @@ PresentationMetal::PresentationMetal(Draw::DrawContext *draw) : PresentationComm
 
 PresentationMetal::~PresentationMetal() {
 	DestroyDeviceObjects();
-}
-
-void PresentationMetal::GetCardboardSettings(const DisplayLayoutConfig &config, CardboardSettings *cardboardSettings) const {
-	if (!config.bEnableCardboardVR) {
-		cardboardSettings->enabled = false;
-		return;
-	}
-
-	// Calculate Cardboard Settings
-	float cardboardScreenScale = config.iCardboardScreenSize / 100.0f;
-	float cardboardScreenWidth = pixelWidth_ / 2.0f * cardboardScreenScale;
-	float cardboardScreenHeight = pixelHeight_ * cardboardScreenScale;
-	float cardboardMaxXShift = (pixelWidth_ / 2.0f - cardboardScreenWidth) / 2.0f;
-	float cardboardUserXShift = config.iCardboardXShift / 100.0f * cardboardMaxXShift;
-	float cardboardLeftEyeX = cardboardMaxXShift + cardboardUserXShift;
-	float cardboardRightEyeX = pixelWidth_ / 2.0f + cardboardMaxXShift - cardboardUserXShift;
-	float cardboardMaxYShift = pixelHeight_ / 2.0f - cardboardScreenHeight / 2.0f;
-	float cardboardUserYShift = config.iCardboardYShift / 100.0f * cardboardMaxYShift;
-	float cardboardScreenY = cardboardMaxYShift + cardboardUserYShift;
-
-	cardboardSettings->enabled = true;
-	cardboardSettings->leftEyeXPosition = cardboardLeftEyeX;
-	cardboardSettings->rightEyeXPosition = cardboardRightEyeX;
-	cardboardSettings->screenYPosition = cardboardScreenY;
-	cardboardSettings->screenWidth = cardboardScreenWidth;
-	cardboardSettings->screenHeight = cardboardScreenHeight;
 }
 
 static float GetShaderSettingValue(const ShaderInfo *shaderInfo, int i, const char *nameSuffix) {
@@ -175,8 +152,9 @@ bool PresentationMetal::UpdatePostShader(const DisplayLayoutConfig &config) {
 	}
 
 	if (usePreviousFrame) {
-		int w = usePreviousAtOutputResolution ? pixelWidth_ : renderWidth_;
-		int h = usePreviousAtOutputResolution ? pixelHeight_ : renderHeight_;
+		const OutputParams output = GetOutput();
+		int w = usePreviousAtOutputResolution ? output.pixelWidth : renderWidth_;
+		int h = usePreviousAtOutputResolution ? output.pixelHeight : renderHeight_;
 
 		_dbg_assert_(w > 0 && h > 0);
 
@@ -270,9 +248,10 @@ bool PresentationMetal::BuildPostShader(const DisplayLayoutConfig &config, const
 			nextHeight *= next->SSAAFilterLevel;
 		} else if (shaderInfo->outputResolution) {
 			// If the current shader uses output res (not next), we will use output res for it.
+			const OutputParams output = GetOutput();
 			FRect rc;
-			FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, (float)pixelWidth_, (float)pixelHeight_);
-			CalculateDisplayOutputRect(config, &rc, 480.0f, 272.0f, frame, config.iInternalScreenRotation);
+			FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, output);
+			CalculateDisplayOutputRect(config, &rc, 480.0f, 272.0f, frame, config.iInternalScreenRotation, output.orientation);
 			nextWidth = (int)rc.w;
 			nextHeight = (int)rc.h;
 		}
@@ -352,7 +331,7 @@ void PresentationMetal::DeviceRestore(Draw::DrawContext *draw) {
 	CreateDeviceObjects();
 }
 
-Draw::Pipeline *PresentationMetal::CreatePipeline(std::vector<Draw::ShaderModule *> shaders, bool postShader, const UniformBufferDesc *uniformDesc) const {
+Draw::Pipeline *PresentationMetal::CreatePipeline(std::vector<Draw::ShaderModule *> shaders, bool postShader, const UniformBufferDesc *uniformDesc, bool alphaBlend) const {
 	using namespace Draw;
 
 	Semantic pos = SEM_POSITION;
@@ -375,7 +354,9 @@ Draw::Pipeline *PresentationMetal::CreatePipeline(std::vector<Draw::ShaderModule
 
 	InputLayout *inputLayout = draw_->CreateInputLayout(inputDesc);
 	DepthStencilState *depth = draw_->CreateDepthStencilState({ false, false, Comparison::LESS });
-	BlendState *blendstateOff = draw_->CreateBlendState({ false, 0xF });
+	BlendState *blendstateOff = alphaBlend ?
+		draw_->CreateBlendState({ true, 0xF, BlendFactor::SRC_ALPHA, BlendFactor::ONE_MINUS_SRC_ALPHA, BlendOp::ADD, BlendFactor::ONE, BlendFactor::ONE_MINUS_SRC_ALPHA, BlendOp::ADD }) :
+		draw_->CreateBlendState({ false, 0xF });
 	RasterState *rasterNoCull = draw_->CreateRasterState({});
 
 	PipelineDesc pipelineDesc{ Primitive::TRIANGLE_STRIP, shaders, inputLayout, depth, blendstateOff, rasterNoCull, uniformDesc };
@@ -403,8 +384,10 @@ void PresentationMetal::CreateDeviceObjects() {
 
 	texColor_ = CreatePipeline({ draw_->GetVshaderPreset(VS_TEXTURE_COLOR_2D), draw_->GetFshaderPreset(FS_TEXTURE_COLOR_2D) }, false, &vsTexColBufDesc);
 	texColorRBSwizzle_ = CreatePipeline({ draw_->GetVshaderPreset(VS_TEXTURE_COLOR_2D), draw_->GetFshaderPreset(FS_TEXTURE_COLOR_2D_RB_SWIZZLE) }, false, &vsTexColBufDesc);
+	texColorBlend_ = CreatePipeline({ draw_->GetVshaderPreset(VS_TEXTURE_COLOR_2D), draw_->GetFshaderPreset(FS_TEXTURE_COLOR_2D) }, false, &vsTexColBufDesc, true);
+	overlayVdata_ = draw_->CreateBuffer(sizeof(Vertex) * 4, BufferUsageFlag::DYNAMIC | BufferUsageFlag::VERTEXDATA);
 
-	restorePostShader_ = false;
+	// BeginFrame restores the post-shader requested by DestroyDeviceObjects.
 }
 
 template <typename T>
@@ -428,6 +411,10 @@ static void DoReleaseVector(std::vector<T *> &list) {
 void PresentationMetal::DestroyDeviceObjects() {
 	DoRelease(texColor_);
 	DoRelease(texColorRBSwizzle_);
+	DoRelease(texColorBlend_);
+	DoRelease(overlayVdata_);
+	DoRelease(overlayTexture_);
+	overlayGeneration_ = 0xFFFFFFFF;
 	DoRelease(samplerNearest_);
 	DoRelease(samplerLinear_);
 	DoRelease(vdata_);
@@ -546,18 +533,19 @@ void PresentationMetal::RunPostshaderPasses(const DisplayLayoutConfig &config, O
 	int lastWidth = srcWidth_;
 	int lastHeight = srcHeight_;
 
-	int pixelWidth = pixelWidth_;
-	int pixelHeight = pixelHeight_;
+	const OutputParams output = GetOutput();
+	int pixelWidth = output.pixelWidth;
+	int pixelHeight = output.pixelHeight;
 
 	// These are the output coordinates.
-	FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, (float)pixelWidth, (float)pixelHeight);
+	FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, output);
 	// Note: In cardboard mode, we halve the width here to compensate
 	// for splitting the window in half, while still reusing normal centering.
-	if (config.bEnableCardboardVR) {
+	if (UseCardboard(config)) {
 		frame.w /= 2.0;
 		pixelWidth /= 2;
 	}
-	CalculateDisplayOutputRect(config, &rc_, 480.0f, 272.0f, frame, uvRotation);
+	CalculateDisplayOutputRect(config, &rc_, 480.0f, 272.0f, frame, uvRotation, output.orientation);
 	if (flags & OutputFlags::NATIVE_SIZE) {
 		// Top-left, or bottom-left in a flipped (OpenGL) backbuffer.
 		rc_.w = (u1 - u0) * srcWidth_;
@@ -645,12 +633,12 @@ void PresentationMetal::RunPostshaderPasses(const DisplayLayoutConfig &config, O
 	}
 
 	if (isFinalAtOutputResolution || useStereo) {
-		// In this mode, we ignore the g_display_rot_matrix.  Apply manually.
-		if (g_display.rotation != DisplayRotation::ROTATE_0) {
+		// In this mode, we ignore the output's rotation matrix. Apply manually.
+		if (output.rotation != DisplayRotation::ROTATE_0) {
 			for (int i = 0; i < 4; i++) {
 				Lin::Vec3 v(verts[i].x, verts[i].y, verts[i].z);
 				// Backwards notation, should fix that...
-				v = v * g_display.rot_matrix;
+				v = v * output.rotMatrix;
 				verts[i].x = v.x;
 				verts[i].y = v.y;
 			}
@@ -782,12 +770,28 @@ void PresentationMetal::CopyToOutput(const DisplayLayoutConfig &config) {
 	int lastWidth = srcWidth_;
 	int lastHeight = srcHeight_;
 
-	draw_->SetScissorRect(0, 0, pixelWidth_, pixelHeight_);
+	const OutputParams output = GetOutput();
+	draw_->SetScissorRect(0, 0, output.pixelWidth, output.pixelHeight);
+
+	OverlayLayout overlay;
+	bool drawOverlay = false;
+	if (!(outputFlags_ & OutputFlags::NATIVE_SIZE)) {
+		const FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, output);
+		drawOverlay = GetOverlayLayout(config, frame.x, frame.y, frame.w, frame.h, &overlay) && PrepareOverlayTexture(overlay);
+	}
 
 	if (!srcFramebuffer_ && !srcTexture_) {
-		// Bound blank. We're done (although we could draw a black rectangle here).
+		// Bound blank. Keep the overlay up though, so it doesn't flicker during loading and such.
+		if (drawOverlay) {
+			DrawOverlay(overlay, output);
+			draw_->Invalidate(InvalidationFlags::CACHED_RENDER_STATE);
+		}
 		presentedThisFrame_ = true;
 		return;
+	}
+
+	if (drawOverlay && overlay.layer == OverlayLayer::Background) {
+		DrawOverlay(overlay, output);
 	}
 
 	Draw::Pipeline *pipeline = (outputFlags_ & OutputFlags::RB_SWIZZLE) ? texColorRBSwizzle_ : texColor_;
@@ -839,7 +843,7 @@ void PresentationMetal::CopyToOutput(const DisplayLayoutConfig &config) {
 		previousUniforms_ = uniforms;
 	} else {
 		Draw::VsTexColUB ub{};
-		memcpy(ub.WorldViewProj, g_display.rot_matrix.m, sizeof(float) * 16);
+		memcpy(ub.WorldViewProj, output.rotMatrix.m, sizeof(float) * 16);
 		draw_->UpdateDynamicUniformBuffer(&ub, sizeof(ub));
 	}
 
@@ -855,7 +859,7 @@ void PresentationMetal::CopyToOutput(const DisplayLayoutConfig &config) {
 	};
 
 	CardboardSettings cardboardSettings;
-	GetCardboardSettings(config, &cardboardSettings);
+	GetCardboardSettings(config, output, &cardboardSettings);
 	if (cardboardSettings.enabled) {
 		// TODO: This could actually support stereo now, with an appropriate shader.
 
@@ -867,8 +871,12 @@ void PresentationMetal::CopyToOutput(const DisplayLayoutConfig &config) {
 		setViewport(cardboardSettings.rightEyeXPosition, cardboardSettings.screenYPosition, cardboardSettings.screenWidth, cardboardSettings.screenHeight);
 		draw_->Draw(4, 0);
 	} else {
-		setViewport(0.0f, 0.0f, (float)pixelWidth_, (float)pixelHeight_);
+		setViewport(0.0f, 0.0f, (float)output.pixelWidth, (float)output.pixelHeight);
 		draw_->Draw(4, 0);
+	}
+
+	if (drawOverlay && overlay.layer == OverlayLayer::Foreground) {
+		DrawOverlay(overlay, output);
 	}
 
 	DoRelease(srcFramebuffer_);

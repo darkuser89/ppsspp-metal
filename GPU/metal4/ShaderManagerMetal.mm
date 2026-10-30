@@ -146,48 +146,58 @@ bool ShaderManagerMetal::LoadCache(const Path &filename) {
 		header.vertexCount <= MAX_CACHED_SHADERS && header.fragmentCount <= MAX_CACHED_SHADERS &&
 		header.compilerBuild == compilerBuild;
 	Metal::TranslationCache::Reader reader(file, fileSize - sizeof(header) - 8);
+	std::vector<std::pair<VShaderID, Metal::TranslationCache::Record>> vertices;
+	std::vector<std::pair<FShaderID, Metal::TranslationCache::Record>> fragments;
 	if (valid) {
 		for (uint32_t i = 0; i < header.vertexCount; ++i) {
-			VShaderID id;
-			Metal::TranslationCache::Record record;
-			if (!reader.Value(&id) || !Metal::TranslationCache::Read(reader, &record)) {
-				valid = false;
-				break;
-			}
-			std::string error;
-			loadingTranslation_ = &record;
-			const auto *shader = GetVertexShaderFromID(id, &error);
-			loadingTranslation_ = nullptr;
-			if (!shader) {
+			vertices.emplace_back();
+			auto &entry = vertices.back();
+			if (!reader.Value(&entry.first) || entry.first.is_invalid() || !Metal::TranslationCache::Read(reader, &entry.second)) {
 				valid = false;
 				break;
 			}
 		}
 		for (uint32_t i = 0; valid && i < header.fragmentCount; ++i) {
-			FShaderID id;
-			Metal::TranslationCache::Record record;
-			if (!reader.Value(&id) || !Metal::TranslationCache::Read(reader, &record)) {
-				valid = false;
-				break;
-			}
-			std::string error;
-			loadingTranslation_ = &record;
-			const auto *shader = GetFragmentShaderFromID(id, &error);
-			loadingTranslation_ = nullptr;
-			if (!shader) {
+			fragments.emplace_back();
+			auto &entry = fragments.back();
+			if (!reader.Value(&entry.first) || entry.first.is_invalid() || !Metal::TranslationCache::Read(reader, &entry.second)) {
 				valid = false;
 				break;
 			}
 		}
 		valid &= reader.Remaining() == 0;
-		if (valid) {
-			gstate_c.useFlagsChanged = false;
-		}
 	}
 	fclose(file);
 	if (!valid) {
+		return false;
+	}
+	// Validate the complete payload before generation or native compilation.
+	// Move each translation out so consumed GLSL/MSL storage is released promptly.
+	for (auto &entry : vertices) {
+		auto record = std::move(entry.second);
+		std::string error;
+		loadingTranslation_ = &record;
+		valid = GetVertexShaderFromID(entry.first, &error) != nullptr;
+		loadingTranslation_ = nullptr;
+		if (!valid) {
+			break;
+		}
+	}
+	for (auto &entry : fragments) {
+		if (!valid) {
+			break;
+		}
+		auto record = std::move(entry.second);
+		std::string error;
+		loadingTranslation_ = &record;
+		valid = GetFragmentShaderFromID(entry.first, &error) != nullptr;
+		loadingTranslation_ = nullptr;
+	}
+	if (!valid) {
 		// Reject partial loads and failed shaders as a unit.
 		ClearShaders();
+	} else {
+		gstate_c.useFlagsChanged = false;
 	}
 	return valid;
 }

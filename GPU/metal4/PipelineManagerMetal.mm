@@ -20,7 +20,7 @@
 namespace {
 
 constexpr uint32_t METAL_PIPELINE_CACHE_MAGIC = 0x4D50534F;
-constexpr uint32_t METAL_PIPELINE_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 6 : 5;
+constexpr uint32_t METAL_PIPELINE_CACHE_VERSION = PPSSPP_PLATFORM(MAC) ? 7 : 5;
 constexpr uint32_t MAX_BINARY_ARCHIVES = 8;
 constexpr uint32_t MAX_CACHED_PIPELINES = 8192;
 
@@ -272,7 +272,7 @@ bool PipelineManagerMetal::LoadCache(const Path &filename, ShaderManagerMetal &s
 	for (const PipelineKey &key : keys) {
 		// Cache files can be truncated or corrupted without invalidating the header.
 		// Metal asserts on invalid blend enums before returning a pipeline error.
-		bool invalid = key[4] > 1 || key[7] > MTLBlendOperationMax || key[10] > MTLBlendOperationMax ||
+		bool invalid = key[3] != 0 || key[4] > 1 || key[7] > MTLBlendOperationMax || key[10] > MTLBlendOperationMax ||
 			key[11] > MTLColorWriteMaskAll || key[12] > 0xFF || key[13] > 0xFF ||
 			key[20] == 0 || key[20] > INT_MAX;
 		for (int i : {5, 6, 8, 9}) {
@@ -592,7 +592,9 @@ const MetalGEPipeline *PipelineManagerMetal::GetOrCreateInternal(ShaderManagerMe
 		*error = "Metal hardware transform requires a decoded vertex layout";
 		return nullptr;
 	}
-	PipelineKey key{vertexID.ToUint64(), fragmentID.ToUint64(), (uint64_t)colorFormat, (uint64_t)depthStencilFormat,
+	// Metal 4 PSOs have no depth/stencil attachment format. Keep that cache field
+	// reserved; attachment-dependent tests and writes are dynamic encoder state.
+	PipelineKey key{vertexID.ToUint64(), fragmentID.ToUint64(), (uint64_t)colorFormat, 0,
 		blend.enabled, blend.srcColor, blend.dstColor, blend.colorOp, blend.srcAlpha, blend.dstAlpha, blend.alphaOp, blend.writeMask};
 	key[20] = sampleCount;
 	if (hardware) {

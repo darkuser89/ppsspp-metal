@@ -92,6 +92,9 @@ enum CPUThreadState {
 MetaFileSystem pspFileSystem;
 ParamSFOData g_paramSFO;
 ParamSFOData g_paramSFORaw;
+
+static std::mutex g_bootRequestLock;
+static std::optional<BootRequest> g_bootRequest;
 static GlobalUIState globalUIState;
 CoreParameter g_CoreParameter;
 static FileLoader *g_loadedFile;
@@ -285,14 +288,19 @@ static void GetBootError(IdentifiedFileType type, std::string *errorString) {
 
 	case IdentifiedFileType::ARCHIVE_7Z: *errorString = "7z file detected (Require 7-Zip)"; break;
 	case IdentifiedFileType::PSP_PKG: *errorString = "PKG game updates need to be installed, not booted."; break;
-	case IdentifiedFileType::PSX_ISO:  *errorString = "PSX game image detected."; break;
+	case IdentifiedFileType::PSX_ISO:
+		// It only gets here if it couldn't be made into an EBOOT, which says why.
+		if (errorString->empty()) {
+			*errorString = "PSX game image detected.";
+		}
+		break;
 	case IdentifiedFileType::PS2_ISO:  *errorString = "PS2 game image detected."; break;
 	case IdentifiedFileType::PS3_ISO:  *errorString = "PS2 game image detected."; break;
 	case IdentifiedFileType::NORMAL_DIRECTORY: *errorString = "Just a directory."; break;
 	case IdentifiedFileType::PPSSPP_SAVESTATE: *errorString = "This is a saved state, not a game."; break; // Actually, we could make it load it...
 	case IdentifiedFileType::PSP_SAVEDATA_DIRECTORY: *errorString = "This is save data, not a game."; break;
 	case IdentifiedFileType::PSP_PS1_PBP: *errorString = "PS1 EBOOTs are not supported by PPSSPP."; break;
-	case IdentifiedFileType::PSP_UMD_VIDEO_ISO: *errorString = "UMD Video ISOs are not supported by PPSSPP."; break;
+	case IdentifiedFileType::PSP_UMD_VIDEO_ISO: *errorString = std::string("UMD Video plays in the XMB, which needs PSP firmware ") + UMD_VIDEO_MIN_FIRMWARE + " or later."; break;
 	case IdentifiedFileType::UNKNOWN_BIN:
 	case IdentifiedFileType::UNKNOWN_ELF:
 	case IdentifiedFileType::UNKNOWN_ISO:
@@ -308,14 +316,14 @@ static void ShowCompatWarnings(const Compatibility &compat) {
 	// UI changes are best done after PSP_InitStart.
 	if (compat.flags().RequireBufferedRendering && g_Config.bSkipBufferEffects && !g_Config.bSoftwareRendering) {
 		auto gr = GetI18NCategory(I18NCat::GRAPHICS);
-		g_OSD.Show(OSDType::MESSAGE_WARNING, gr->T("BufferedRenderingRequired", "Warning: This game requires Rendering Mode to be set to Buffered."), 10.0f, "bufreq");
+		g_OSD.Show(OSDType::MESSAGE_WARNING, gr->T("BufferedRenderingRequired", "Warning: This game is not compatible with \"Skip buffer effects\""), 10.0f, "bufreq");
 	} else {
 		g_OSD.CancelById("bufreq");
 	}
 
 	if (compat.flags().RequireBlockTransfer && g_Config.iSkipGPUReadbackMode != (int)SkipGPUReadbackMode::NO_SKIP && !PSP_CoreParameter().compat.flags().ForceEnableGPUReadback) {
 		auto gr = GetI18NCategory(I18NCat::GRAPHICS);
-		g_OSD.Show(OSDType::MESSAGE_WARNING, gr->T("BlockTransferRequired", "Warning: This game requires Skip GPU Readbacks be set to No."), 10.0f, "blockxfer");
+		g_OSD.Show(OSDType::MESSAGE_WARNING, gr->T("BlockTransferRequired", "Warning: This game requires Skip GPU Readbacks to be set to No."), 10.0f, "blockxfer");
 	} else {
 		g_OSD.CancelById("blockxfer");
 	}
@@ -448,12 +456,19 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 		break;
 	}
 	case IdentifiedFileType::PSP_ELF:
+	{
 		homebrew = true;
 		if (Memory::g_PSPModel != PSP_MODEL_FAT) {
 			INFO_LOG(Log::Loader, "ELF, using full PSP-2000 memory access");
 			Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
 		}
+		// The XMB is an ELF too, with no title of its own.
+		const std::string vshTitle = GetVSHTitle(fileLoader->GetPath());
+		if (!vshTitle.empty()) {
+			gameTitle = vshTitle;
+		}
 		break;
+	}
 	case IdentifiedFileType::PPSSPP_GE_DUMP:
 		// Try to grab the disc ID from the filename or GE dump.
 		if (DiscIDFromGEDumpPath(g_CoreParameter.fileToStart, fileLoader, &geDumpDiscID)) {
@@ -468,9 +483,10 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 		break;
 	case IdentifiedFileType::PSP_UMD_VIDEO_ISO:
 	{
-		ERROR_LOG(Log::Loader, "PPSSPP doesn't support UMD Video.");
+		// The game list boots the XMB for these, which plays them.
+		ERROR_LOG(Log::Loader, "UMD Video can't be booted directly, only played in the XMB");
 		auto er = GetI18NCategory(I18NCat::ERRORS);
-		*errorString = er->T("PPSSPP doesn't support UMD Video.");
+		*errorString = ApplySafeSubstitutions(er->T("PSP firmware version %1 or later must be installed to play UMD video"), UMD_VIDEO_MIN_FIRMWARE);
 		return false;
 	}
 	default:
@@ -662,6 +678,10 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 
 	if (g_CoreParameter.updateRecent) {
 		g_recentFiles.Add(g_CoreParameter.fileToStart.ToString());
+		// A UMD Video disc picked from the game list boots the XMB (which Add skips) to play it.
+		if (!g_CoreParameter.mountIso.empty() && g_CoreParameter.umdAutoboot.has_value()) {
+			g_recentFiles.Add(g_CoreParameter.mountIso.ToString());
+		}
 	}
 
 	// Update things that depend on game-specific config here.
@@ -786,6 +806,12 @@ bool PSP_InitStart(const CoreParameter &coreParam) {
 
 	IncrementDebugCounter(DebugCounter::GAME_BOOT);
 
+	{
+		// One the frontend didn't act on (the user stopped the game instead) is stale now.
+		std::lock_guard<std::mutex> guard(g_bootRequestLock);
+		g_bootRequest.reset();
+	}
+
 	g_bootState = BootState::Booting;
 	g_loaderDone = false;
 	g_loaderFailed = false;
@@ -817,6 +843,23 @@ bool PSP_InitStart(const CoreParameter &coreParam) {
 
 		IdentifiedFileType fileType;
 		FileLoader *loadedFile = ResolveFileLoaderTarget(ConstructFileLoader(filename), &fileType, errorString);
+
+		// UMD Video only plays in the XMB, so however it was asked for, boot that with the disc in
+		// the drive and auto-start on. Without a firmware that can, CPU_Init says what's needed.
+		if (fileType == IdentifiedFileType::PSP_UMD_VIDEO_ISO) {
+			const Path vshmain = GetUmdVideoVSHPath();
+			if (!vshmain.empty()) {
+				INFO_LOG(Log::Loader, "UMD Video: booting the XMB (%s) to play %s", vshmain.c_str(), filename.c_str());
+				delete loadedFile;
+				g_CoreParameter.mountIso = filename;
+				g_CoreParameter.fileToStart = vshmain;
+				if (!g_CoreParameter.umdAutoboot) {
+					g_CoreParameter.umdAutoboot = true;
+				}
+				filename = vshmain;
+				loadedFile = ResolveFileLoaderTarget(ConstructFileLoader(filename), &fileType, errorString);
+			}
+		}
 
 		if (System_GetPropertyBool(SYSPROP_ENOUGH_RAM_FOR_FULL_ISO)) {
 			if (g_Config.bCacheFullIsoInRam) {
@@ -909,6 +952,38 @@ BootState PSP_Init(const CoreParameter &coreParam, std::string *error_string) {
 
 BootState PollBootState() {
 	return g_bootState;
+}
+
+void BootRequest::ApplyTo(CoreParameter *coreParam) const {
+	coreParam->fileToStart = fileToStart;
+	coreParam->mountIso = mountIso;
+	coreParam->launchedFromVSH = launchedFromVSH;
+	coreParam->vshmainArgs = vshmainArgs;
+	coreParam->umdAutoboot.reset();
+}
+
+void PSP_RequestBoot(const BootRequest &request) {
+	INFO_LOG(Log::Loader, "Rebooting into %s (disc: %s)", request.fileToStart.c_str(), request.mountIso.c_str());
+	{
+		std::lock_guard<std::mutex> guard(g_bootRequestLock);
+		g_bootRequest = request;
+	}
+	Core_Stop();
+}
+
+bool PSP_HasBootRequest() {
+	std::lock_guard<std::mutex> guard(g_bootRequestLock);
+	return g_bootRequest.has_value();
+}
+
+bool PSP_TakeBootRequest(BootRequest *request) {
+	std::lock_guard<std::mutex> guard(g_bootRequestLock);
+	if (!g_bootRequest) {
+		return false;
+	}
+	*request = std::move(*g_bootRequest);
+	g_bootRequest.reset();
+	return true;
 }
 
 void PSP_Shutdown(bool success) {

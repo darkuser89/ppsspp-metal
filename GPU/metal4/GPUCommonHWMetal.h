@@ -87,6 +87,8 @@ public:
 	void ExecuteOp(u32 op, u32 diff) override;
 
 	bool PresentedThisFrame() const override;
+	void SetPresentationOutput(const OutputParams *output) override;
+	bool PresentsToOtherOutput() const override;
 
 private:
 	void UpdateState(GPURunState state) {

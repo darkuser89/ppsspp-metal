@@ -22,6 +22,7 @@
 
 #import "AppDelegate.h"
 #import "ViewController.h"
+#import "ExternalDisplaySceneDelegate.h"
 #import "iOSCoreAudio.h"
 #import "IAPManager.h"
 #import "SceneDelegate.h"
@@ -248,6 +249,7 @@ float g_safeInsetLeft = 0.0;
 float g_safeInsetRight = 0.0;
 float g_safeInsetTop = 0.0;
 float g_safeInsetBottom = 0.0;
+float g_sideInsetsBottom = -1.0;
 
 static bool g_jitAvailable = true;
 
@@ -266,6 +268,13 @@ std::string System_GetProperty(SystemProperty prop) {
 			return [[[NSLocale currentLocale] objectForKey:NSLocaleIdentifier] UTF8String];
 		case SYSPROP_BUILD_VERSION:
 			return PPSSPP_GIT_VERSION;
+		case SYSPROP_DEVICE_NAME: {
+			// Since iOS 16, without the user-assigned-device-name entitlement this is just the model.
+			UIDevice *device = [UIDevice currentDevice];
+			return [device.name isEqualToString:device.model] ? "" : device.name.UTF8String;
+		}
+		case SYSPROP_DEVICE_MODEL:
+			return [UIDevice currentDevice].model.UTF8String;
 		default:
 			return "";
 	}
@@ -314,6 +323,8 @@ float System_GetPropertyFloat(SystemProperty prop) {
 		return g_safeInsetTop * g_display.dpi_scale_y;
 	case SYSPROP_DISPLAY_SAFE_INSET_BOTTOM:
 		return g_safeInsetBottom * g_display.dpi_scale_y;
+	case SYSPROP_DISPLAY_SIDE_INSETS_BOTTOM:
+		return g_sideInsetsBottom < 0.0f ? -1.0f : g_sideInsetsBottom * g_display.dpi_scale_y;
 	default:
 		return -1;
 	}
@@ -437,6 +448,11 @@ void System_Notify(SystemNotification notification) {
 			}
 		});
 		break;
+	case SystemNotification::EXTERNAL_DISPLAY_CHANGED:
+		dispatch_async(dispatch_get_main_queue(), ^{
+			ExternalDisplaySettingChanged();
+		});
+		break;
 	case SystemNotification::IMMERSIVE_MODE_CHANGE:
 		dispatch_async(dispatch_get_main_queue(), ^{
 			if (sharedViewController) {
@@ -492,13 +508,11 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 			// Get the connected scenes
 			NSSet<UIScene *> *scenes = [UIApplication sharedApplication].connectedScenes;
 
-			// Loop through scenes to find a UIWindowScene that is active
+			// Find the app's scene. An external display has a scene of its own.
 			for (UIScene *scene in scenes) {
-				if ([scene isKindOfClass:[UIWindowScene class]]) {
-					UIWindowScene *windowScene = (UIWindowScene *)scene;
-					SceneDelegate *sceneDelegate = (SceneDelegate *)windowScene.delegate;
-					[sceneDelegate restart:args.c_str()];
-					break; // call only on the first active scene
+				if ([scene.delegate isKindOfClass:[SceneDelegate class]]) {
+					[(SceneDelegate *)scene.delegate restart:args.c_str()];
+					break;
 				}
 			}
 		});
@@ -506,12 +520,12 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 	}
 	case SystemRequestType::EXIT_APP:
 		// NOTE: on iOS, this is considered a crash and not a valid way to exit.
-		exit(0);
-		// The below seems right, but causes hangs. See #12140.
-		// dispatch_async(dispatch_get_main_queue(), ^{
-		// [sharedViewController shutdown];
-		//	exit(0);
-		// });
+		// We're on the render thread. Calling exit() here would destroy its still joinable std::thread,
+		// which aborts, so let the main thread join it first.
+		dispatch_async(dispatch_get_main_queue(), ^{
+			[sharedViewController shutdown];
+			exit(0);
+		});
 		break;
 	case SystemRequestType::BROWSE_FOR_FILE:
 	{

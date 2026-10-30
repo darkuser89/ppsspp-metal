@@ -125,7 +125,9 @@ extern const char *const defaultNetSSID;
 
 void Register_sceNetInet();
 
+void __NetInetInit();
 void __NetInetShutdown();
+void __NetInetDoState(PointerWrap &p, bool hasState, bool hasErrno);
 
 int NetApctl_GetState();
 

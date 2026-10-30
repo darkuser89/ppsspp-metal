@@ -703,6 +703,8 @@ id<MTLBuffer> RenderContext::AcquireCopyPlane(size_t size, std::string *error) {
 
 ResourceMetrics RenderContext::Metrics() const {
 	ResourceMetrics result = metrics_;
+	result.libraryCacheEntries = libraryCache_.size();
+	result.libraryCacheBytes = libraryCacheBytes_;
 	for (const auto &blocks : uploadBlocks_) {
 		for (const auto &block : blocks) {
 			result.uploadCapacity += block.buffer.length;
@@ -790,9 +792,23 @@ void RenderContext::RecycleReadbackBuffer(id<MTLBuffer> buffer) {
 	}
 }
 
+void RenderContext::UseDrawable(id<MTLDrawable> drawable) {
+	if (drawable && std::none_of(drawables_.begin(), drawables_.end(), [&](const DrawableState &state) { return state.drawable == drawable; })) {
+		drawables_.push_back({drawable});
+	}
+}
+
 void RenderContext::PresentDrawable(id<MTLDrawable> drawable) {
-	pendingDrawable_ = drawable;
-	Keep(drawable);
+	UseDrawable(drawable);
+	for (auto &state : drawables_) {
+		if (state.drawable == drawable) {
+			state.present = true;
+		}
+	}
+}
+
+bool RenderContext::HasPendingDrawables() const {
+	return std::any_of(drawables_.begin(), drawables_.end(), [](const DrawableState &state) { return state.present; });
 }
 
 bool RenderContext::SubmitCommands(bool wait, std::string *error) {
@@ -812,6 +828,11 @@ bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 		[boundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
 		++metrics_.initializationBoundaries;
 		EndEncoder(boundary);
+	}
+	// A resized/detached surface may have queued its drawable before this command
+	// buffer began. Retain acquisitions in the slot that submits their work.
+	for (const auto &state : drawables_) {
+		Keep(state.drawable);
 	}
 	[residency_[slot] commit];
 	id<MTL4CommandBuffer> buffers[2];
@@ -837,15 +858,24 @@ bool RenderContext::SubmitCommands(bool wait, std::string *error) {
 		}
 		completion->ready.notify_all();
 	}];
-	if (pendingDrawable_) {
-		[queue_ waitForDrawable:pendingDrawable_];
+	for (auto &state : drawables_) {
+		// Readbacks can submit before the final presentation. The display must
+		// relinquish this acquisition before any buffer that accesses it runs.
+		if (!state.waited) {
+			[queue_ waitForDrawable:state.drawable];
+			state.waited = true;
+			++metrics_.drawableWaits;
+		}
 	}
 	[queue_ commit:buffers count:count options:options];
-	if (pendingDrawable_) {
-		[queue_ signalDrawable:pendingDrawable_];
-		[pendingDrawable_ present];
-		pendingDrawable_ = nil;
+	for (const auto &state : drawables_) {
+		if (state.present) {
+			[queue_ signalDrawable:state.drawable];
+			[state.drawable present];
+			++metrics_.presentedDrawables;
+		}
 	}
+	drawables_.erase(std::remove_if(drawables_.begin(), drawables_.end(), [](const DrawableState &state) { return state.present; }), drawables_.end());
 	submitted_[slot] = completion;
 	submittedAccesses_[slot] = std::move(initializationAccesses_);
 	MergeAccesses(&submittedAccesses_[slot], mainAccesses_);
@@ -906,29 +936,67 @@ id<MTLFunction> RenderContext::CreateShader(const CompiledShader &shader, const 
 		return nil;
 	}
 	@autoreleasepool {
-		MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-		options.languageVersion = MTLLanguageVersion4_0;
-		// Preserve NaN/Inf range culling and coplanar position invariance.
-		options.mathMode = MTLMathModeRelaxed;
-		options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
-		options.preserveInvariance = YES;
-		MTL4LibraryDescriptor *desc = [[MTL4LibraryDescriptor alloc] init];
-		desc.source = [[NSString alloc] initWithBytes:shader.source.data() length:shader.source.size() encoding:NSUTF8StringEncoding];
-		desc.options = options;
-		desc.name = tag ? [NSString stringWithUTF8String:tag] : @"PPSSPP";
 		NSString *entryPoint = [[NSString alloc] initWithBytes:shader.entryPoint.data() length:shader.entryPoint.size() encoding:NSUTF8StringEncoding];
-		if (!desc.source || !entryPoint) {
+		if (!entryPoint) {
 			*error = "Metal shader source or entry point is not valid UTF-8";
 			return nil;
 		}
-		NSError *compileError = nil;
-		const double libraryStart = time_now_d();
-		id<MTLLibrary> library = [compiler_ newLibraryWithDescriptor:desc error:&compileError];
-		metrics_.librarySeconds += time_now_d() - libraryStart;
-		++metrics_.libraryCompiles;
+		id<MTLLibrary> library = nil;
+		auto cached = libraryCache_.find(shader.source);
+		if (cached != libraryCache_.end()) {
+			library = cached->second.library;
+			if (library) {
+				cached->second.lastUsed = ++libraryCacheUse_;
+				++metrics_.libraryCacheHits;
+			} else {
+				libraryCacheBytes_ -= cached->first.size();
+				libraryCache_.erase(cached);
+			}
+		}
 		if (!library) {
-			*error = compileError ? compileError.localizedDescription.UTF8String : "Metal 4 library compilation failed";
-			return nil;
+			MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+			options.languageVersion = MTLLanguageVersion4_0;
+			// Preserve NaN/Inf range culling and coplanar position invariance.
+			options.mathMode = MTLMathModeRelaxed;
+			options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+			options.preserveInvariance = YES;
+			MTL4LibraryDescriptor *desc = [[MTL4LibraryDescriptor alloc] init];
+			desc.source = [[NSString alloc] initWithBytes:shader.source.data() length:shader.source.size() encoding:NSUTF8StringEncoding];
+			desc.options = options;
+			desc.name = tag ? [NSString stringWithUTF8String:tag] : @"PPSSPP";
+			if (!desc.source) {
+				*error = "Metal shader source or entry point is not valid UTF-8";
+				return nil;
+			}
+			NSError *compileError = nil;
+			const double libraryStart = time_now_d();
+			library = [compiler_ newLibraryWithDescriptor:desc error:&compileError];
+			metrics_.librarySeconds += time_now_d() - libraryStart;
+			++metrics_.libraryCompiles;
+			if (library && shader.source.size() <= MAX_LIBRARY_CACHE_BYTES) {
+				for (auto it = libraryCache_.begin(); it != libraryCache_.end();) {
+					if (!it->second.library) {
+						libraryCacheBytes_ -= it->first.size();
+						it = libraryCache_.erase(it);
+					} else {
+						++it;
+					}
+				}
+				while (libraryCache_.size() >= MAX_LIBRARY_CACHE_ENTRIES || libraryCacheBytes_ + shader.source.size() > MAX_LIBRARY_CACHE_BYTES) {
+					auto oldest = std::min_element(libraryCache_.begin(), libraryCache_.end(), [](const auto &a, const auto &b) {
+						return a.second.lastUsed < b.second.lastUsed;
+					});
+					libraryCacheBytes_ -= oldest->first.size();
+					libraryCache_.erase(oldest);
+					++metrics_.libraryCacheEvictions;
+				}
+				libraryCache_[shader.source] = {library, ++libraryCacheUse_};
+				libraryCacheBytes_ += shader.source.size();
+			}
+			if (!library) {
+				*error = compileError ? compileError.localizedDescription.UTF8String : "Metal 4 library compilation failed";
+				return nil;
+			}
 		}
 		id<MTLFunction> function = [library newFunctionWithName:entryPoint];
 		if (!function) {

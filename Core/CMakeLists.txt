@@ -612,6 +612,8 @@ add_library(Core STATIC
 	FileLoaders/HTTPFileLoader.h
 	FileLoaders/LocalFileLoader.cpp
 	FileLoaders/LocalFileLoader.h
+	FileLoaders/PS1EbootFileLoader.cpp
+	FileLoaders/PS1EbootFileLoader.h
 	FileLoaders/RamCachingFileLoader.cpp
 	FileLoaders/RamCachingFileLoader.h
 	FileLoaders/RetryingFileLoader.cpp
@@ -730,7 +732,7 @@ endif()
 list(APPEND CoreExtraLibs armips)
 
 target_link_libraries(Core GPU Common chdr kirk cityhash sfmt19937 xbrz xxhash libdeflate rcheevos at3_standalone lua
-	aemu_postoffice_client ${CoreExtraLibs} ${CMAKE_DL_LIBS})
+	aemu_postoffice_client aemu_postoffice_server ${CoreExtraLibs} ${CMAKE_DL_LIBS})
 
 # Winsock
 if(WIN32)
@@ -754,21 +756,13 @@ if(FFmpeg_FOUND)
 		FFmpeg::avcodec
 		FFmpeg::avformat
 		FFmpeg::avutil
-		FFmpeg::swresample
 		FFmpeg::swscale
 		${ZLIB_LIBRARY}
 	)
 elseif(BUILD_BUNDLED_FFMPEG)
 	target_compile_definitions(Core PRIVATE USE_FFMPEG=1)
 	set_target_properties(Core PROPERTIES NO_SYSTEM_FROM_IMPORTED true)
-	target_link_libraries(Core
-		avcodec
-		avformat
-		avutil
-		swresample
-		swscale
-		${ZLIB_LIBRARY}
-	)
+	target_link_libraries(Core ffmpeg)
 endif()
 
 # Discord integration

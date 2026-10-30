@@ -223,6 +223,8 @@ public:
 	}
 
 	bool PresentedThisFrame() const;
+	void SetPresentationOutput(const OutputParams *output);
+	bool PresentsToOtherOutput() const;
 
 	const std::vector<VirtualFramebuffer *> &GetVFBs() const {
 		return vfbs_;

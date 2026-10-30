@@ -46,6 +46,10 @@ struct AvcPicture {
 	int width = 0;
 	int height = 0;
 	AvcTiming timing;
+	// For a picture coded as two fields (each its own access unit), the second one's timing.
+	// timing is then the first field's.
+	bool fieldPair = false;
+	AvcTiming secondField;
 };
 
 // An H.264 decoder for sceVideocodec, which is a low level interface to the PSP Media Engine.
@@ -138,6 +142,9 @@ private:
 	std::map<int, AvcTiming> timings_;
 	AvcTiming lastTiming_;
 	s64 bufferingTick_ = 0;
+	// The last access unit's removal tick, and how far apart the last two were (2 ticks a frame).
+	s64 lastRemovalTick_ = 0;
+	s64 removalStep_ = 2;
 	bool firstTiming_ = true;
 	int nextIndex_ = 0;
 	int released_ = 0;

@@ -566,6 +566,14 @@ bool GPUCommonHWMetal::PresentedThisFrame() const {
 	return framebufferManager_->PresentedThisFrame();
 }
 
+void GPUCommonHWMetal::SetPresentationOutput(const OutputParams *output) {
+	framebufferManager_->SetPresentationOutput(output);
+}
+
+bool GPUCommonHWMetal::PresentsToOtherOutput() const {
+	return framebufferManager_->PresentsToOtherOutput();
+}
+
 void GPUCommonHWMetal::DoState(PointerWrap &p) {
 	GPUCommon::DoState(p);
 

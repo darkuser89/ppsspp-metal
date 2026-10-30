@@ -1956,7 +1956,7 @@ static TextureAlpha DecodeDXTBlocks(uint8_t *out, int outPitch, uint32_t texaddr
 	const uint32_t neededBlocks = SourceExtent(rowBlocks, blocksPerRow, blockRows);
 
 	if (!Memory::IsValidRange(texaddr, neededBlocks * sizeof(DXTBlock))) {
-		ERROR_LOG_REPORT(Log::TexCache, "DXT%d texture extends beyond valid RAM: %08x + %d x %d (w=%d)", n, texaddr, bufw, h, w);
+		ERROR_LOG(Log::TexCache, "DXT%d texture extends beyond valid RAM: %08x + %d x %d (w=%d)", n, texaddr, bufw, h, w);
 		const uint32_t limited = Memory::ClampValidSizeAt(texaddr, neededBlocks * sizeof(DXTBlock));
 		// Drop block rows until the last one's blocks fit too. This might land on 0, but try to
 		// decode what we can (might even be how the PSP behaves.)
@@ -2093,7 +2093,7 @@ TextureAlpha MetalTextureCacheCommon::DecodeTextureLevel(u8 *out, int outPitch, 
 		WaitForDepthWrites(texaddr, std::max(byteSize, neededBytes));
 	}
 	if (bytesPerRow > 0 && !isPPGE && !Memory::IsValidRange(texaddr, neededBytes)) {
-		ERROR_LOG_REPORT(Log::TexCache, "Texture extends beyond valid RAM: %08x + %d x %d (w=%d)", texaddr, bufw, h, w);
+		ERROR_LOG(Log::TexCache, "Texture extends beyond valid RAM: %08x + %d x %d (w=%d)", texaddr, bufw, h, w);
 		const uint32_t limited = Memory::ClampValidSizeAt(texaddr, neededBytes);
 		// Drop rows until the last one's w texels fit too, not just its bufw stride.
 		if (overlappingSwizzle) {

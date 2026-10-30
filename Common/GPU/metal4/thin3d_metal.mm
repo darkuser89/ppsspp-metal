@@ -69,10 +69,10 @@ struct MetalPipeline final : Pipeline {
 	uint32_t fragmentTextureMask = 0;
 	bool multiview = false;
 	bool fan = false;
-	// Attachment formats are part of the PSO identity. This pipeline object
+	// Color format and sample count are part of the PSO identity. This pipeline object
 	// already uniquely owns its shaders, vertex layout, blend, and topology.
-	std::map<std::array<uint64_t, 3>, id<MTLRenderPipelineState>> states;
-	std::map<std::array<uint64_t, 3>, std::shared_ptr<MetalPipelineRequest>> pending;
+	std::map<std::array<uint64_t, 2>, id<MTLRenderPipelineState>> states;
+	std::map<std::array<uint64_t, 2>, std::shared_ptr<MetalPipelineRequest>> pending;
 	std::map<uint32_t, id<MTLDepthStencilState>> depthStates;
 };
 
@@ -84,6 +84,23 @@ struct MetalDelayedReadback {
 	std::shared_ptr<Metal::Submission> pendingCommands;
 	size_t pitch = 0;
 	uint64_t lastUse = 0;
+};
+
+class MetalSwapchain final : public Swapchain {
+public:
+	MetalSwapchain(CAMetalLayer *layer, int width, int height, const char *tag) : layer(layer), tag_(tag ? tag : "Metal output") {
+		SetSize(width, height);
+	}
+	void SetSize(int width, int height) { width_ = width; height_ = height; }
+	const char *Tag() const override { return tag_.c_str(); }
+	CAMetalLayer *layer = nil;
+	id<CAMetalDrawable> drawable = nil;
+	id<MTLTexture> depth = nil;
+	AutoRef<Metal::Framebuffer> buffer;
+	bool attemptedDrawable = false;
+
+private:
+	std::string tag_;
 };
 
 static MTLBlendFactor BlendFactorNative(BlendFactor factor) {
@@ -104,7 +121,7 @@ class MetalDrawContext final : public DrawContext, public Metal::RenderManager {
 public:
 
 	bool Init(std::string *error);
-	~MetalDrawContext() override { Wait(); DestroyPresets(); }
+	~MetalDrawContext() override;
 	void Wait() override;
 	const DeviceCaps &GetDeviceCaps() const override { return caps_; }
 	uint32_t GetDataFormatSupport(DataFormat fmt) const override { return Metal::FormatSupport(context_.Device(), fmt); }
@@ -127,6 +144,13 @@ public:
 	bool BlitFramebuffer(Framebuffer *src, int sx1, int sy1, int sx2, int sy2, Framebuffer *dst, int dx1, int dy1, int dx2, int dy2, Aspect aspects, FBBlitFilter filter, const char *tag) override;
 	bool CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, int y, int w, int h, DataFormat format, void *pixels, int stride, ReadbackMode mode, const char *tag) override;
 	DataFormat PreferredFramebufferReadbackFormat(Framebuffer *src) override;
+	Swapchain *CreateSwapchain(const SwapchainDesc &desc, std::string *error) override;
+	void DestroySwapchain(Swapchain *swapchain) override;
+	void ResizeSwapchain(Swapchain *swapchain, int width, int height) override;
+	void SetTargetSize(int width, int height) override {
+		DrawContext::SetTargetSize(width, height);
+		primarySwapchain_->SetSize(width, height);
+	}
 	void BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) override;
 	void BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect aspect, int layer) override;
 	void BindFramebufferSamplesAsTexture(Framebuffer *fbo, int binding, int layer) override;
@@ -209,6 +233,11 @@ private:
 	NSUInteger InstanceCount() const { return pipeline_->multiview ? target_->Layers() : 1; }
 	void Error(const std::string &message);
 	void ReleaseDrawable();
+	void RetireSurface();
+	void ReleaseSwapchain(MetalSwapchain *swapchain);
+	void RetireSwapchain(MetalSwapchain *swapchain);
+	void ConfigureLayer(CAMetalLayer *layer);
+	Metal::Framebuffer *ResolveSwapchain(MetalSwapchain *swapchain);
 	Metal::Framebuffer *Resolve(Framebuffer *framebuffer);
 	id<MTLTexture> NullTexture(bool array);
 	bool Copy(Framebuffer *src, int sx, int sy, Framebuffer *dst, int dx, int dy, int w, int h, Aspect aspects);
@@ -241,6 +270,7 @@ private:
 	id<CAMetalDrawable> drawable_ = nil;
 	id<MTLTexture> surfaceDepth_ = nil;
 	bool attemptedDrawable_ = false;
+	std::vector<MetalSwapchain *> swapchains_;
 	AutoRef<MetalPipeline> pipeline_;
 	AutoRef<Metal::Buffer> vertex_, index_;
 	int vertexOffset_ = 0, indexOffset_ = 0;
@@ -325,6 +355,7 @@ bool MetalDrawContext::Init(std::string *error) {
 		}
 	}
 	caps_.presentModesSupported = PresentMode::FIFO;
+	caps_.multipleSwapchains = true;
 	caps_.presentMaxInterval = 1;
 #if PPSSPP_PLATFORM(MAC)
 	caps_.presentModesSupported |= PresentMode::IMMEDIATE;
@@ -709,8 +740,7 @@ void MetalDrawContext::RequestPipeline() {
 		return;
 	}
 	const auto colorFormat = target_->Color().pixelFormat;
-	const auto depthFormat = target_->DepthStencil() ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
-	const std::array<uint64_t, 3> key{(uint64_t)colorFormat, (uint64_t)depthFormat, (uint64_t)target_->SampleCount()};
+	const std::array<uint64_t, 2> key{(uint64_t)colorFormat, (uint64_t)target_->SampleCount()};
 	if (pipeline_->states.find(key) != pipeline_->states.end() || pipeline_->pending.find(key) != pipeline_->pending.end()) {
 		return;
 	}
@@ -755,6 +785,150 @@ Framebuffer *MetalDrawContext::CreateFramebuffer(const FramebufferDesc &desc) {
 	return fbo;
 }
 
+MetalDrawContext::~MetalDrawContext() {
+	Wait();
+	for (auto *swapchain : swapchains_) {
+		ReleaseSwapchain(swapchain);
+		swapchain->ReleaseAssertLast();
+	}
+	DestroyPresets();
+}
+
+void MetalDrawContext::ConfigureLayer(CAMetalLayer *layer) {
+	layer.device = context_.Device();
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	layer.framebufferOnly = NO;
+	layer.maximumDrawableCount = std::clamp(g_Config.iInflightFrames + 1, 2, 3);
+	layer.allowsNextDrawableTimeout = YES;
+	layer.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
+}
+
+Swapchain *MetalDrawContext::CreateSwapchain(const SwapchainDesc &desc, std::string *error) {
+	error->clear();
+	if (desc.winsys != WINDOWSYSTEM_METAL_EXT || (desc.data1 &&
+		![(__bridge id)desc.data1 isKindOfClass:[CAMetalLayer class]])) {
+		*error = "Metal 4 swapchains require a CAMetalLayer or an offscreen Metal surface";
+		return nullptr;
+	}
+	CAMetalLayer *layer = (__bridge CAMetalLayer *)desc.data1;
+	if (swapchains_.size() >= 4 || desc.width < 0 || desc.height < 0 ||
+		(!layer && (desc.width == 0 || desc.height == 0)) ||
+		desc.width > caps_.maxTextureSize || desc.height > caps_.maxTextureSize) {
+		*error = "Invalid Metal 4 swapchain dimensions or too many outputs";
+		return nullptr;
+	}
+	if (layer) {
+		ConfigureLayer(layer);
+	}
+	auto *swapchain = new MetalSwapchain(layer, desc.width, desc.height, desc.tag);
+	swapchains_.push_back(swapchain);
+	return swapchain;
+}
+
+void MetalDrawContext::ReleaseSwapchain(MetalSwapchain *swapchain) {
+	if (swapchain->buffer) {
+		if (target_.ptr == swapchain->buffer.ptr) {
+			target_ = nullptr;
+		}
+		for (auto &texture : textures_) {
+			if (swapchain->buffer->OwnsTexture(texture)) {
+				texture = nil;
+			}
+		}
+	}
+	swapchain->buffer = nullptr;
+	swapchain->drawable = nil;
+}
+
+void MetalDrawContext::DestroySwapchain(Swapchain *swapchain) {
+	auto it = std::find(swapchains_.begin(), swapchains_.end(), swapchain);
+	if (it == swapchains_.end()) {
+		Error("Destroying an unknown Metal 4 swapchain");
+		return;
+	}
+	auto *metal = *it;
+	RetireSwapchain(metal);
+	swapchains_.erase(it);
+	metal->ReleaseAssertLast();
+}
+
+void MetalDrawContext::ResizeSwapchain(Swapchain *swapchain, int width, int height) {
+	if (width < 0 || height < 0 || width > caps_.maxTextureSize || height > caps_.maxTextureSize) {
+		Error("Invalid Metal 4 swapchain size");
+		return;
+	}
+	if (swapchain == primarySwapchain_) {
+		HandleEvent(Event::RESIZED, width, height, nullptr, nullptr);
+		return;
+	}
+	auto it = std::find(swapchains_.begin(), swapchains_.end(), swapchain);
+	if (it == swapchains_.end()) {
+		Error("Resizing an unknown Metal 4 swapchain");
+		return;
+	}
+	auto *metal = *it;
+	if (metal->Width() == width && metal->Height() == height) {
+		return;
+	}
+	RetireSwapchain(metal);
+	metal->depth = nil;
+	metal->SetSize(width, height);
+}
+
+void MetalDrawContext::RetireSwapchain(MetalSwapchain *swapchain) {
+	EndPass();
+	// Submission storage retains attachments until GPU completion. Queue an
+	// acquired drawable for presentation before releasing the output's references.
+	context_.PresentDrawable(swapchain->drawable);
+	ReleaseSwapchain(swapchain);
+}
+
+Metal::Framebuffer *MetalDrawContext::ResolveSwapchain(MetalSwapchain *swapchain) {
+	if (swapchain->buffer) {
+		return swapchain->buffer.ptr;
+	}
+	if (swapchain->layer) {
+		const CGSize size = swapchain->layer.drawableSize;
+		swapchain->SetSize((int)size.width, (int)size.height);
+	}
+	if (swapchain->Width() <= 0 || swapchain->Height() <= 0) {
+		return nullptr;
+	}
+	if (!swapchain->layer) {
+		swapchain->buffer.reset(static_cast<Metal::Framebuffer *>(CreateFramebuffer({swapchain->Width(), swapchain->Height(),
+			1, 1, 0, true, swapchain->Tag()})));
+		return swapchain->buffer.ptr;
+	}
+	if (swapchain->attemptedDrawable) {
+		return nullptr;
+	}
+	swapchain->attemptedDrawable = true;
+	swapchain->drawable = [swapchain->layer nextDrawable];
+	if (!swapchain->drawable) {
+		return nullptr;
+	}
+	id<MTLTexture> color = swapchain->drawable.texture;
+	swapchain->SetSize((int)color.width, (int)color.height);
+	if (!swapchain->depth || swapchain->depth.width != color.width || swapchain->depth.height != color.height) {
+		MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+			width:color.width height:color.height mipmapped:NO];
+		desc.storageMode = MTLStorageModePrivate;
+		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+		swapchain->depth = [context_.Device() newTextureWithDescriptor:desc];
+	}
+	std::string error;
+	if (swapchain->depth) {
+		swapchain->buffer.reset(Metal::Framebuffer::Wrap(color, swapchain->depth, &error));
+	}
+	if (!swapchain->buffer) {
+		Error(error.empty() ? "Failed to allocate Metal 4 output depth/stencil" : error);
+		swapchain->drawable = nil;
+	} else {
+		context_.UseDrawable(swapchain->drawable);
+	}
+	return swapchain->buffer.ptr;
+}
+
 void MetalDrawContext::UpdateBuffer(Buffer *buffer, const uint8_t *data, size_t offset, size_t size, UpdateBufferFlags flags) {
 	if (!buffer || !static_cast<Metal::Buffer *>(buffer)->Update(context_.Device(), data, offset, size, flags)) {
 		Error("Metal buffer update failed or exceeded allocation");
@@ -781,6 +955,11 @@ void MetalDrawContext::UpdateTextureRegions(Texture *texture, int level, const T
 }
 
 Metal::Framebuffer *MetalDrawContext::Resolve(Framebuffer *fbo) {
+	fbo = PrimaryToNull(fbo);
+	if (fbo && fbo->IsSwapchain()) {
+		auto it = std::find(swapchains_.begin(), swapchains_.end(), fbo);
+		return it != swapchains_.end() ? ResolveSwapchain(*it) : nullptr;
+	}
 	if (fbo) {
 		return static_cast<Metal::Framebuffer *>(fbo);
 	}
@@ -817,6 +996,8 @@ Metal::Framebuffer *MetalDrawContext::Resolve(Framebuffer *fbo) {
 			if (!backbuffer_) {
 				Error(error);
 				drawable_ = nil;
+			} else {
+				context_.UseDrawable(drawable_);
 			}
 		}
 		return backbuffer_.ptr;
@@ -828,6 +1009,7 @@ Metal::Framebuffer *MetalDrawContext::Resolve(Framebuffer *fbo) {
 }
 
 void MetalDrawContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
+	fbo = PrimaryToNull(fbo);
 	*w = fbo ? fbo->Width() : targetWidth_;
 	*h = fbo ? fbo->Height() : targetHeight_;
 }
@@ -1219,7 +1401,8 @@ bool MetalDrawContext::ReadbackDelayedColor(id<MTLTexture> source, int x, int y,
 }
 
 bool MetalDrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, int y, int w, int h, DataFormat format, void *pixels, int stride, ReadbackMode mode, const char *tag) {
-	if (!src && mode == ReadbackMode::OLD_DATA_OK) {
+	src = PrimaryToNull(src);
+	if ((!src || src->IsSwapchain()) && mode == ReadbackMode::OLD_DATA_OK) {
 		Error("Delayed Metal backbuffer readback is unavailable");
 		return false;
 	}
@@ -1243,6 +1426,11 @@ bool MetalDrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, 
 }
 
 DataFormat MetalDrawContext::PreferredFramebufferReadbackFormat(Framebuffer *src) {
+	src = PrimaryToNull(src);
+	if (src && src->IsSwapchain()) {
+		auto it = std::find(swapchains_.begin(), swapchains_.end(), src);
+		return it != swapchains_.end() && (*it)->layer ? DataFormat::B8G8R8A8_UNORM : DataFormat::R8G8B8A8_UNORM;
+	}
 	if (!src && backbuffer_ && backbuffer_->Color().pixelFormat == MTLPixelFormatBGRA8Unorm) {
 		return DataFormat::B8G8R8A8_UNORM;
 	}
@@ -1467,8 +1655,7 @@ bool MetalDrawContext::Apply(id<MTLBuffer> vertices, size_t offset) {
 		return false;
 	}
 	const auto colorFormat = target_->Color().pixelFormat;
-	const auto depthFormat = target_->DepthStencil() ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
-	const std::array<uint64_t, 3> key{(uint64_t)colorFormat, (uint64_t)depthFormat, (uint64_t)target_->SampleCount()};
+	const std::array<uint64_t, 2> key{(uint64_t)colorFormat, (uint64_t)target_->SampleCount()};
 	auto found = pipeline_->states.find(key);
 	id<MTLRenderPipelineState> state = found == pipeline_->states.end() ? nil : found->second;
 	if (!state) {
@@ -1840,6 +2027,9 @@ void MetalDrawContext::BeginFrame(DebugFlags flags) {
 	const bool profileLog = (flags & DebugFlags::PROFILE_SCOPES) || g_Config.bGpuLogProfiler;
 	context_.SetProfilingEnabled(profileLog || (flags & DebugFlags::PROFILE_TIMESTAMPS), profileLog);
 	attemptedDrawable_ = false;
+	for (auto *swapchain : swapchains_) {
+		swapchain->attemptedDrawable = false;
+	}
 	passCount_ = 0;
 	++frameCount_;
 	// Recycle submission storage at the first GPU operation so CPU emulation
@@ -1855,19 +2045,32 @@ void MetalDrawContext::Present(PresentMode mode) {
 		if (layer_) {
 			layer_.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
 		}
+		for (auto *swapchain : swapchains_) {
+			swapchain->layer.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
+		}
 	}
 #endif
 	std::string error;
 	// A readback may have submitted all render commands already. Present on a
 	// fresh buffer in the same queue so it remains ordered after that work.
-	if (drawable_ && Commands()) {
+	const bool hasDrawable = context_.HasPendingDrawables() || drawable_ || std::any_of(swapchains_.begin(), swapchains_.end(),
+		[](const MetalSwapchain *swapchain) { return swapchain->drawable != nil; });
+	if (hasDrawable && Commands()) {
 		context_.PresentDrawable(drawable_);
+		for (auto *swapchain : swapchains_) {
+			context_.PresentDrawable(swapchain->drawable);
+		}
 	}
 	if (context_.Commands() && !context_.SubmitCommands(false, &error)) {
 		Error(error);
 	}
 	if (layer_) {
 		ReleaseDrawable();
+	}
+	for (auto *swapchain : swapchains_) {
+		if (swapchain->layer) {
+			ReleaseSwapchain(swapchain);
+		}
 	}
 }
 
@@ -1895,21 +2098,15 @@ bool MetalDrawContext::SetSurface(CAMetalLayer *layer, std::string *error) {
 		return false;
 	}
 	if (@available(macOS 26.0, *)) {
-		Wait();
-		ReleaseDrawable();
-		surfaceDepth_ = nil;
+		if (layer == layer_) {
+			ResizeSurface();
+			return true;
+		}
+		RetireSurface();
 		layer_ = layer;
 		attemptedDrawable_ = false;
 		if (layer_) {
-			layer_.device = context_.Device();
-			layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
-			// Screenshots and framebuffer transfers can read the drawable.
-			layer_.framebufferOnly = NO;
-			layer_.maximumDrawableCount = std::clamp(g_Config.iInflightFrames + 1, 2, 3);
-			layer_.allowsNextDrawableTimeout = YES;
-#if PPSSPP_PLATFORM(MAC)
-			layer_.displaySyncEnabled = presentMode_ == PresentMode::FIFO;
-#endif
+			ConfigureLayer(layer_);
 			ResizeSurface();
 		}
 		return true;
@@ -1928,11 +2125,15 @@ void MetalDrawContext::ResizeSurface() {
 	if (w == targetWidth_ && h == targetHeight_) {
 		return;
 	}
+	RetireSurface();
+	SetTargetSize(w, h);
+}
+
+void MetalDrawContext::RetireSurface() {
 	EndPass();
+	context_.PresentDrawable(drawable_);
 	ReleaseDrawable();
 	surfaceDepth_ = nil;
-	SetTargetSize(w, h);
-	attemptedDrawable_ = false;
 }
 
 void MetalDrawContext::Clear(Aspect aspects, uint32_t color, float depth, int stencil) {
@@ -2008,11 +2209,8 @@ uint64_t MetalDrawContext::GetNativeObject(NativeObject obj, void *src) {
 
 void MetalDrawContext::HandleEvent(Event event, int w, int h, void *p1, void *p2) {
 	if (event == Event::RESIZED || event == Event::GOT_BACKBUFFER || event == Event::LOST_BACKBUFFER) {
-		EndPass();
+		RetireSurface();
 		target_ = nullptr;
-		ReleaseDrawable();
-		surfaceDepth_ = nil;
-		attemptedDrawable_ = false;
 		SetTargetSize(w, h);
 	}
 }
